@@ -1,0 +1,12 @@
+{
+  "name": "study-dsh-plugin",
+  "version": "1.0.0",
+  "description": "学习区（study-work）DSH 插件工程：学习目标管理面板 + 目标/章节独立会话 + 聊天管理工具。源码、打包与安装脚本、文档集中于此仓库。",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "install:dsh": "node scripts/install.mjs"
+  },
+  "license": "MIT"
+}
