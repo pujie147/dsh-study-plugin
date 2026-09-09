@@ -1,7 +1,6 @@
 {
   "name": "study-plugin",
   "version": "0.1.0",
-  "private": true,
   "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_* 聊天工具。",
   "type": "module",
   "main": "lib/index.js",
@@ -14,18 +13,20 @@
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
+  "keywords": ["dsh", "dsh-plugin", "cordis", "study", "学习区", "学习规划"],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "node scripts/build-client.mjs"
+    "build": "node scripts/build-client.mjs",
+    "test": "node test/smoke.mjs",
+    "cleanroom": "node scripts/cleanroom-check.mjs"
   },
   "license": "MIT",
-  "dependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7"
-  },
   "dsh": {
     "bundle": {
       "patch": "cordis.patch.yml"

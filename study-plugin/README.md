@@ -5,19 +5,22 @@
 
 ## 形态（与 dsh-free-search / @xmanrui/dsh-im 等同构）
 - **宿主半** `lib/index.js`：ESM 模块，`export function apply(ctx, config)`。
-  - `ctx.inject(['webServer','agents','workspaceRegistry'], …)` 注入服务
+  - `ctx.inject(['webServer','agents','workspaceRegistry','tools'], …)` 注入服务
   - `/study-rpc` webServer prefix 路由（loopback 守卫）承载全部 `study.*` RPC
-  - `study_plan_*` 聊天工具：**M2**（`ctx.inject(['tools'], sctx => sctx.tools.register(defineTool(…)))`，`@deepseek-ai/dsh-tools`）
+  - `study_plan_*` 聊天工具 ×5：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
 - **客户端半** `lib/client.js`（构建产物，勿手改）：`window.__ModuleLoader__.load({id, factory:(require)=>…})` 形态；
   源码 `src/client.mjs`；CSS 从仓库根 `src/client.js` 的 `styles.insert` 提取并内联。
   - `dsh.client` 清单在 `package.json`：`platform: web` + inject 边（runtime/layout/ui-sidebar）
 - **自注册** `cordis.patch.yml`：`- insert: - id: study-engine name: study-plugin`（dsh-app-boot 合成 profile 时自动应用）
 
-## 构建
+## 构建与测试
 ```bash
 cd study-plugin
-node scripts/build-client.mjs   # → lib/client.js（CSS 内联 + banner + react externals）
+node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
+node test/smoke.mjs                 # 宿主半运行时冒烟（33 断言）
+node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
 ```
+开发说明：`node_modules/@deepseek-ai/dsh-tools` 是指向本机宿主副本的 **dev junction**（仅开发用；真实目录安装无需它，终端用户经 DSH 宿主桥接解析，净室脚本已验证）。
 
 ## 安装（本机 web profile，幂等可重跑）
 ```powershell

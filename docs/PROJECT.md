@@ -2,6 +2,8 @@
 
 学习区（study-work）DSH 插件的工程仓库。本文档面向开发/维护者；使用者请看 [USAGE.md](./USAGE.md)。
 
+> **2026-09-09 状态**：主形态已升级为 **常驻插件包 [`study-plugin/`](../study-plugin/README.md)**（profile 组合插件：DSH 启动自动装载、任何模式/会话可用、重启不丢失，含面板 + `/study-rpc` + `study_plan_*` 五工具；v0.1.0 已净室验证）。本文 §3 起描述的**动态插件**保留为双轨回退（路线 A），数据契约两边完全一致。
+
 ## 1. 项目是什么
 
 在 DeepSeek Harness Web GUI 中提供一套「个人学习管理」能力：
@@ -30,6 +32,13 @@ study_dsh_plugin/
 │   └── install.mjs      安装快照 → ~/.dsh/study-work/plugin/
 ├── dist/
 │   └── study-plugin.dist.json   打包产物（含 code.host / code.client）
+├── study-plugin/        ★ 常驻插件包（主形态，可分发）
+│   ├── package.json     双 exports + dsh.bundle.patch + dsh.client 清单
+│   ├── cordis.patch.yml 自注册 row（- insert: study-engine）
+│   ├── lib/index.js     宿主半（/study-rpc + study.* ×13 + study_plan_* ×5 + README）
+│   ├── lib/client.js    客户端 bundle（构建产物，勿手改）
+│   ├── src/client.mjs   客户端源码 + scripts/（build-client / install-profile / cleanroom-check）
+│   └── test/smoke.mjs   运行时冒烟（33 断言）
 └── package.json
 ```
 
