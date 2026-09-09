@@ -19,12 +19,14 @@ cd study-plugin
 node scripts/build-client.mjs   # → lib/client.js（CSS 内联 + banner + react externals）
 ```
 
-## 安装（本机 web profile，阶段2）
+## 安装（本机 web profile，幂等可重跑）
 ```powershell
-# 开发期：符号链接（改仓库代码 → 重启 DSH 即生效）
-New-Item -ItemType SymbolicLink -Path "C:\Users\pyg12\.dsh\profiles\web\node_modules\study-plugin" -Target "C:\Users\pyg12\gitProjects\study_dsh_plugin\study-plugin"
-# 发布期（M3）：dsh plugin --profile web add study-plugin（npm/GitHub 包）
+cd C:\Users\pyg12\gitProjects\study_dsh_plugin\study-plugin
+node scripts/install-profile.mjs              # 默认 $DSH_HOME/profiles/web（或 ~/.dsh/profiles/web）
+node scripts/install-profile.mjs --profile <dir>   # 指定其他 profile
+node scripts/install-profile.mjs --uninstall       # 卸载（删链接 + 撤注册，自动备份）
 ```
+Windows 用目录 Junction（免管理员；符号链接需提权）。发布期（M3）亦可：`dsh plugin --profile web add study-plugin`。
 重启 DSH 后：
 - 左栏出现「📚 学习区」（任何模式）
 - `curl -X POST http://127.0.0.1:3080/study-rpc -d '{"method":"study.list","args":{}}'` 返回 `{goals:[…]}`

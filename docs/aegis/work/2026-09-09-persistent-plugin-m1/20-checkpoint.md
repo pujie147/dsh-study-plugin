@@ -8,7 +8,8 @@
 - [x] T4 客户端移植 src/client.mjs + scripts/build-client.mjs（CSS 提取/内联、fetch RPC、setInterval）
 - [x] T5 构建 lib/client.js + node --check 双文件 + 运行时冒烟测试 24/24 过
 - [x] T6 提交 M1（git）
-- [ ] T7（阶段2，需审批）包装入 ~/.dsh/profiles/web/node_modules + 重启验证面板/RPC
+- [x] T7 阶段2 安装：Junction 链接 + profile 注册完成；提供幂等脚本 `scripts/install-profile.mjs`（用户选择手动重跑亦可）
+- [ ] T7b 重启 DSH 验证：左栏 📚（任意模式）、POST /study-rpc 通、README 刷新
 - [ ] T8（M2）study_plan_* 工具静态化（defineTool 注册）
 - [ ] T9（M3）去硬编码/config 化 + 发布分发
 
