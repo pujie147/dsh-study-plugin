@@ -19,20 +19,25 @@ const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-smoke-'))
 const injected = []
 let capturedRoute = null
 const effects = []
+const registeredTools = []
 const ctx = {
   inject: (names, fn) => {
-    for (const n of names) if (n !== 'webServer' && n !== 'agents' && n !== 'workspaceRegistry') throw new Error('unexpected service: ' + n)
+    for (const n of names) if (!['webServer', 'agents', 'workspaceRegistry', 'tools'].includes(n)) throw new Error('unexpected service: ' + n)
     fn({
       effect: (fn2, label) => { const d = fn2(); effects.push({ label, d }); return d },
       webServer: {
         register: (route) => { capturedRoute = route; return () => { capturedRoute = null } }
+      },
+      tools: {
+        register: (def) => { registeredTools.push(def); return () => { const i = registeredTools.indexOf(def); if (i >= 0) registeredTools.splice(i, 1) } }
       },
       agents: {
         get: (id) => ({ followup: (msg) => { injected.push({ id, msg }) } })
       },
       workspaceRegistry: {
         resolveByPath: async () => undefined,
-        create: async () => ({ id: 'ws-test' })
+        create: async () => ({ id: 'ws-test' }),
+        get: () => undefined
       }
     })
   }
@@ -150,6 +155,30 @@ function callRpc(method, args, opts = {}) {
   check('deleteGoal ok', r10.json && r10.json.ok === true, r10.json)
   const r11 = await callRpc('study.list', {})
   check('list 不再含已删目标', !r11.json.goals.some((g) => g.id === goalId), r11.json.goals.map((g) => g.id))
+}
+
+// ── M2: study_plan_* 工具 ────────────────────────────────────────────────────
+{
+  check('defineTool 已解析（静态注册启用）', registeredTools.length > 0, '注册数=' + registeredTools.length)
+  const names = registeredTools.map((t) => t.name).sort()
+  check('5 个工具注册', names.join(',') === 'study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status', names)
+  const byName = Object.fromEntries(registeredTools.map((t) => [t.name, t]))
+  const createJson = JSON.stringify(byName.study_plan_create && byName.study_plan_create.parameters)
+  check('create schema 含 topic 且表达 required', /topic/.test(createJson) && /required/.test(createJson), createJson)
+  const rendered = byName.study_plan_status.output.render({}, { ok: true, goals: [] })
+  check('output.render 返回 text 段', Array.isArray(rendered) && rendered[0] && rendered[0].type === 'text' && JSON.parse(rendered[0].text).ok === true, rendered)
+  const st = await byName.study_plan_status.execute({})
+  check('study_plan_status 执行（含 temp 目标与 next_action）', st.ok === true && st.goals.some((g) => g.title === 'temp' && /打开该目标会话/.test(g.next_action)), st.goals && st.goals.map((g) => [g.title, g.status]))
+  const cr = await byName.study_plan_create.execute({ topic: '聊天工具测试', target_level: '演示' })
+  check('study_plan_create 建目标', cr.ok === true && String(cr.goal_id).startsWith('goal-'), cr)
+  const rs = await byName.study_plan_research.execute({ goal_id: cr.goal_id })
+  check('study_plan_research 无会话 → need_open', rs.ok === false && rs.need_open === true, rs)
+  const ap = await byName.study_plan_approve.execute({ goal_id: 'missing' })
+  check('study_plan_approve 不存在 → error', ap.ok === false && /目标不存在/.test(ap.error), ap)
+  await callRpc('study.deleteGoal', { goalId: cr.goal_id })
+  await callRpc('study.deleteGoal', { goalId: (st.goals.find((g) => g.title === 'temp') || {}).id })
+  const lf = await callRpc('study.list', {})
+  check('清理完毕 list 为空', lf.json.goals.length === 0, lf.json.goals.map((g) => g.id))
 }
 
 await fsp.rm(tmpRoot, { recursive: true, force: true })

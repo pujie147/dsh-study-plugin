@@ -1,19 +1,34 @@
 // ============================================================================
-// study-plugin — 宿主半（静态持久化版，M1）
+// study-plugin — 宿主半（静态持久化版，M1+M2）
 // 形态: profile 组合插件（cordis patch row 挂载，DSH 启动时自动装载，任何模式/会话可见）。
 // M1: /study-rpc webServer prefix 路由（学习区面板全部 study.* RPC）+ README 同步。
-// M2: 追加 ctx.inject(['tools'], sctx => sctx.tools.register(defineTool(...)))
-//     注册 study_plan_status/create/research/approve/reject（@deepseek-ai/dsh-tools）。
+// M2: study_plan_* 五个聊天工具（defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register）。
 //
 // 与动态版 src/host.js 的对照（契约完全一致，仅基础设施不同）:
 //   - fs 服务(fsService.resolve/stat/readText/writeText) → node:fs/promises（宿主平面受信）
 //   - harness.handle('study.*', fn)                     → handlers['study.*'] + webServer 路由分发
+//   - harness.defineTool + registerTool(ctx, tool)       → defineTool 静态版 + sctx.tools.register
 //   - ctx.get('agents'|'workspaceRegistry')             → ctx.inject([...]) 注入同名服务
 //   - console.log/error                                  → 同（宿主进程 console 可用）
 // ============================================================================
 import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+// ── M2 前置：静态 defineTool 解析（带降级）。解析失败只缺聊天工具，绝不拖垮 M1 路由/面板。
+let defineTool
+try {
+  defineTool = (await import('@deepseek-ai/dsh-tools')).defineTool
+} catch {
+  try {
+    const { createRequire } = await import('node:module')
+    const resolved = createRequire(new URL('./package.json', import.meta.url)).resolve('@deepseek-ai/dsh-tools')
+    defineTool = (await import(pathToFileURL(resolved).href)).defineTool
+  } catch {
+    defineTool = undefined
+  }
+}
 
 const name = 'study-engine'
 export { name }
@@ -59,7 +74,7 @@ export function apply(ctx, config) {
   const INDEX = BASE + '/index.json'
   const README_PATH = BASE + '/README.md'
 
-  ctx.inject(['webServer', 'agents', 'workspaceRegistry'], (sctx) => {
+  ctx.inject(['webServer', 'agents', 'workspaceRegistry', 'tools'], (sctx) => {
     const agents = sctx.agents
     const wsRegistry = sctx.workspaceRegistry
 
@@ -512,6 +527,127 @@ export function apply(ctx, config) {
       }
     }
 
+    // -------------------------------------------------------------- 聊天工具（study_plan_*，M2）
+    async function chatStatus() {
+      const idx = await readIndex()
+      const out = []
+      for (const row of (idx.goals || [])) {
+        const g = await readJson(row.path + '/goal.json')
+        if (!g || g.status === 'deleted') continue
+        try { await adoptDraftFile(g) } catch (e) {}
+        try { await adoptChapterFiles(g) } catch (e) {}
+        const chapters = Array.isArray(g.chapters) ? g.chapters : []
+        const done = chapters.filter((c) => c.status === 'done').length
+        const next = chapters.find((c) => c.status !== 'done')
+        let nextAction = ''
+        if (g.status === 'researching') nextAction = '调研/规划进行中：请先打开该目标会话，然后告诉我「开始调研」以触发联网调研'
+        else if (g.status === 'draft_pending') nextAction = '草案待批准（批准后生成章节；不满意可让我重新调研）'
+        else if (g.status === 'research_failed') nextAction = '上次调研失败，可让我重新调研'
+        else if (g.status === 'approved' || g.status === 'active' || g.status === 'completed') {
+          if (!chapters.length) nextAction = '章节待生成'
+          else if (!next) nextAction = '全部章节已学完'
+          else if (next.status === 'draft') nextAction = '下一步：生成第 ' + next.index + ' 章「' + next.title + '」讲义（可在学习区点「生成讲义」）'
+          else if (next.status === 'generating') nextAction = '第 ' + next.index + ' 章讲义生成中…'
+          else if (next.status === 'ready') nextAction = '下一步：开始学习第 ' + next.index + ' 章「' + next.title + '」（学习区点「📖 开始学习」）'
+        }
+        out.push({
+          id: g.id,
+          title: g.title,
+          status: g.status,
+          target_level: g.target_level || '',
+          requirements: g.requirements || '',
+          updatedAt: g.updatedAt || '',
+          chapters_done: done,
+          chapters_total: chapters.length,
+          next_chapter: next ? { index: next.index, title: next.title, status: next.status } : null,
+          next_action: nextAction,
+          draft_pending: g.status === 'draft_pending' && !!(g.draft && Array.isArray(g.draft.chapters) && g.draft.chapters.length),
+          session_ready: !!(g.sessionId || (g.workspaceId && wsRegistry && wsRegistry.get && wsRegistry.get(String(g.workspaceId)) && Array.isArray(wsRegistry.get(String(g.workspaceId)).sessionIds) && wsRegistry.get(String(g.workspaceId)).sessionIds.length)),
+          dir: row.path
+        })
+      }
+      out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+      return { ok: true, goals: out }
+    }
+
+    async function chatCreate(args) {
+      try {
+        const r = await createGoalDoc(args && args.topic, args && args.target_level, args && args.requirements)
+        return {
+          ok: true,
+          goal_id: r.goalId,
+          workspace_id: r.workspaceId,
+          dir: r.absDir,
+          next: '请先在左侧「学习区」打开该目标的会话一次（点目标行「📄 打开会话」），随后告诉我「开始调研」'
+        }
+      } catch (e) {
+        return { ok: false, error: errText(e) }
+      }
+    }
+
+    async function chatResearch(args) {
+      const goalId = String((args && args.goal_id) || '').trim()
+      if (!goalId) return { ok: false, error: '缺少 goal_id（创建目标时返回）' }
+      const g = await loadGoal(goalId)
+      if (!g) return { ok: false, error: '目标不存在: ' + goalId }
+      const absDir = await goalDir(g)
+      let sessionId = g.sessionId ? String(g.sessionId) : ''
+      if (!sessionId && agents && wsRegistry) {
+        try {
+          let ws = g.workspaceId ? wsRegistry.get(String(g.workspaceId)) : undefined
+          if (!ws) ws = await wsRegistry.resolveByPath(absDir)
+          if (ws && Array.isArray(ws.sessionIds)) {
+            for (const id of ws.sessionIds) {
+              if (agents.get(id)) { sessionId = String(id); break }
+            }
+          }
+        } catch (e) {}
+      }
+      if (!sessionId) {
+        return { ok: false, need_open: true, error: '目标会话尚未就绪：请先在左侧「学习区」点该目标的「📄 打开会话」一次，再让我重试' }
+      }
+      const agent = agents ? agents.get(sessionId) : undefined
+      if (!agent || typeof agent.followup !== 'function') {
+        return { ok: false, need_open: true, error: '目标会话代理未激活：请打开该目标会话（若已打开，请在该会话中随便发一条消息），然后让我重试' }
+      }
+      g.sessionId = sessionId
+      g.status = 'researching'
+      g.updatedAt = nowISO()
+      await saveGoal(g)
+      await clearDraftFile(absDir)
+      const reason = (g.draft && g.draft.reject_reason) ? String(g.draft.reject_reason) : ''
+      const text = reason ? retryInstruction(g, absDir, reason) : researchInstruction(g, absDir)
+      try {
+        injectToSession(sessionId, text)
+      } catch (e) {
+        return { ok: false, need_open: true, error: errText(e) }
+      }
+      return { ok: true, goal_id: goalId, session_id: sessionId, message: '调研指令已发送到该目标会话，AI 完成后草案会自动进入「待批准」' }
+    }
+
+    async function chatApprove(args) {
+      const g = await loadGoal(String((args && args.goal_id) || '').trim())
+      if (!g) return { ok: false, error: '目标不存在' }
+      try {
+        const n = await approveGoal(g)
+        return { ok: true, goal_id: g.id, chapters: n, message: '草案已批准，共 ' + n + ' 章' }
+      } catch (e) {
+        return { ok: false, error: errText(e) }
+      }
+    }
+
+    async function chatReject(args) {
+      const g = await loadGoal(String((args && args.goal_id) || '').trim())
+      if (!g) return { ok: false, error: '目标不存在' }
+      try {
+        const reason = String((args && args.reason) || '').trim()
+        await rejectGoal(g, reason)
+        return { ok: true, goal_id: g.id, message: '草案已退回' + (reason ? '（意见: ' + reason + '）' : '') + '。要我重新调研吗？' }
+      } catch (e) {
+        return { ok: false, error: errText(e) }
+      }
+    }
+
     // ── /study-rpc 路由（同源、loopback 守卫；面板经 fetch 调用） ───────────
     const handle = async (req, res) => {
       if (req.method !== 'POST') {
@@ -554,6 +690,57 @@ export function apply(ctx, config) {
       return () => { if (typeof dispose === 'function') dispose() }
     }, 'study-plugin: /study-rpc route')
 
+    // ── M2: study_plan_* 聊天工具（全局注册，所有会话可见；defineTool 不可用时仅缺这组工具） ──
+    sctx.effect(() => {
+      if (typeof defineTool !== 'function') {
+        console.error('study-plugin: 未能解析 @deepseek-ai/dsh-tools，study_plan_* 聊天工具未注册（面板与 RPC 不受影响）')
+        return
+      }
+      const specs = [
+        ['study_plan_status',
+          '列出本会话全部学习目标的最新状态与下一步建议（含草案待批准、章节进度）。当用户问学习进度/学到哪了/接下来学什么/继续学习时调用。',
+          {}, chatStatus],
+        ['study_plan_create',
+          '创建新学习目标（仅建文档与工作区，不自动调研）。当用户想学某主题/要一份学习计划时先与用户确认主题、目标水平与要求后调用，然后引导用户打开目标会话并提示可继续用 study_plan_research 触发联网调研。',
+          {
+            topic: { type: 'string', required: true, description: '学习主题，如 Transformer 基础' },
+            target_level: { type: 'string', required: true, description: '目标水平，如 能读懂论文并动手实现' },
+            requirements: { type: 'string', description: '附加要求，如 中文讲义、重直觉。可省略' }
+          }, chatCreate],
+        ['study_plan_research',
+          '对已有目标发起（或重发）联网调研：在该目标专属会话中注入课程规划任务，产出草案 draft.json 后状态自动变待批准。当用户说 开始调研/重新调研/重试调研 时调用。',
+          { goal_id: { type: 'string', required: true, description: '目标 id（创建或状态查询返回）' } }, chatResearch],
+        ['study_plan_approve',
+          '批准某目标的课程草案：写入章节清单（状态=已批准/学习中）。当用户说 批准/计划没问题/按这个来 时调用。',
+          { goal_id: { type: 'string', required: true, description: '目标 id' } }, chatApprove],
+        ['study_plan_reject',
+          '退回某目标的课程草案并记录修改意见（状态回到调研中，草案文件被清空）。当用户对草案不满意、要求按新方向重做时调用，随后通常继续 study_plan_research。',
+          {
+            goal_id: { type: 'string', required: true, description: '目标 id' },
+            reason: { type: 'string', description: '修改意见，如 章节太多，合并到6章' }
+          }, chatReject]
+      ]
+      const disposers = []
+      for (const [toolName, description, parameters, run] of specs) {
+        try {
+          disposers.push(sctx.tools.register(defineTool({
+            name: toolName,
+            description: description,
+            parameters: parameters,
+            output: {
+              schema: { type: 'object', additionalProperties: true },
+              render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }]
+            },
+            execute: async (args) => stripUndefined(await run(args || {}))
+          })))
+          console.log('study-plugin: tool registered: ' + toolName)
+        } catch (e) {
+          console.error('study-plugin: register tool failed ' + toolName + ': ' + errText(e))
+        }
+      }
+      return () => { for (const d of disposers) { try { d() } catch {} } }
+    }, 'study-plugin: study_plan_* tools')
+
     // ------------------------------------------------------------------ README 同步
     const README_LINES = [
       '# 📚 学习区（study-work）使用说明',
@@ -591,13 +778,13 @@ export function apply(ctx, config) {
       '',
       '## 对话入口（在聊天里直接管理）',
       '可用工具: study_plan_status(进度总览与下一步) / study_plan_create(创建目标) / study_plan_research(发起调研) / study_plan_approve(批准草案) / study_plan_reject(退回草案)。',
-      '注: 常驻版 M1 阶段该组工具仍由动态版提供——在「创造模式」会话按 plugin/INSTALL.txt 激活一次即可（全局生效，任何模式可用）；M2 完成后由常驻插件直接提供，无需激活。',
+      '注: 该组工具由本常驻插件直接提供，DSH 启动即全局可用，任何模式无需激活。',
       '示例问法: 「看看我的学习进度」「帮我建一个学 XX 的计划（目标: …）」「开始调研」「草案可以，批准」「草案不行，XX 方向重做」。',
       '注意: 创建后需要先把目标总会话打开过一次（📄 打开会话），chat 工具才能向它注入调研任务。',
       '',
       '## 重启与恢复',
       '1. 数据都在 ~/.dsh/study-work；目标对应的工作区/会话（id 记录在 goal.json 的 workspaceId/sessionId 与 storages 中）在 DSH 重启后仍然存在。',
-      '2. 常驻插件随 DSH 进程自动装载，重启后面板无需任何操作；仅 study_plan_* 聊天工具（M2 前）需在创造模式会话激活一次。',
+      '2. 常驻插件（面板 + study_plan_* 聊天工具）随 DSH 进程自动装载，重启后无需任何激活操作。',
       '3. 若常驻插件不可用（如回退到旧版本），可退而求其次：直接用文件工具读写上述 JSON，并在目标/章节会话中继续学习，面板仅作展示。',
       '',
       '## 提示',
