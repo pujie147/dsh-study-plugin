@@ -1,0 +1,6 @@
+# study-plugin bundle patch: 把本插件插入 profile 层栈（开机自动装载）。
+# 安装 = 把本包放入 profile node_modules（或 dsh plugin --profile <name> add study-plugin）；
+# 本文件由 dsh-app-boot 在合成 profile 时自动应用，无需用户手改 cordis.patch.yml。
+- insert:
+    - id: study-engine
+      name: study-plugin
