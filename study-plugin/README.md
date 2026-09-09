@@ -22,15 +22,26 @@ node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 prof
 ```
 开发说明：`node_modules/@deepseek-ai/dsh-tools` 是指向本机宿主副本的 **dev junction**（仅开发用；真实目录安装无需它，终端用户经 DSH 宿主桥接解析，净室脚本已验证）。
 
-## 安装（本机 web profile，幂等可重跑）
-```powershell
-cd C:\Users\pyg12\gitProjects\study_dsh_plugin\study-plugin
-node scripts/install-profile.mjs              # 默认 $DSH_HOME/profiles/web（或 ~/.dsh/profiles/web）
-node scripts/install-profile.mjs --profile <dir>   # 指定其他 profile
-node scripts/install-profile.mjs --uninstall       # 卸载（删链接 + 撤注册，自动备份）
+## 安装（他人机器，官方通道）
+```bash
+# GitHub 渠道（发布仓 = https://github.com/pujie147/dsh-study-plugin）
+dsh plugin --profile web add github:pujie147/dsh-study-plugin
 ```
-Windows 用目录 Junction（免管理员；符号链接需提权）。发布期（M3）亦可：`dsh plugin --profile web add study-plugin`。
-重启 DSH 后：
+装完**重启 DSH** 即生效：左栏出现「📚 学习区」（任何模式），`study_plan_*` 五工具全局可用。
+注意事项（来自官方安装器的已知边界）：
+- GitHub 通道经 `git ls-remote` + `codeload.github.com` 拉取 tarball 预检；大陆网络直连 codeload 常失败——配好系统代理后重试。npm 渠道发布后可改 `dsh plugin --profile web add study-plugin`。
+- pnpm 11 供应链策略可能拦首次安装：报 `Minimum release age` = 发布未满 24h（等或配 `minimumReleaseAge: 0`）；报 `untrusted origin` = 删 profile 目录 `node_modules` 与 `pnpm-lock.yaml` 后重装。
+- 数据根目录 = `~/.dsh/study-work`（自动创建）；更新 `dsh plugin --profile web update study-plugin`；卸载在「已安装」列表。
+
+## 本机开发安装（幂等脚本）
+```powershell
+cd study-plugin
+node scripts/build-client.mjs        # 改过 src/ 后重建客户端 bundle（--sync-css 从动态版同步 CSS）
+node scripts/install-profile.mjs     # 默认 $DSH_HOME/profiles/web；支持 --profile <dir> / --uninstall
+node test/smoke.mjs                  # 冒烟 33 断言
+node scripts/cleanroom-check.mjs     # 净室安装验证（离线）
+```
+Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - 左栏出现「📚 学习区」（任何模式）
 - `curl -X POST http://127.0.0.1:3080/study-rpc -d '{"method":"study.list","args":{}}'` 返回 `{goals:[…]}`
 - `~/.dsh/study-work/README.md` 被刷新为常驻版文案

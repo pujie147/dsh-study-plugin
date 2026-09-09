@@ -12,7 +12,8 @@
 - [x] T7b 重启 DSH 验证：M1 验收通过（用户确认 + 独立证据：GET→405 文本、POST study.list→200 真实 3 目标、README 14:15 刷新）
 - [x] T8（M2）study_plan_* 工具静态化：5 工具 defineTool 注册 + chat* 五函数移植；冒烟扩至 33/33（含真实 defineTool 编译）
 - [x] T8b 重启 DSH 验证 M2：**通过**（标准模式会话直接调用 study_plan_status → 真实 2 目标 + next_action/session_ready；GET 405/POST 200；README 14:43 刷新为新文案）
-- [ ] T9（M3）发布分发：宿主半已无硬编码（os.homedir 兜底 + workRoot config）；剩 LICENSE/CHANGELOG、`npm pack --dry-run` 内容核对、**净室安装测试**（真实目录安装模拟终端用户，验证无 junction 时 dsh-tools 解析链——free-search 同构可对照）、发布渠道（npm 或 GitHub）
+- [x] T9（M3）发布分发完成：**GitHub 渠道上线** `pujie147/dsh-study-plugin`（main=v0.1.0=0793c9b；净室 + git clone 双验证）；CSS 固化包内 src/client.css（build 不再依赖仓库根，--sync-css 同步）；LICENSE/CHANGELOG/repository 字段；发布脚本 scripts/publish-repo.mjs（pack→解包→GIT_DIR 分离仓→push）；M3 修正：包**不声明** dsh-tools 依赖（与 free-search 对齐，走 DSH profiles/node_modules 宿主桥接——本机实测该桥接存在且指向宿主同实例）
+- [ ] 后续可选：npm 渠道（需 npm login；study-plugin 名字 npmjs 空闲）、dshmarket 收录、终端用户真实安装验证（本机网络 codeload/raw 被墙，github 通道需代理；git clone 通道实测可用）
 
 ## M2 关键基建发现（重要，防再踩坑）
 - `@deepseek-ai/dsh-tools` 实际住在 **DSH 全局安装树嵌套**：`%AppData%\Roaming\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-tools`（v0.1.0-rc.7）；profile node_modules 只有 cosmokit/schemastery，**普通 ESM 从 profile 路径也解析不到 dsh-tools**（free-search 能跑是靠 DSH 装载器侧的解析链，非标准 ESM 规则）。
@@ -30,4 +31,4 @@
 - 无。M1+M2 已在线上（本机常驻运行）。
 
 ## 下一步
-M3（T9）：①LICENSE/CHANGELOG + npm pack 内容核对；②净室安装测试（临时目录模拟真实安装路径，验证终端用户无 workspace junction 时 defineTool 解析链）；③发布（用户选 npm 或 GitHub，dshmarket 收录可选）。最初诉求"插件在任何模式都可以使用"已由 M1+M2 闭环。
+主线全部完成（M1 面板 + M2 工具 + M3 发布）。可选延伸见 T9 后续项。恢复协议：读本文件 + 10-intent.md + `git log --oneline`。

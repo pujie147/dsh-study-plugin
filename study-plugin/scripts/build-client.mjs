@@ -1,9 +1,11 @@
-// build-client.mjs — 零依赖构建：src/client.mjs → lib/client.js
+// build-client.mjs — 零依赖构建：src/client.mjs + src/client.css → lib/client.js
 // 产物 = 浏览器经典脚本：window.__ModuleLoader__.load({ id, factory:(require)=>{…} })
-//  1) 从仓库根 src/client.js 的 styles.insert('…') 提取完整 CSS（单一事实来源）
-//  2) 内联 CSS 为 <style data-plugin-css="study-plugin/client.css"> 标签（静态模块无 styles.insert API）
-//  3) externals 仅 react（浏览器模块表的 seed 模块，factory 的 require("react") 解析它）
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+//  1) CSS 取包内 src/client.css（单一事实来源，可独立发布；开发仓库内与动态版
+//     src/client.js 的 styles.insert 做一致性核对，漂移即报错）
+//  2) 内联为 <style data-plugin-css> 标签（静态模块无 styles.insert API）
+//  3) externals 仅 react（浏览器模块表 seed，factory 的 require("react") 解析它）
+// 用法: node scripts/build-client.mjs [--sync-css | --allow-css-drift]
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -11,17 +13,52 @@ const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = join(pluginRoot, '..')
 const read = (rel) => readFileSync(join(pluginRoot, rel), 'utf8')
 
-// 1) 提取 CSS
-const dyn = readFileSync(join(repoRoot, 'src', 'client.js'), 'utf8')
-const marker = "styles.insert('"
-const start = dyn.indexOf(marker)
-if (start < 0) throw new Error('src/client.js 中未找到 styles.insert( — 提取 CSS 失败')
-const end = dyn.indexOf("')", start + marker.length)
-if (end < 0) throw new Error('styles.insert 结束标记未找到')
-const css = dyn.slice(start + marker.length, end)
-if (css.length < 100) throw new Error('提取到的 CSS 过短，疑似错误: ' + css.length)
+function extractFromDynamic(dynPath) {
+  const dyn = readFileSync(dynPath, 'utf8')
+  const marker = "styles.insert('"
+  const start = dyn.indexOf(marker)
+  if (start < 0) throw new Error('动态版未找到 styles.insert( — 无法提取 CSS')
+  const end = dyn.indexOf("')", start + marker.length)
+  if (end < 0) throw new Error('styles.insert 结束标记未找到')
+  return dyn.slice(start + marker.length, end)
+}
 
-// 2) 读客户端源码（bundle 作用域，纯 JS，无 import/export）
+const cssRel = 'src/client.css'
+const cssAbs = join(pluginRoot, cssRel)
+const dynClient = join(repoRoot, 'src', 'client.js')
+
+// --sync-css：从动态版重新提取并写包内 CSS（开发仓库内使用）
+if (process.argv.includes('--sync-css')) {
+  const src = extractFromDynamic(dynClient)
+  writeFileSync(cssAbs, src, 'utf8')
+  console.log('[build] 已从动态版同步 ' + cssRel + '（' + src.length + ' chars）')
+  process.exit(0)
+}
+
+// 1) CSS：包内文件为准（首次缺失则自动从动态版提取生成）
+let css
+if (existsSync(cssAbs)) {
+  css = readFileSync(cssAbs, 'utf8')
+} else if (existsSync(dynClient)) {
+  css = extractFromDynamic(dynClient)
+  writeFileSync(cssAbs, css, 'utf8')
+  console.log('[build] 首次生成 ' + cssRel + '（从动态版 styles.insert 提取），请纳入版本管理')
+} else {
+  throw new Error(cssRel + ' 缺失且无动态版可提取 — 请从仓库运行或恢复包内 CSS')
+}
+if (css.length < 100) throw new Error(cssRel + ' 过短，疑似错误: ' + css.length)
+
+// 一致性核对（仅开发仓库；独立发布包无 ../src 自动跳过）
+if (existsSync(dynClient)) {
+  const dynCss = extractFromDynamic(dynClient).replace(/\s+$/, '')
+  if (dynCss !== css.replace(/\s+$/, '')) {
+    const msg = 'CSS 漂移: src/client.css 与动态版 styles.insert 不一致（改动动态版后请运行: node scripts/build-client.mjs --sync-css）'
+    if (!process.argv.includes('--allow-css-drift')) throw new Error(msg)
+    console.warn('[build] 警告: ' + msg)
+  }
+}
+
+// 2) 客户端源码（bundle 作用域，纯 JS，无 import/export）
 const client = read('src/client.mjs')
 
 // 3) 组装

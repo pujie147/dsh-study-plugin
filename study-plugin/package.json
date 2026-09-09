@@ -27,6 +27,10 @@
     "cleanroom": "node scripts/cleanroom-check.mjs"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pujie147/dsh-study-plugin.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "cordis.patch.yml"

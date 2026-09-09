@@ -1,5 +1,9 @@
 # 安装 / 重装 / 恢复指引（study_dsh_plugin）
 
+> **首选：常驻插件包** —— `cd study-plugin && node scripts/install-profile.mjs` + 重启 DSH。
+> 一次安装永久在线（任何模式/会话、重启不丢、含 study_plan_* 工具），见 [study-plugin/README.md](study-plugin/README.md)。
+> 本文余下内容为**动态插件**（路线 A 回退）：源码需在会话内通过 `cordis_define` 定义并 `cordis_run` 激活，DSH 进程重启后需重新激活。
+
 插件以 **DSH 动态插件** 形态运行：源码需在会话内通过 `cordis_define` 定义并 `cordis_run` 激活。
 本仓库保存源码与打包产物，使「重装 / 重启恢复」可重复执行。
 
