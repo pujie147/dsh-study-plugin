@@ -11,8 +11,8 @@
 - [x] T7 阶段2 安装：Junction 链接 + profile 注册完成；提供幂等脚本 `scripts/install-profile.mjs`（用户选择手动重跑亦可）
 - [x] T7b 重启 DSH 验证：M1 验收通过（用户确认 + 独立证据：GET→405 文本、POST study.list→200 真实 3 目标、README 14:15 刷新）
 - [x] T8（M2）study_plan_* 工具静态化：5 工具 defineTool 注册 + chat* 五函数移植；冒烟扩至 33/33（含真实 defineTool 编译）
-- [ ] T8b 重启 DSH 验证 M2：标准模式会话里 study_plan_status 可被模型调用
-- [ ] T9（M3）去硬编码/config 化 + 发布分发
+- [x] T8b 重启 DSH 验证 M2：**通过**（标准模式会话直接调用 study_plan_status → 真实 2 目标 + next_action/session_ready；GET 405/POST 200；README 14:43 刷新为新文案）
+- [ ] T9（M3）发布分发：宿主半已无硬编码（os.homedir 兜底 + workRoot config）；剩 LICENSE/CHANGELOG、`npm pack --dry-run` 内容核对、**净室安装测试**（真实目录安装模拟终端用户，验证无 junction 时 dsh-tools 解析链——free-search 同构可对照）、发布渠道（npm 或 GitHub）
 
 ## M2 关键基建发现（重要，防再踩坑）
 - `@deepseek-ai/dsh-tools` 实际住在 **DSH 全局安装树嵌套**：`%AppData%\Roaming\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\dsh-tools`（v0.1.0-rc.7）；profile node_modules 只有 cosmokit/schemastery，**普通 ESM 从 profile 路径也解析不到 dsh-tools**（free-search 能跑是靠 DSH 装载器侧的解析链，非标准 ESM 规则）。
@@ -27,7 +27,7 @@
 - 已知原行为保留（非 M1 回归）：reject 后内存 draft 保留旧内容（带 rejected 标志），list 映射不含 rejected 字段；「重新调研」重触发走 chat 工具 study_plan_research（M2 静态化）。
 
 ## 阻塞
-- T7 起依赖用户在场 + `~/.dsh` 写入审批 + DSH 重启。
+- 无。M1+M2 已在线上（本机常驻运行）。
 
 ## 下一步
-T8b：重启 DSH（宿主代码改动不热载）→ 验证：①标准模式新会话里问「看看我的学习进度」→ 模型调用 study_plan_status 并列出真实目标；②面板照常；③README 再刷新（新文案「该组工具由常驻插件直接提供」）。全过 → M2 收口，进 M3。
+M3（T9）：①LICENSE/CHANGELOG + npm pack 内容核对；②净室安装测试（临时目录模拟真实安装路径，验证终端用户无 workspace junction 时 defineTool 解析链）；③发布（用户选 npm 或 GitHub，dshmarket 收录可选）。最初诉求"插件在任何模式都可以使用"已由 M1+M2 闭环。
