@@ -25,13 +25,14 @@ node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 prof
 ## 安装（他人机器，官方通道）
 ```bash
 # GitHub 渠道（发布仓 = https://github.com/pujie147/dsh-study-plugin）
-dsh plugin --profile web add github:pujie147/dsh-study-plugin
+# git+https 形式经 pnpm 直接 git clone（对代理/受限网络最稳）；github: 简写走 codeload tarball 快捷路径
+dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.git
 ```
 装完**重启 DSH** 即生效：左栏出现「📚 学习区」（任何模式），`study_plan_*` 五工具全局可用。
 注意事项（来自官方安装器的已知边界）：
-- GitHub 通道经 `git ls-remote` + `codeload.github.com` 拉取 tarball 预检；大陆网络直连 codeload 常失败——配好系统代理后重试。npm 渠道发布后可改 `dsh plugin --profile web add study-plugin`。
-- pnpm 11 供应链策略可能拦首次安装：报 `Minimum release age` = 发布未满 24h（等或配 `minimumReleaseAge: 0`）；报 `untrusted origin` = 删 profile 目录 `node_modules` 与 `pnpm-lock.yaml` 后重装。
-- 数据根目录 = `~/.dsh/study-work`（自动创建）；更新 `dsh plugin --profile web update study-plugin`；卸载在「已安装」列表。
+- `dsh plugin` 底层是把参数转发给 profile 目录里的 pnpm。pnpm 11 供应链策略可能拦首次安装：报 `Minimum release age` = 发布未满 24h（等或配 `minimumReleaseAge: 0`）；报 `untrusted origin` = 删 profile 目录 `node_modules` 与 `pnpm-lock.yaml` 后重装。
+- 数据根目录 = `~/.dsh/study-work`（自动创建）；更新：`dsh plugin --profile web update study-plugin`；卸载在「已安装」列表或 `dsh plugin --profile web remove study-plugin`。
+- 后续提供 npm 渠道后可直接 `dsh plugin --profile web add study-plugin`。
 
 ## 本机开发安装（幂等脚本）
 ```powershell
