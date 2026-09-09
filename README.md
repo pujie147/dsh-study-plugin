@@ -17,7 +17,7 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-node test/smoke.mjs                 # 宿主半运行时冒烟（33 断言）
+node test/smoke.mjs                 # 宿主半运行时冒烟（37 断言）
 node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
 ```
 开发说明：`node_modules/@deepseek-ai/dsh-tools` 是指向本机宿主副本的 **dev junction**（仅开发用；真实目录安装无需它，终端用户经 DSH 宿主桥接解析，净室脚本已验证）。
@@ -39,7 +39,7 @@ dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.gi
 cd study-plugin
 node scripts/build-client.mjs        # 改过 src/ 后重建客户端 bundle（--sync-css 从动态版同步 CSS）
 node scripts/install-profile.mjs     # 默认 $DSH_HOME/profiles/web；支持 --profile <dir> / --uninstall
-node test/smoke.mjs                  # 冒烟 33 断言
+node test/smoke.mjs                  # 冒烟 37 断言
 node scripts/cleanroom-check.mjs     # 净室安装验证（离线）
 ```
 Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：

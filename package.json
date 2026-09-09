@@ -1,6 +1,6 @@
 {
   "name": "study-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_* 聊天工具。",
   "type": "module",
   "main": "lib/index.js",
