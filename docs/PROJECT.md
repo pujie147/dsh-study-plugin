@@ -168,7 +168,7 @@ study-work/
 | 附件 | `attachmentId = "sha256:<内容哈希>"`，内容寻址 ⇒ 重新落盘后 id 不变，会话引用不悬空 |
 | 全局单文件 | `storages/workspace.json`（所有工作区 + 持久顺序 + 归档集合）；`session_projcache.json` 可再生 ⇒ 都不进导出包、都不直接改写 |
 | 存活会话 | 导出前必须 `sessions.flush(sessions.get(id))`，否则包里只有上次 flush 的前缀；导入时该会话 LIVE ⇒ 宿主回写会盖掉结果 ⇒ 硬冲突 |
-| 测试夹具 | `test/host-fixture.mjs` 用宿主真实 `JsonlSessionPersistence` + `WorkspaceRegistry`（假一个内存 `storageDomain`，`ctx.sessions.prepare` 给轻量 stub）；**模块路径必须 realpath 成长文件名**，8.3 短名会让 cordis 的 URL 模式匹配失效 |
+| 测试夹具 | `test/host-fixture.mjs` 用宿主真实 `JsonlSessionPersistence` + `WorkspaceRegistry`（只假一个内存 `storageDomain`），`ctx.sessions` 用**真实 `SessionStore`**（跑 `Session.fromRestore` 的 surface 校验，比手写 stub 严格）；**模块路径必须 realpath 成长文件名**——8.3 短名（`PYG12~1`）会让 cordis 的 `/@deepseek-ai/` URL 模式匹配失效，裸标识符导入全灭 |
 
 ### 会话注入协议
 

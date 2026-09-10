@@ -200,6 +200,7 @@ try {
   // ── 8. 用宿主真实后端交叉验证我写出的字节（取不到就明确跳过，不放宽断言） ───
   {
     const H = await createHostServices({ sessionsRoot: path.join(tmp, 'host-sessions') })
+    if (H) console.log('  \u00b7 交叉验证用 ctx.sessions = ' + (H.usingRealSessionStore ? '真实 SessionStore' : '最小 stub'))
     if (!H) {
       console.log('  skip — 本机取不到宿主 dsh-session-persistence-jsonl / dsh-workspace，跳过真后端交叉验证')
     } else {

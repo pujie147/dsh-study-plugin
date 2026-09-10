@@ -107,7 +107,7 @@ export function makeStorageDomain(initial = { initialized: false, workspaceIds: 
 
 /**
  * 装载宿主真实实现。宿主不可得时返回 undefined ⇒ 调用方**跳过**而不是放宽断言。
- * @returns {Promise<undefined|{JsonlSessionPersistence,WorkspaceRegistry,Service,createRoots}>}
+ * @returns {Promise<undefined|{JsonlSessionPersistence,WorkspaceRegistry,Service,SessionStore?}>}
  */
 export async function loadHost() {
   const pUrl = tryResolve('@deepseek-ai/dsh-session-persistence-jsonl')
@@ -117,31 +117,41 @@ export async function loadHost() {
   const [{ default: JsonlSessionPersistence }, { default: WorkspaceRegistry }, cordis] = await Promise.all([
     import(pUrl), import(wUrl), import(cUrl),
   ])
-  return { JsonlSessionPersistence, WorkspaceRegistry, Service: cordis.Service }
+  let SessionStore = undefined
+  try {
+    const su = tryResolve('@deepseek-ai/dsh-session')
+    if (su) SessionStore = (await import(su)).SessionStore
+  } catch {}
+  return { JsonlSessionPersistence, WorkspaceRegistry, Service: cordis.Service, SessionStore }
 }
+
+/** 协调器 prepareCore 只用返回值的 header / events.length（实测）；真实 SessionStore 可用时不必走这里。 */
+const stubPrepare = (id, { seed, meta }) => ({ id, header: meta, events: Object.freeze((seed || []).map((e) => Object.freeze(e))) })
 
 /**
  * 起一套真的会话存储 + 工作区注册表（同一临时根目录）。
  * @param {{sessionsRoot:string, sessions?:object}} opts
- *   sessions - 覆盖给宿主用的 sessions 服务（必须能被 list()/get() 调用；缺 prepare 时补默认，
- *   因为协调器的 inspect 校验要走 sessions.prepare）。
+ *   sessions - 覆盖给宿主用的 sessions 服务（要有 list()/get()）。
+ *
+ * `ctx.sessions` 优先用**宿主真实 SessionStore**：它比手写 stub 严格更强（会跑 Session.fromRestore
+ * 的 surfaceOp 校验），我写坏的帧/行更容易被当场抓住；拿不到时退回最小 stub 并如实报出用哪个。
  */
 export async function createHostServices({ sessionsRoot, sessions }) {
   const host = await loadHost()
   if (!host) return undefined
   const storageDomain = makeStorageDomain()
-  const hostSessions = {
-    list: () => [],
-    get: () => undefined,
-    // 协调器 prepareCore 只用到返回值的 header / events.length（实测）
-    prepare: (id, { seed, meta }) => ({ id, header: meta, events: Object.freeze((seed || []).map((e) => Object.freeze(e))) }),
-    ...(sessions || {}),
-  }
-  if (typeof hostSessions.prepare !== 'function') {
-    hostSessions.prepare = (id, { seed, meta }) => ({ id, header: meta, events: Object.freeze((seed || []).map((e) => Object.freeze(e))) })
+  const fallbackSessions = { list: () => [], get: () => undefined, ...(sessions || {}) }
+  if (typeof fallbackSessions.prepare !== 'function') fallbackSessions.prepare = stubPrepare
+  let hostSessions = fallbackSessions
+  let usingRealSessionStore = false
+  if (host.SessionStore) {
+    try {
+      hostSessions = new host.SessionStore(makeStubCtx({}))
+      usingRealSessionStore = true
+    } catch { hostSessions = fallbackSessions }
   }
   const persistence = new host.JsonlSessionPersistence(makeStubCtx({ storageDomain, sessions: hostSessions }), { root: sessionsRoot, compression: 'zstd' })
   const registry = new host.WorkspaceRegistry(makeStubCtx({ storageDomain, sessions: hostSessions, sessionPersistence: persistence }))
   await registry[host.Service.init]()
-  return { host, persistence, registry, storageDomain, sessions: hostSessions }
+  return { host, persistence, registry, storageDomain, sessions: hostSessions, usingRealSessionStore, fallbackSessions }
 }

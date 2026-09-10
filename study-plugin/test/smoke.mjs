@@ -45,6 +45,7 @@ if (!H) {
     '      这条测试的前提就是跑宿主代码；请确认本机装了 DSH（或 profile 里有这两个包）。')
   process.exit(1)
 }
+console.log('  \u00b7 ctx.sessions = ' + (H.usingRealSessionStore ? '宿主真实 SessionStore（会跑 Session.fromRestore 的 surface 校验）' : '最小 stub（拿不到宿主 dsh-session）'))
 const mockPersistence = H.persistence
 const wsRegistryReal = H.registry
 
