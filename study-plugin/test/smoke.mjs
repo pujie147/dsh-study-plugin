@@ -406,6 +406,17 @@ let exportedGoalId = ''
   check('空闲但在归档集里的 id 不复用（why 说明归档）', archImp.json && archImp.json.ok === true && archRemap.length === 1 && archRemap[0].remoteId === 'sess-ch-1' && /归档/.test(archRemap[0].why), archRemap)
   check('未归档的空闲 id 沿用原身份（不无谓换发）', (await projectionOf(goalAbsDir)).filter((id) => id === 'sess-goal-1' || id === 'sess-sub-1').length === 2, await projectionOf(goalAbsDir))
 
+  // ── P8.5 血缘不同的同名目录 ⇒ 默认挡住，force 才放行（D21）
+  const ledPath = path.join(goalAbsDir, '.study-sync.json')
+  const ledReal = await fsp.readFile(ledPath, 'utf8')
+  await fsp.writeFile(ledPath, JSON.stringify({ v: 1, remoteGoalId: 'goal-someone-else', sessions: [] }))
+  const unrel = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite' })
+  check('同名目录血缘不同 ⇒ 默认被 goalUnrelated 挡住（不会误盖别人的目标）', unrel.json && unrel.json.ok === false && (unrel.json.conflicts || []).some((c) => c.kind === 'goalUnrelated'), unrel.json && { err: unrel.json.error, conflicts: (unrel.json.conflicts || []).map((c) => c.kind) })
+  const unrelForce = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite', force: true })
+  check('带 force 才允许覆盖血缘不同的同名目录，并留下告警', unrelForce.json && unrelForce.json.ok === true && /force 覆盖/.test((unrelForce.json.warnings || []).join(' ')), unrelForce.json && { ok: unrelForce.json.ok, w: unrelForce.json.warnings })
+  check('换身份后旧席位被摘除（投影仍是每条一席，不堆积）', (await projectionOf(goalAbsDir)).length === 3, await projectionOf(goalAbsDir))
+  await fsp.writeFile(ledPath, ledReal)
+
   // ── P9 终态：主目标在、投影齐全、没有一条被归档集藏起来、无空目录残留 ──────
   const finProj = await projectionOf(goalAbsDir)
   check('终态：主目标工作区投影 3 条齐全', finProj.length === 3, finProj)

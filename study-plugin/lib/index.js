@@ -1077,7 +1077,8 @@ export function apply(ctx, config) {
         || String(existingLedger.remoteGoalId || '') === remoteGoalId
         || String((existingGoal && existingGoal.id) || '') === goalId && !existingLedger.remoteGoalId
       if (dirExists && mode !== 'copy') {
-        if (!sameLineage) conflicts.push({ kind: 'goalUnrelated', detail: absDir, hint: '同名目录已存在但血缘不同（不是这个目标导出的）：带 force 才会覆盖，或改用「另存为副本」' })
+        if (!sameLineage && force) warnings.push('同名目录 ' + goalId + ' 血缘不同（不是这个包导出的目标），已按 force 覆盖')
+        else if (!sameLineage) conflicts.push({ kind: 'goalUnrelated', detail: absDir, hint: '同名目录已存在但血缘不同（不是这个目标导出的）：带 force 才会覆盖，或改用「另存为副本」' })
       }
       const idx = await readIndex()
       if ((idx.goals || []).some((r) => r.id === goalId && r.status === 'active') && mode !== 'copy') {
@@ -1106,7 +1107,34 @@ export function apply(ctx, config) {
         const mappedId = ledgerLocalOf(existingLedger, remoteId)
         // 候选顺序：账本里已分配的本地 id（幂等的关键）→ 包里的 id → 换新 id。
         // 淘汰条件：该 id 已被别的 project 目录占用（约束 1）；或它在宿主归档集里（约束 2）。
-        const candidates = []
+        /**
+       * 不依赖账本的身份兜底：账本可能被手删/写失败（见导入返回的对应告警），
+       * 此时"本机这条就是包里的同一条会话"仍可从**内容**认出来 —— 逐行相同（除 header）
+       * 且不在归档集里 ⇒ 复用它，避免每次导入都多留一份副本席位。
+       */
+      async function findContentTwin(cwd, s) {
+        const pkgBuf = (opts._entries || new Map()).get(s.entry)
+        if (pkgBuf === undefined || pkgBuf.length > MAX_DECODE_BYTES) return ''
+        let pkgLines
+        try {
+          pkgLines = s.encoding === 'jsonl' ? pkgBuf.toString('utf8').split('\n').filter(Boolean).slice(1) : P.analyzeTranscript(pkgBuf).lines
+        } catch { return '' }
+        let pdir = ''
+        try { pdir = projectDirOf(cwd) } catch { return '' }
+        for (const it of await fsp.readdir(pdir, { withFileTypes: true }).catch(() => [])) {
+          if (!it.isDirectory()) continue
+          let buf
+          try { buf = await fsp.readFile(path.join(pdir, it.name, 'session.jsonl.zstd')) } catch { continue }
+          if (buf.length > MAX_DECODE_BYTES) continue
+          let h, lines
+          try { h = P.readSessionHeader(buf); lines = P.analyzeTranscript(buf).lines } catch { continue }
+          const id = String(h.id || '')
+          if (!id || usedLocalIds.has(id) || archivedSet.has(id)) continue
+          if (P.compareTranscriptLines(lines, pkgLines) === 'same') return id
+        }
+        return ''
+      }
+      const candidates = []
         if (mappedId) candidates.push({ id: mappedId, from: 'ledger' })
         if (s.id !== mappedId) candidates.push({ id: s.id, from: 'pkg' })
         let chosen = null, why = ''
@@ -1117,6 +1145,10 @@ export function apply(ctx, config) {
           if (archivedSet.has(c.id)) { why = 'id ' + c.id + ' 在宿主归档集里（沿用会被隐藏，宿主没有取消归档 API）'; continue }
           chosen = { id: c.id, identity: c.from === 'ledger' ? 'adopt' : 'fresh' }
           break
+        }
+        if (!chosen) {
+          const twin = await findContentTwin(canonicalDir, s)
+          if (twin) chosen = { id: twin, identity: 'update' }
         }
         if (!chosen) { chosen = { id: 'session-' + randomUUID(), identity: 'reissue' }; why = why || '包内 id 与本机已有会话冲突' }
         if (usedLocalIds.has(chosen.id)) { chosen = { id: 'session-' + randomUUID(), identity: 'reissue' }; why = '包内 id 重复，换发新身份' }
