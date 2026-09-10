@@ -4,7 +4,8 @@
 //       触发 onClick/onChange，断言打到 /study-rpc 的调用序列与界面文案。
 // 覆盖: 面板开合 → 目标列表 → 展开 → 📤 导出 → 成功提示 + 切到 📦 视图 + 下载链接 →
 //       导入路径 → 🔍 预览（含"将重写会话 cwd"）→ ✓ 确认导入 → 冲突时确认按钮禁用 → 🔗 重新绑定会话 →
-//       📄 打开会话(D10 幂等) → researching 三态(D16: 未派发/已派发/会话已销毁) 与「▶ 开始调研」。
+//       📄 打开会话(D10 幂等) → researching 三态(D16: 未派发/已派发/会话已销毁) 与「▶ 开始调研」→
+//       空列表仍渲染「＋ 添加学习目标」（回归：它曾被关在 goals.length>0 分支，新装/删空后面板没有创建入口）。
 // React 桩的 useEffect/useCallback 按槽位记 deps（与真实 React 一致）：否则每次渲染都会重跑
 // 「打开面板就 refresh」的副作用，把 doAction 刚写上的失败红字异步清掉，测试就会假失败。
 import assert from 'node:assert/strict'
@@ -62,8 +63,9 @@ const planOk = {
   ]
 }
 let inspectResult = { ok: true, canImport: true, conflicts: [], warnings: ['附件服务不可用时图片不会落盘'], plan: planOk }
+let listGoals = [goalRow, researchRow, dispatchedRow, ghostRow, pendingRow]
 const handlers = {
-  'study.list': () => ({ goals: [goalRow, researchRow, dispatchedRow, ghostRow, pendingRow] }),
+  'study.list': () => ({ goals: listGoals }),
   'study.rejectDraft': (a) => { rpc.push(['reject', a]); return { ok: true } },
   'study.dispatchResearch': (a) => { rpc.push(['dispatch', a]); return dispatchResult },
   'study.recordGoalSession': (a) => { rpc.push(['record', a]); return { ok: true, sessionId: a.sessionId } },
@@ -336,5 +338,22 @@ const seq = rpc.filter((c) => c[0] === 'reject' || c[0] === 'dispatch').map((c) 
 assert.ok(seq.indexOf('reject:goal-pending') >= 0 && seq.indexOf('dispatch:goal-pending') === seq.indexOf('reject:goal-pending') + 1,
   '应「先 rejectDraft 再 dispatchResearch」: ' + JSON.stringify(seq))
 ok('D16：草案待批准的「重新调研」名副其实——rejectDraft 后紧接 dispatchResearch')
+
+// ── 空列表：提示文案与「＋ 添加学习目标」必须同时在场（回归：按钮曾被关在
+//    goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口）────────
+assert.ok(flat.some((e) => e.type === 'button' && e.props.className === 'stuiAdd'), '非空列表也应有「＋ 添加学习目标」')
+ok('非空列表渲染「＋ 添加学习目标」')
+// 打开面板的 useEffect 只跑一次（桩按槽位记 deps，与真 React 一致），改数据源后要手动点 ⟳ 重取
+listGoals = []
+await click(flat.find((e) => e.type === 'button' && e.props.title === '刷新'), 'refresh')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('还没有学习目标') >= 0, '空列表应显示空态提示')
+const addBtn = flat.find((e) => e.type === 'button' && e.props.className === 'stuiAdd')
+assert.ok(addBtn, '空列表缺少「＋ 添加学习目标」按钮（提示文案指向了不存在的出口）')
+assert.equal(textOf(addBtn), '＋ 添加学习目标')
+await click(addBtn, 'add goal from empty state')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('学习主题') >= 0 && bodyText().indexOf('✓ 创建并调研') >= 0, '空态点添加应进入创建表单')
+ok('空列表仍渲染「＋ 添加学习目标」，点击可进入创建表单')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')

@@ -420,8 +420,10 @@ function apply(ctx) {
               React.createElement('button', { type: 'button', className: 'stuiAct', onClick: () => setView('list') }, '取消')
             ),
             React.createElement('div', { className: 'stuiMeta' }, '创建后打开该目标专属会话，由会话 AI 联网调研并按自然章节产出课程草案，待你批准')
-          ) : goals.length === 0 ? React.createElement('div', { className: 'stuiEmpty' }, '还没有学习目标\n点下方「＋ 添加学习目标」开始') :
-            React.createElement(React.Fragment, null,
+          ) : React.createElement(React.Fragment, null,
+            // 添加按钮属于整个列表视图（含空态）：空态提示文案就指着它，之前被关在
+            // goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口。
+            goals.length === 0 ? React.createElement('div', { className: 'stuiEmpty' }, '还没有学习目标\n点下方「＋ 添加学习目标」开始') :
               goals.map((g) => {
                 const exp = expanded[g.id] === true
                 const hasDraft = g.draft && Array.isArray(g.draft.chapters) && g.draft.chapters.length > 0

@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-09-10
+
+### fixed
+- **目标列表为空时面板没有创建入口**：`＋ 添加学习目标` 原先挂在 `goals.length > 0` 那个分支里（`src/client.mjs` 的三元链），空列表只渲染 `stuiEmpty` 提示——而那句提示恰好指着这个不存在的按钮（「点下方『＋ 添加学习目标』开始」）。于是新装（零目标）、把目标全删空、以及面板首帧 `study.list` 还没返回时，面板上只剩 📦 / ⟳ / ✕ 三个按钮，**没有任何 UI 途径创建学习目标**，只能退回聊天用 `study_plan_create`。现在添加按钮归属整个「列表视图」（空态与非空列表都在末尾渲染）。
+- 测试：`test/client.test.mjs` 19 → 21 断言——非空列表与空列表都必须渲染「＋ 添加学习目标」，且空态点击后进入创建表单（`学习主题 *` + `✓ 创建并调研`）。用 HEAD 的旧 bundle 跑新测试会在「空列表缺少按钮」上失败，确认拦得住回归。`test/smoke.mjs` 79、`test/portable.test.mjs` 14 不变，全绿。
+
+### 说明
+- 只改常驻版（`study-plugin/`）。动态版 `src/client.js:271` 有同一段三元结构，同样带这个缺陷；按 D7（动态版为路线 A 回退）本次未同步，需要时一条改动即可镜像。
+- 宿主半未改动：本版本唯一产物差异是 `lib/client.js`，因此已安装副本可直接替换该文件生效（`/plugins/study-plugin/client.js` 每次请求现读磁盘并带 `cache-control: no-cache`，刷新页面即可，无需重启 DSH）。
+
 ## [0.2.1] - 2026-09-10
 
 ### changed
