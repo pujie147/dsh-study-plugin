@@ -617,7 +617,9 @@ export function apply(ctx, config) {
       return path.dirname(path.dirname(loc.path))
     }
     function sessionTargetPath(absCwd, sessionId) {
-      return portableDeps.persistence.locate({ cwd: absCwd, id: sessionId }).path
+      const pp = portableDeps.persistence
+      if (!pp || typeof pp.locate !== 'function') throw new Error('会话持久化服务不可用，无法定位会话文件')
+      return pp.locate({ cwd: absCwd, id: sessionId }).path
     }
 
     /** 收集该目标工作区项目目录下的全部会话（含 subagent / 孤儿 / 已归档）。 */

@@ -18,7 +18,9 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-npm test                            # smoke(69，含导出→导入往返) + portable(14) + client(13，桩 React 真实渲染点击)
+node test/smoke.mjs                 # 宿主半运行时冒烟（69 断言，含导出→导入端到端往返）
+npm test                            # smoke + portable(14) + client(13，桩 React 真实渲染点击)
+node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
 node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
 ```
 开发说明：`node_modules/@deepseek-ai/dsh-tools` 是指向本机宿主副本的 **dev junction**（仅开发用；真实目录安装无需它，终端用户经 DSH 宿主桥接解析，净室脚本已验证）。

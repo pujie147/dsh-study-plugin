@@ -43,19 +43,30 @@ if (!profilePkg.dsh || !profilePkg.dsh.profile || !Array.isArray(profilePkg.dsh.
   fail('该 package.json 没有 dsh.profile.bundles 数组，不是 DSH profile 目录: ' + profileDir)
 }
 
+// 判定一个目录项是「链接/Junction 挂载点」还是「真实目录」。
+// Windows Junction 上 lstat().isDirectory() 为 true，但 readlink() 能取到目标；
+// 真实目录 readlink() 报 EINVAL。据此避免把 rmdir（只删空目录）误用到真实目录上。
+async function classifyEntry(p) {
+  let st
+  try { st = await fs.lstat(p) } catch { return { exists: false, link: false, stat: undefined } }
+  let target
+  try { target = await fs.readlink(p) } catch { target = undefined }
+  return { exists: true, link: target !== undefined, target, stat: st }
+}
+
 if (uninstall) {
   // 卸载
   const bak = profilePkgPath + '.bak-' + PKG_NAME
   try { await fs.copyFile(profilePkgPath, bak) } catch {}
-  let st
-  try { st = await fs.lstat(linkPath) } catch { st = undefined }
-  if (st) {
-    if (st.isDirectory()) await fs.rmdir(linkPath)   // 只删链接本身，不碰目标
-    else await fs.rm(linkPath, { force: true })
-    ok('已删除 ' + linkPath)
+  const entry = await classifyEntry(linkPath)
+  if (entry.exists) {
+    if (entry.link) { await fs.rmdir(linkPath); ok('已删除链接 ' + linkPath) }
+    else if (!entry.stat.isDirectory()) { await fs.rm(linkPath, { force: true }); ok('已删除文件 ' + linkPath) }
+    else console.error('⚠ ' + linkPath + ' 是真实目录（官方安装器 pnpm 装的），本脚本不动它。'
+      + '\n  要彻底卸载：dsh plugin --profile web remove ' + PKG_NAME + '，或自己把该目录改名/删除。')
   } else ok('链接本就不存在')
   delete profilePkg.dependencies[PKG_NAME]
-  profilePkg.dsh.profile.bundles = profilePkg.dsh.profile.bundles.filter((b) => b !== PKG_NAME)
+  profilePkg.dsh.profile.bundles = (profilePkg.dsh.profile.bundles || []).filter((b) => b !== PKG_NAME)
   await fs.writeFile(profilePkgPath, JSON.stringify(profilePkg, null, 2) + '\n')
   ok('已从 profile package.json 撤销注册（备份: ' + path.basename(bak) + '）')
   console.log('重启 DSH 后生效。')
@@ -78,16 +89,23 @@ try {
 
 // ── node_modules 链接 ────────────────────────────────────────────────────────
 async function ensureLink() {
-  let st
-  try { st = await fs.lstat(linkPath) } catch { st = undefined }
-  if (st) {
-    try {
-      const real = await fs.realpath(linkPath)
-      if (path.resolve(real).toLowerCase() === path.resolve(pkgRoot).toLowerCase()) { ok('链接已就绪（指向本仓库）: ' + linkPath); return }
-    } catch {}
-    if (st.isDirectory()) await fs.rmdir(linkPath)
-    else await fs.rm(linkPath, { force: true })
-    ok('已移除旧链接/残留')
+  const entry = await classifyEntry(linkPath)
+  if (entry.exists) {
+    if (entry.link) {
+      let real
+      try { real = await fs.realpath(linkPath) } catch { real = undefined }
+      if (real && path.resolve(real).toLowerCase() === path.resolve(pkgRoot).toLowerCase()) { ok('链接已就绪（指向本仓库）: ' + linkPath); return }
+      await fs.rmdir(linkPath)
+      ok('已移除指向别处的旧链接')
+    } else if (!entry.stat.isDirectory()) {
+      await fs.rm(linkPath, { force: true })
+      ok('已移除残留文件')
+    } else {
+      // 真实目录（官方安装器 pnpm 装的）：改名让位，不删任何字节，随时可还原
+      const aside = linkPath + '.installed-' + new Date().toISOString().replace(/[-:]/g, '').slice(0, 14)
+      await fs.rename(linkPath, aside)
+      ok('官方安装的真实目录已改名让位: ' + path.basename(aside) + '（回退：删掉本链接并把该目录改回原名）')
+    }
   }
   const attempts = process.platform === 'win32' ? ['junction', 'dir'] : ['dir']
   for (const kind of attempts) {

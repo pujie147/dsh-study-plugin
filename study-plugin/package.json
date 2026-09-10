@@ -25,6 +25,7 @@
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "test": "node test/smoke.mjs && node test/portable.test.mjs && node test/client.test.mjs",
+    "sweep": "node test/transcript-sweep.mjs",
     "cleanroom": "node scripts/cleanroom-check.mjs"
   },
   "license": "MIT",
