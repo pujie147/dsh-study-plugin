@@ -114,27 +114,57 @@ function apply(ctx) {
       return undefined
     }
 
+    // 会话是否还在客户端镜像里（= 宿主仍存在该会话；open() 只认已列出的会话）
+    const sessionIsLive = (sid) => {
+      const snap = sessionsSvc && sessionsSvc.list && typeof sessionsSvc.list.getSnapshot === 'function'
+        ? sessionsSvc.list.getSnapshot()
+        : undefined
+      return !!(snap && snap.byId && snap.byId[sid])
+    }
+
+    // 镜像可能落后于宿主（DSH 刚重启 / 另一端刚建工作区）：拉一次再判定
+    const refreshMirror = async (svc) => {
+      if (svc && typeof svc.refresh === 'function') { try { await svc.refresh() } catch (e2) {} }
+    }
+
+    // 在目标工作区取一个会话（复用空白会话，否则新建）；工作区尚未进镜像时刷新后重试一次
+    const connectGoalWorkspace = async (wsId) => {
+      if (!workspacesSvc) throw new Error('工作区服务不可用')
+      try {
+        return unwrapSessionId(await workspacesSvc.connectWorkspace(wsId))
+      } catch (e2) {
+        await refreshMirror(workspacesSvc)
+        return unwrapSessionId(await workspacesSvc.connectWorkspace(wsId))
+      }
+    }
+
+    // 打开该目标的「目标总会话」（= 产出草案的那个会话）。仅当它已被销毁/从未记录时，
+    // 才在目标工作区新建一个会话，并把新 id 记回 goal.json。
     const openGoalSession = async (g) => {
-      if (!workspacesSvc || !sessionsSvc) { setError('会话服务不可用'); return }
+      if (!sessionsSvc) { setError('会话服务不可用'); return }
       setBusyKey('open:' + g.id)
       setError('')
       try {
-        const wsId = g.workspaceId
-        let sessionId
-        if (wsId) {
-          try {
-            sessionId = unwrapSessionId(await workspacesSvc.connectWorkspace(wsId))
-          } catch (e2) {
-            sessionId = undefined
+        const recorded = g.sessionId ? String(g.sessionId) : ''
+        if (recorded) {
+          if (!sessionIsLive(recorded)) await refreshMirror(sessionsSvc)
+          if (sessionIsLive(recorded)) {
+            sessionsSvc.open(recorded)
+            return
           }
         }
-        if (!sessionId) {
+        let wsId = g.workspaceId
+        if (!wsId) {
           const r = await call('study.ensureGoalWorkspace', { goalId: g.id })
           if (!r || r.ok !== true) { setError(String((r && r.error) || '无法建立目标工作区')); return }
-          sessionId = unwrapSessionId(await workspacesSvc.connectWorkspace(r.workspaceId))
+          wsId = r.workspaceId
         }
-        if (sessionId) sessionsSvc.open(sessionId)
-        else setError('未能取得会话 id')
+        const sessionId = await connectGoalWorkspace(wsId)
+        if (!sessionId) { setError('未能取得会话 id'); return }
+        const rec = await call('study.recordGoalSession', { goalId: g.id, sessionId: sessionId })
+        if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录目标会话失败')); return }
+        sessionsSvc.open(sessionId)
+        await refresh()
       } catch (e) {
         setError('打开会话失败: ' + String((e && e.message) || e))
       } finally {
@@ -156,7 +186,7 @@ function apply(ctx) {
         const goalId = r.goalId
         let sessionId
         try {
-          sessionId = unwrapSessionId(await workspacesSvc.connectWorkspace(r.workspaceId))
+          sessionId = await connectGoalWorkspace(r.workspaceId)
         } catch (e2) {
           sessionId = undefined
         }

@@ -497,6 +497,18 @@ return {
       }
     })
 
+    // 面板「打开会话」在目标会话被销毁后新建会话时，把新 id 记回 goal.json
+    harness.handle('study.recordGoalSession', async (args) => {
+      const g = await loadGoal(String(args && args.goalId))
+      if (!g) return { ok: false, error: '目标不存在' }
+      const sessionId = String((args && args.sessionId) || '')
+      if (!sessionId) return { ok: false, error: '缺少 sessionId' }
+      g.sessionId = sessionId
+      g.updatedAt = nowISO()
+      await saveGoal(g)
+      return { ok: true, sessionId: sessionId }
+    })
+
     // -------------------------------------------------------------- 聊天工具（study_plan_*）
     async function chatStatus() {
       const idx = await readIndex()
@@ -696,7 +708,7 @@ return {
       '',
       '## 左侧「学习区」面板按钮',
       '- ＋ 添加学习目标: 主题/目标水平/附加要求 → 「✓ 创建并调研」= 先建文档 → 打开目标总会话 → 会话内 AI 联网调研 → 草案自动待批准',
-      '- 📄 打开会话: 切换到该目标总会话（首次打开后该会话即可接收调研/讲义任务）',
+      '- 📄 打开会话: 切换到该目标的「目标总会话」（即产出课程草案的那个会话）；只有它未记录或已被销毁时，才在目标工作区新建一个会话并把 id 记回 goal.json',
       '- ✓ 批准 / 重新调研: 处理待批准草案（退回会清空草案文件，避免旧草案被重新采纳）',
       '- 生成讲义: 在目标会话中生成某章讲义 md；讲义文件出现后自动标记「讲义就绪」',
       '- 继续生成: 讲义「生成中」且未产出时点击，重新发送生成任务（会话未激活会退回「待生成」并提示）',
