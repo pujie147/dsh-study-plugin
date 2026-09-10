@@ -55,13 +55,16 @@ const pendingRow = {
 }
 const planOk = {
   goalId: 'goal-demo', dir: '/home/me/.dsh/study-work/goal-demo', title: '软件设计', chapters: 10,
-  sessionCount: 3, attachments: 1, files: 9, bytesTotal: 260431, rewriteCwd: true,
-  exportedAt: '2026-09-10T02:00:00.000Z', source: { platform: 'win32' },
+  sessionCount: 3, attachments: 1, files: 9, bytesTotal: 260431,
+  goalExists: true, sameLineage: true, counts: { update: 0, append: 1, noop: 1, create: 1 },
+  reissue: 1, hiddenByHostRule: [], agentPresets: ['standard'],
+  exportedAt: '2026-09-10T02:00:00.000Z', source: { platform: 'win32' }, deviceId: 'dev-abc',
   sessions: [
-    { id: 'session-g', title: '课程规划草案', boundTo: 'goal', lines: 1418, exists: false },
-    { id: 'session-c1', title: '第 1 章学习', boundTo: 'chapter-1', lines: 818, exists: false }
+    { remoteId: 'session-g', pkgId: 'session-g', localId: 'session-g', identity: 'update', action: 'append', title: '课程规划草案', boundTo: 'goal', pkgLines: 1420, localRows: 1418, detail: '' },
+    { remoteId: 'session-c1', pkgId: 'session-c1', localId: 'session-9f3a', identity: 'reissue', action: 'create', title: '第 1 章学习', boundTo: 'chapter-1', pkgLines: 818, detail: 'id session-c1 已被别的目录占用' }
   ]
 }
+let importIdempotent = false
 let inspectResult = { ok: true, canImport: true, conflicts: [], warnings: ['附件服务不可用时图片不会落盘'], plan: planOk }
 let listGoals = [goalRow, researchRow, dispatchedRow, ghostRow, pendingRow]
 const handlers = {
@@ -76,7 +79,12 @@ const handlers = {
   'study.importGoal': (a) => {
     rpc.push(['import', a])
     if (a.confirm !== true) return { ok: false, preview: true, needConfirm: true, canImport: inspectResult.canImport, conflicts: inspectResult.conflicts, warnings: inspectResult.warnings, plan: inspectResult.plan }
-    return { ok: true, goalId: 'goal-demo', dir: '/home/me/.dsh/study-work/goal-demo', title: '软件设计', sessions: 3, skipped: 0, attachments: 1, workspaceId: 'ws-new', verified: true, warnings: [] }
+    return {
+      ok: true, goalId: 'goal-demo', dir: '/home/me/.dsh/study-work/goal-demo', title: '软件设计', mode: a.mode || 'merge',
+      sessions: 3, applied: { create: 1, append: 1, noop: 1 }, remap: [{ remoteId: 'session-c1', localId: 'session-9f3a', why: 'id 已被别的目录占用' }],
+      goalFiles: { written: 2, same: 7, goalJson: 1 }, skipped: 0, attachments: 1, idempotent: importIdempotent,
+      workspaceId: 'ws-new', verified: true, restartNeeded: true, warnings: [],
+    }
   },
   'study.reattachGoalSessions': (a) => { rpc.push(['reattach', a]); return { ok: true, workspaceId: 'ws-1', attached: 2, failed: [] } }
 }
@@ -222,53 +230,84 @@ ok('「📤 导出 zip」调用 study.exportGoal 并给出成功提示')
 const dl = flat.find((e) => e.type === 'a' && String((e.props || {}).href || '').indexOf('/study-export?file=') === 0)
 assert.ok(dl, '导出包下载链接未渲染')
 assert.equal(dl.props.download, 'study-goal-goal-demo.zip')
-assert.ok(bodyText().indexOf('导入：填导出包路径') >= 0, '导入区未渲染')
+assert.ok(bodyText().indexOf('导入 = 应用一个包') >= 0, '导入区未渲染')
 ok('导出后切到 📦 视图：包列表可下载（/study-export?file=…）且出现导入区')
 
-// 导入：填路径 → 预览
+// 模式三选一，默认必须是「覆盖」（用户定的默认）
+const modeBtns = flat.filter((e) => e.type === 'button' && /⤴ 覆盖|➕ 合并|📋 另存副本/.test(textOf(e)))
+assert.equal(modeBtns.length, 3, '三模式按钮不齐: ' + modeBtns.map(textOf).join('|'))
+assert.equal(modeBtns[0].props['data-tone'], 'primary', '默认模式不是「覆盖」')
+ok('导入模式三选一（覆盖/合并/另存副本），默认选中「⤴ 覆盖」')
+
+// 填路径 → 预览（mode=overwrite、force=false）
 const pathInput = flat.find((e) => e.type === 'input' && String((e.props || {}).placeholder || '').indexOf('study-goal') >= 0)
 assert.ok(pathInput, '导入路径输入框未渲染')
 await input(pathInput, 'C:\\tmp\\study-goal-goal-demo.zip')
 tree = await renderAll()
-const previewBtn = flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览') >= 0 && textOf(e).indexOf('副本') < 0)
-await click(previewBtn, 'preview')
-assert.deepEqual(rpc.filter((c) => c[0] === 'inspect').map((c) => c[1]), [{ path: 'C:\\tmp\\study-goal-goal-demo.zip' }], 'inspectImport 参数不对')
+await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览这个包') >= 0), 'preview')
+assert.deepEqual(rpc.filter((c) => c[0] === 'inspect').map((c) => c[1]).pop(), { path: 'C:\\tmp\\study-goal-goal-demo.zip', mode: 'overwrite', force: false }, 'inspectImport 参数不对')
 tree = await renderAll()
 assert.ok(bodyText().indexOf('目标: 软件设计') >= 0, '预览摘要缺失')
-assert.ok(bodyText().indexOf('将重写会话 cwd') >= 0, '未提示 header 重写')
-assert.ok(bodyText().indexOf('课程规划草案') >= 0 && bodyText().indexOf('[chapter-1]') >= 0, '会话清单未渲染')
-ok('「🔍 预览」调用 study.inspectImport 并渲染落点/会话清单/重写提示')
+assert.ok(bodyText().indexOf('同一目标 ⇒ 更新它') >= 0, '未说明目标已存在 ⇒ 更新而非复制')
+assert.ok(bodyText().indexOf('将执行: ') >= 0 && bodyText().indexOf('追加尾帧 1') >= 0, '未渲染分类计数')
+assert.ok(bodyText().indexOf('换发新身份') >= 0 && bodyText().indexOf('[chapter-1]') >= 0, '会话清单未渲染身份/绑定: ' + bodyText().slice(-260))
+assert.ok(bodyText().indexOf('设备 dev-abc') >= 0, '未显示来源设备')
+ok('「🔍 预览这个包」渲染落点/分类计数/每条会话的身份与动作')
+
+// 勾 force ⇒ 重新预览带 force；取消勾选再带 false
+const forceBox = flat.find((e) => e.type === 'input' && e.props.type === 'checkbox')
+assert.ok(forceBox, 'overwrite 模式下应有 force 勾选框')
+const toggleBox = async (n, label) => { await n.props.onChange({ target: { checked: !n.props.checked } }); await tick() }
+await toggleBox(forceBox, 'force')
+assert.equal(rpc.filter((c) => c[0] === 'inspect').map((c) => c[1]).pop().force, true, '勾 force 未重新预览')
+tree = await renderAll()
+await toggleBox(flat.find((e) => e.type === 'input' && e.props.type === 'checkbox'), 'force off')
+assert.equal(rpc.filter((c) => c[0] === 'inspect').map((c) => c[1]).pop().force, false, '取消 force 未重新预览')
+ok('「允许覆盖分叉/更旧的本地会话」勾选会带 force 重新预览')
 
 // 确认导入
-const confirmBtn = flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认导入') >= 0)
+const confirmBtn = flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认覆盖导入') >= 0)
+assert.ok(confirmBtn, '确认按钮缺失: ' + flat.filter((e) => e.type === 'button').map(textOf).join('|'))
 assert.notEqual(confirmBtn.props.disabled, true, '无冲突时确认按钮不该禁用')
 await click(confirmBtn, 'confirm import')
-const imp = rpc.filter((c) => c[0] === 'import').map((c) => c[1])
-assert.equal(imp.length, 1)
-assert.equal(imp[0].confirm, true)
-assert.equal(imp[0].path, 'C:\\tmp\\study-goal-goal-demo.zip')
+const impArgs = rpc.filter((c) => c[0] === 'import').map((c) => c[1]).pop()
+assert.equal(impArgs.confirm, true)
+assert.equal(impArgs.mode, 'overwrite')
+assert.equal(impArgs.path, 'C:\\tmp\\study-goal-goal-demo.zip')
 tree = await renderAll()
-assert.ok(bodyText().indexOf('已导入目标「软件设计」') >= 0, '导入成功提示缺失')
+assert.ok(bodyText().indexOf('已导入/更新目标「软件设计」') >= 0, '导入成功提示缺失')
+assert.ok(bodyText().indexOf('追加 1') >= 0 && bodyText().indexOf('换身份 1') >= 0, '成功提示未带分类计数')
 assert.ok(bodyText().indexOf('重启 DSH') >= 0, '缺重启提示')
-ok('「✓ 确认导入」带 confirm:true 调用 study.importGoal 并提示重启')
+ok('「✓ 确认覆盖导入」带 confirm+mode 调用并汇报分类与重启')
 
-// 冲突 → 确认按钮禁用
+// 全 no-op 时的说法不同（幂等）
+importIdempotent = true
+tree = await renderAll()
+await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览这个包') >= 0), 'preview idem')
+tree = await renderAll()
+await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认覆盖导入') >= 0), 'confirm idem')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('已是最新（无改动）') >= 0, '幂等时不应说"已导入"：' + bodyText().slice(0, 160))
+importIdempotent = false
+ok('同一个包再导一次 ⇒ 面板说「已是最新（无改动）」')
+
+// 冲突 → 确认按钮禁用 + 给出 force 指引
 inspectResult = {
   ok: true, canImport: false, plan: planOk, warnings: [],
-  conflicts: [{ kind: 'goalDir', detail: '/home/me/.dsh/study-work/goal-demo', hint: '用「另存为副本」导入' }]
+  conflicts: [{ kind: 'sessionDiverged', detail: 'session-c1', hint: '与本地内容有差异；带 force=true 才会覆盖' }]
 }
 tree = await renderAll()
-await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览') >= 0 && textOf(e).indexOf('副本') < 0), 'preview2')
+await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览这个包') >= 0), 'preview2')
 tree = await renderAll()
-const confirm2 = flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认导入') >= 0)
+const confirm2 = flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认覆盖导入') >= 0)
 assert.equal(confirm2.props.disabled, true, '有冲突时确认按钮应禁用')
-assert.ok(bodyText().indexOf('冲突') >= 0 && bodyText().indexOf('另存为副本') >= 0, '冲突提示缺失')
-ok('冲突时确认按钮禁用并给出「另存为副本」指引')
+assert.ok(bodyText().indexOf('force=true') >= 0, '冲突提示缺失: ' + bodyText().slice(0, 200))
+ok('分叉冲突时确认按钮禁用并给出 force 指引')
 
-// 副本预览带 mode=copy
-await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('预览副本') >= 0), 'preview copy')
-assert.ok(rpc.filter((c) => c[0] === 'inspect').some((c) => c.mode === 'copy' || c[1].mode === 'copy'), '副本预览未带 mode=copy')
-ok('「📋 预览副本」以 mode=copy 请求预览')
+// 切到副本模式 ⇒ 预览带 mode=copy
+await click(flat.find((e) => e.type === 'button' && textOf(e).indexOf('另存副本') >= 0), 'mode copy')
+assert.equal(rpc.filter((c) => c[0] === 'inspect').map((c) => c[1]).pop().mode, 'copy', '切模式未重新预览')
+ok('「📋 另存副本」以 mode=copy 重新预览')
 
 // 返回目标列表
 tree = await renderAll()

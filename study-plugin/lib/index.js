@@ -1462,14 +1462,20 @@ export function apply(ctx, config) {
     async function chatImport(args) {
       const a = args || {}
       const ref = { path: a.path, file: a.file }
-      if (a.confirm === true || String(a.confirm).toLowerCase() === 'true') {
-        return handlers['study.importGoal']({ ...ref, mode: a.mode, confirm: true })
+      const yes = a.confirm === true || String(a.confirm).toLowerCase() === 'true'
+      const force = a.force === true || String(a.force).toLowerCase() === 'true'
+      if (yes) {
+        return handlers['study.importGoal']({ ...ref, mode: a.mode || 'merge', force, confirm: true })
       }
       // 未确认 → 走 importGoal 的预览分支（同一实现，语义与面板一致）
-      const r = await handlers['study.importGoal']({ ...ref, mode: a.mode })
-      if (r && r.ok) r.next = r.canImport
-        ? '预览无误。要真正写入请再调一次 study_goal_import 并带 confirm=true（有冲突时用 mode=copy 另存为副本）'
-        : '有冲突，不能直接导入：看 conflicts，必要时用 mode=copy 另存为副本'
+      const r = await handlers['study.importGoal']({ ...ref, mode: a.mode || 'merge', force })
+      if (r && r.ok) {
+        const c = (r.plan && r.plan.counts) || {}
+        r.summary = Object.keys(c).map((k) => k + '=' + c[k]).join(' ')
+        r.next = r.canImport
+          ? '预览无误。要真正写入请再调一次 study_goal_import 并带 confirm=true（mode=overwrite 覆盖式更新 / merge 只新增与快进 / copy 另存副本）。包内容与会话身份会记进目标目录的 .study-sync.json，重复导入同一包是无改动。'
+          : '不能直接写入：看 conflicts。分叉或包比本地旧 ⇒ 需要 force=true（会吃掉本地历史）；会话正被打开 ⇒ 先在 GUI 关掉它；不想动现有目标 ⇒ 用 mode=copy。'
+      }
       return r
     }
 
@@ -1721,11 +1727,12 @@ export function apply(ctx, config) {
           '把一个学习目标导出为 zip：含该目标目录下全部内容 + 该目标工作区的会话 transcript 与会话引用的附件，落在 ~/.dsh/study-work/exports/。当用户说 导出目标/备份目标/打包这个目标 时调用。',
           { goal_id: { type: 'string', required: true, description: '要导出的目标 id' } }, chatExport],
         ['study_goal_import',
-          '从导出的 zip 导入学习目标。不带 confirm 时只返回预览与冲突（先看预览，再带 confirm=true 真导入；有冲突可用 mode=copy 另存为副本）。当用户说 导入目标/恢复备份/从这个 zip 还原 时调用。',
+          '应用一个导出的 zip（幂等 upsert，可重复执行）。不带 confirm 时只返回预览与分类计数（新增/追加尾帧/整份替换/不变/需 force）。模式：overwrite=目标与会话已存在时按包更新（面板默认，也是"覆盖"语义）；merge=只新增与快进、本地分叉项不动（缺省）；copy=另存为新 goalId 且会话全部换发新身份。分叉或包比本地旧时必须带 force=true。当用户说 导入目标/恢复备份/同步这个包 时调用。',
           {
             path: { type: 'string', description: 'zip 的绝对路径（与 file 二选一）' },
             file: { type: 'string', description: '~/.dsh/study-work/exports/ 里的文件名' },
-            mode: { type: 'string', description: 'copy=另存为副本（换新 goalId）；缺省为原位导入（目标 id 已存在则拒绝）' },
+            mode: { type: 'string', description: 'overwrite | merge（缺省） | copy' },
+            force: { type: 'string', description: 'true 才允许覆盖分叉/比本地更旧的会话内容' },
             confirm: { type: 'string', description: 'true 才真正写入' }
           }, chatImport]
       ]

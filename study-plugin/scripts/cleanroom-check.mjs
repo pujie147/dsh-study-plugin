@@ -59,7 +59,7 @@ try {
   r = run('tar', ['-tzf', tgzAbs], { T }, 'list')
   if (r.status !== 0) throw new Error('tar -tzf 失败: ' + r.out)
   const entries = r.out.trim().split(/\r?\n/).map((s) => s.replace(/^package\//, ''))
-  const need = ['package.json', 'cordis.patch.yml', 'lib/index.js', 'lib/client.js', 'LICENSE', 'CHANGELOG.md']
+  const need = ['package.json', 'cordis.patch.yml', 'lib/index.js', 'lib/client.js', 'lib/portable.js', 'LICENSE', 'CHANGELOG.md']
   for (const n of need) if (!entries.includes(n)) throw new Error('tarball 缺少 ' + n)
   const forbidden = entries.filter((e) => e.startsWith('src/') || e.startsWith('test/') || e.startsWith('scripts/') || e.startsWith('node_modules/'))
   if (forbidden.length) throw new Error('tarball 混入开发文件: ' + forbidden.join(', '))
@@ -83,6 +83,31 @@ try {
   const workRootSpec = (path.join(T, 'work')).replace(/\\/g, '/')
   const probe = `
 import { apply } from ${JSON.stringify(importSpec)}
+import * as Pb from ${JSON.stringify('file:///' + path.join(pkgDir, 'lib', 'portable.js').replace(/\\/g, '/'))}
+import Fsp from 'node:fs/promises'
+import Pth from 'node:path'
+import { EventEmitter } from 'node:events'
+const T = ${JSON.stringify(T.replace(/\\\\/g, '/'))}
+const workRoot = ${JSON.stringify(workRootSpec)}
+const sessRoot = Pth.join(T, 'sessions')
+const enc = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, (c) => '~' + c.charCodeAt(0).toString(16).padStart(4, '0'))
+const locate = (cwd, id) => Pth.join(sessRoot, enc(String(cwd).replace(/[\\\\/]/g, '-')), enc(id), 'session.jsonl.zstd')
+const attached = []
+// 镜像宿主两条硬不变量：同 id 出现在两个 project 目录 ⇒ list() 抛；attach 要 realpath 相符
+async function listHeaders() {
+  const out = []
+  for (const pr of await Fsp.readdir(sessRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!pr.isDirectory()) continue
+    for (const sd of await Fsp.readdir(Pth.join(sessRoot, pr.name), { withFileTypes: true })) {
+      if (!sd.isDirectory()) continue
+      const f = Pth.join(sessRoot, pr.name, sd.name, 'session.jsonl.zstd')
+      try { out.push({ h: Pb.readSessionHeader(await Fsp.readFile(f)), p: f }) } catch {}
+    }
+  }
+  const seen = new Set()
+  for (const x of out) { if (seen.has(x.h.id)) throw new Error('duplicate JSONL session id ' + x.h.id); seen.add(x.h.id) }
+  return out
+}
 const routes = []
 const tools = []
 const ctx = {
@@ -91,13 +116,45 @@ const ctx = {
     webServer: { register: (rt) => { routes.push(rt); return () => {} } },
     tools: { register: (def) => { tools.push(def); return () => {} } },
     agents: { get: () => undefined },
-    workspaceRegistry: { resolveByPath: async () => undefined, create: async () => ({ id: 'x' }), get: () => undefined },
-    sessionPersistence: { compression: 'zstd', locate: (m) => ({ kind: 'jsonl', path: 'T/sessions/' + m.id + '/session.jsonl.zstd' }), inspect: async () => ({}) },
-    sessions: { get: () => undefined, flush: async () => {} },
+    workspaceRegistry: {
+      archivedSessionIds: [],
+      resolveByPath: async () => undefined,
+      get: () => undefined,
+      create: async (p, title) => ({
+        id: 'ws-cr', path: await Fsp.realpath(p), title, sessionIds: [],
+        attachSession: async function (sid) {
+          const hit = (await listHeaders()).find((x) => x.h.id === sid)
+          if (!hit) throw new Error('no such session ' + sid)
+          if (Pth.resolve(await Fsp.realpath(hit.h.cwd)) !== this.path) throw new Error('cwd mismatch')
+          if (!this.sessionIds.includes(sid)) this.sessionIds.push(sid)
+          attached.push(sid)
+        },
+        detachSession: async function (sid) { this.sessionIds = this.sessionIds.filter((x) => x !== sid) },
+        setTitle: async function (t) { this.title = t }
+      })
+    },
+    sessionPersistence: {
+      compression: 'zstd',
+      locate: (m) => ({ kind: 'jsonl', path: locate(m.cwd, m.id) }),
+      list: async () => (await listHeaders()).map((x) => x.h),
+      inspect: async (id) => { const h = (await listHeaders()).find((x) => x.h.id === id); if (!h) throw new Error('not found ' + id); return { meta: h.h, events: [] } }
+    },
+    sessions: { get: () => undefined, flush: async () => {}, list: () => [] },
     attachments: { readImage: async () => ({ data: new Uint8Array() }), saveImage: async () => ({ attachmentId: 'sha256:0' }) }
   })
 }
-apply(ctx, { workRoot: ${JSON.stringify(workRootSpec)} })
+apply(ctx, { workRoot })
+const rpc = routes.find((r) => r.path === '/study-rpc')
+function call(method, args) {
+  return new Promise((resolve, reject) => {
+    const res = { writeHead() {}, end(b) { try { resolve(JSON.parse(String(b))) } catch (e) { reject(e) } } }
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.socket = { remoteAddress: '127.0.0.1' }
+    setImmediate(() => { req.emit('data', JSON.stringify({ method, args: args || {} })); req.emit('end') })
+    try { rpc.handler(req, res) } catch (e) { reject(e) }
+  })
+}
 const names = tools.map((t) => t.name).sort().join(',')
 const expect = 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status'
 const paths = routes.map((r) => r.path).sort().join(',')
@@ -108,7 +165,33 @@ if (!st || st.ok !== true || !Array.isArray(st.goals)) { console.error('✗ stud
 let rejected = false
 try { await tools.find((t) => t.name === 'study_goal_export').execute({}) } catch { rejected = true }
 if (!rejected) { console.error('✗ study_goal_export 缺 goal_id 应被参数 schema 拦下'); process.exit(1) }
-console.log('✓ 探针: 2 路由 + 7 工具注册 + status 执行 + export 参数校验（净室，无 dev junction）')
+console.log('✓ 探针: 2 路由 + 7 工具注册 + status 执行 + export 参数校验')
+
+// ── 端到端：造目标 → 造会话 → 导出 → 抹掉 → 覆盖式导入（证明 tarball 里 portable.js 真的可用）
+const created = await call('study.createGoal', { topic: '净室回归', target_level: 'x', requirements: '' })
+if (!created || created.ok !== true) { console.error('✗ createGoal: ' + JSON.stringify(created)); process.exit(1) }
+const gid = created.goalId
+const dir = Pth.join(workRoot, gid)
+const sid = 'session-cr-1'
+const writeAt = async (p, buf) => { await Fsp.mkdir(Pth.dirname(p), { recursive: true }); await Fsp.writeFile(p, buf) }
+await writeAt(locate(dir, sid), await Pb.jsonlToZstdFrames(JSON.stringify({ type: 'session', version: 0, id: sid, createdAt: Date.now(), cwd: dir, delegationDepth: 0 }) + '\\n' + JSON.stringify({ type: 'turn/start', seq: 0, time: Date.now(), data: { turn: 1 } }) + '\\n', 1))
+const ex = await call('study.exportGoal', { goalId: gid })
+if (!ex || ex.ok !== true || ex.counts.sessions !== 1) { console.error('✗ exportGoal: ' + JSON.stringify(ex)); process.exit(1) }
+if (ex.manifestFormatVersion && ex.manifestFormatVersion !== 2) { console.error('✗ manifest 版本异常'); process.exit(1) }
+await Fsp.rm(dir, { recursive: true, force: true })
+await Fsp.rm(Pth.dirname(Pth.dirname(locate(dir, sid))), { recursive: true, force: true })
+await Fsp.writeFile(Pth.join(workRoot, 'index.json'), JSON.stringify({ goals: [] }))
+const pv = await call('study.importGoal', { path: ex.path, mode: 'overwrite' })
+if (!pv || pv.preview !== true || pv.canImport !== true) { console.error('✗ 预览: ' + JSON.stringify(pv)); process.exit(1) }
+if (!pv.plan.sessions.every((s) => s.identity && s.action)) { console.error('✗ 预览未给出身份/动作'); process.exit(1) }
+const im = await call('study.importGoal', { path: ex.path, mode: 'overwrite', confirm: true })
+if (!im || im.ok !== true || im.applied.create !== 1) { console.error('✗ 导入: ' + JSON.stringify(im)); process.exit(1) }
+const led = JSON.parse(await Fsp.readFile(Pth.join(dir, '.study-sync.json'), 'utf8'))
+if (led.sessions[0].localId !== sid) { console.error('✗ 账本未记身份映射'); process.exit(1) }
+if (attached.length !== 1 || attached[0] !== sid) { console.error('✗ 会话未挂回工作区: ' + attached.join(',')); process.exit(1) }
+const re = await call('study.importGoal', { path: ex.path, mode: 'overwrite', confirm: true })
+if (!re || re.ok !== true || re.idempotent !== true) { console.error('✗ 重复导入不应是幂等: ' + JSON.stringify(re)); process.exit(1) }
+console.log('✓ 端到端: 导出→抹掉→覆盖式导入→重复导入幂等（含 portable.js 与 .study-sync.json 账本）')
 `
   const probePath = path.join(T, 'probe.mjs')
   await fs.writeFile(probePath, probe)

@@ -62,6 +62,8 @@ function apply(ctx) {
     const [ioBusy, setIoBusy] = React.useState(false)
     const [impPath, setImpPath] = React.useState('')
     const [impPreview, setImpPreview] = React.useState(null)
+    const [impMode, setImpMode] = React.useState('overwrite')
+    const [impForce, setImpForce] = React.useState(false)
     const [anchor, setAnchor] = React.useState(undefined)
     const [open, setOpen] = React.useState(ui.open)
     const rootRef = React.useRef(null)
@@ -296,7 +298,13 @@ function apply(ctx) {
     const doReattach = async (g) => {
       await doAction('reattach:' + g.id, () => call('study.reattachGoalSessions', { goalId: g.id }))
     }
-    const doPreviewImport = async (mode) => {
+    const ACTION_LABEL = {
+      create: '新增', append: '追加尾帧', replace: '整份替换', noop: '不变',
+      rewind: '回退（包更旧）', diverged: '与本地分叉', liveBlocked: '会话正打开·挡',
+      skippedByRequest: '按选择跳过', skippedDiverged: '分叉·本次不动',
+    }
+    const IDENTITY_LABEL = { fresh: '沿用原 id', update: '原地更新', adopt: '续用上次映射', reissue: '换发新身份' }
+    const previewWith = async (mode, force) => {
       const p = impPath.trim()
       if (!p) { setError('先填导出包的绝对路径（或 exports 目录里的文件名）'); return }
       setIoBusy(true)
@@ -304,25 +312,37 @@ function apply(ctx) {
       setImpPreview(null)
       try {
         const arg = /\.zip$/i.test(p) && /[\\/]/.test(p) ? { path: p } : { file: p }
-        const r = await call('study.inspectImport', mode ? Object.assign({}, arg, { mode: mode }) : arg)
+        const r = await call('study.inspectImport', Object.assign({}, arg, { mode: mode, force: !!force }))
         if (!r || r.ok !== true) { setError(String((r && r.error) || '预览失败')); return }
-        setImpPreview(Object.assign({}, r, { arg: arg, mode: mode || '' }))
+        setImpPreview(Object.assign({}, r, { arg: arg, mode: mode, force: !!force }))
       } catch (e) {
         setError('预览失败: ' + String((e && e.message) || e))
       } finally {
         setIoBusy(false)
       }
     }
+    const doPreviewImport = () => previewWith(impMode, impForce)
+    const pickMode = (m) => {
+      setImpMode(m)
+      if (impPath.trim()) previewWith(m, impForce)
+    }
+    const toggleForce = () => {
+      const f = !impForce
+      setImpForce(f)
+      if (impPreview) previewWith(impMode, f)
+    }
     const doConfirmImport = async () => {
       if (!impPreview) return
       setIoBusy(true)
       setError('')
       try {
-        const arg = Object.assign({}, impPreview.arg, { confirm: true })
-        if (impPreview.mode) arg.mode = impPreview.mode
+        const arg = Object.assign({}, impPreview.arg, { confirm: true, mode: impPreview.mode, force: !!impPreview.force })
         const r = await call('study.importGoal', arg)
-        if (!r || r.ok !== true) { setError(String((r && r.error) || '导入失败') + (r && r.rolledBack ? '（已回滚）' : '')); return }
-        setNotice('✅ 已导入目标「' + (r.title || r.goalId) + '」：会话 ' + r.sessions + ' 个、附件 ' + r.attachments + ' 个。重启 DSH 后左栏分组与会话列表才会完整刷新。')
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '导入失败') + (r && r.rolledBack ? '（已回滚，未留下半成品）' : '')); return }
+        const ap = r.applied || {}
+        const bits = ['新增 ' + (ap.create || 0), '追加 ' + (ap.append || 0), '替换 ' + (ap.replace || 0), '不变 ' + (ap.noop || 0)]
+        if (r.remap && r.remap.length) bits.push('换身份 ' + r.remap.length)
+        setNotice('✅ ' + (r.idempotent ? '已是最新（无改动）：' : '已导入/更新目标「') + (r.title || r.goalId) + '」' + bits.join(' · ') + '，附件 ' + r.attachments + ' 个。重启 DSH 后左栏分组与会话列表才会完整刷新。')
         setImpPreview(null)
         await refresh()
       } catch (e) {
@@ -349,20 +369,33 @@ function apply(ctx) {
           React.createElement('a', { className: 'stuiAct', href: it.downloadUrl, download: it.file, style: { textDecoration: 'none' } }, '⬇ 下载'),
           React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'danger', disabled: ioBusy, onClick: () => doDeleteExport(it) }, '删')
         ))),
-      React.createElement('div', { className: 'stuiDraftOv' }, '导入：填导出包路径（zip 绝对路径，或 exports 目录里的文件名）→ 先预览再确认。跨机器导入只重写会话 header 的 cwd；goalId 已存在时用「另存为副本」。'),
+      React.createElement('div', { className: 'stuiDraftOv' }, '导入 = 应用一个包（可重复执行）：同一个包再导一次是「更新」而不是复制。目标 / 会话 / 工作区都按这个原则处理；本地比包新的内容不会被悄悄吃掉（需要勾 force）。'),
       React.createElement('input', {
         className: 'stuiInput', value: impPath, placeholder: 'C:\\Users\\me\\Downloads\\study-goal-…-20260909.zip',
         onChange: (e) => { setImpPath(e.target.value); setImpPreview(null) }
       }),
       React.createElement('div', { className: 'stuiRow' },
-        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || !impPath.trim(), onClick: () => doPreviewImport('') }, ioBusy ? '读取中…' : '🔍 预览'),
-        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || !impPath.trim(), onClick: () => doPreviewImport('copy') }, '📋 预览副本')
+        [['overwrite', '⤴ 覆盖'], ['merge', '➕ 合并'], ['copy', '📋 另存副本']].map((m) => React.createElement('button', {
+          key: m[0], type: 'button', className: 'stuiAct', 'data-tone': impMode === m[0] ? 'primary' : undefined,
+          title: m[0] === 'overwrite' ? '目标/会话已存在时按包更新（分叉需勾 force）' : m[0] === 'merge' ? '只新增与快进，本地分叉项不动' : '换一个新 goalId，会话全部换发新身份，绝不碰现有目标',
+          disabled: ioBusy, onClick: () => pickMode(m[0])
+        }, m[1]))
+      ),
+      impMode === 'overwrite' && React.createElement('label', { className: 'stuiMeta', style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+        React.createElement('input', { type: 'checkbox', checked: impForce, disabled: ioBusy, onChange: () => toggleForce() }),
+        '允许覆盖分叉/更旧的本地会话（会吃掉本地历史）'
+      ),
+      React.createElement('div', { className: 'stuiRow' },
+        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || !impPath.trim(), onClick: () => doPreviewImport() }, ioBusy ? '读取中…' : '🔍 预览这个包')
       ),
       impPreview && React.createElement('div', { className: 'stuiDetail' },
         React.createElement('div', { className: 'stuiMeta' }, '目标: ' + (impPreview.plan.title || '(无标题)') + ' · ' + impPreview.plan.chapters + ' 章 · 会话 ' + impPreview.plan.sessionCount + ' 个 · 附件 ' + impPreview.plan.attachments + ' 个 · ' + fmtBytes(impPreview.plan.bytesTotal)),
-        React.createElement('div', { className: 'stuiMeta', style: { wordBreak: 'break-all' } }, '落点: ' + impPreview.plan.dir + (impPreview.plan.rewriteCwd ? '（将重写会话 cwd）' : '（同路径，逐字节还原）')),
-        React.createElement('div', { className: 'stuiMeta' }, '源机导出时间: ' + (impPreview.plan.exportedAt || '?') + ' · 平台 ' + ((impPreview.plan.source || {}).platform || '?')),
-        (impPreview.plan.sessions || []).slice(0, 8).map((s) => React.createElement('div', { key: s.id, className: 'stuiMeta' }, '  · ' + (s.title || s.id) + ' [' + (s.boundTo || '?') + '] ' + (s.lines || 0) + ' 行' + (s.exists ? ' ⚠已存在' : ''))),
+        React.createElement('div', { className: 'stuiMeta', style: { wordBreak: 'break-all' } }, '落点: ' + impPreview.plan.dir + (impPreview.plan.goalExists ? (impPreview.plan.sameLineage ? '（已存在·同一目标 ⇒ 更新它）' : '（已存在·不是这个目标 ⚠）') : '（新建）')),
+        React.createElement('div', { className: 'stuiMeta' }, '模式: ' + (impPreview.mode === 'overwrite' ? '覆盖' : impPreview.mode === 'copy' ? '另存副本' : '合并') + (impPreview.force ? ' + force' : '') + ' · 源机导出 ' + (impPreview.plan.exportedAt || '?') + ' · 平台 ' + ((impPreview.plan.source || {}).platform || '?') + (impPreview.plan.deviceId ? ' · 设备 ' + impPreview.plan.deviceId : '')),
+        React.createElement('div', { className: 'stuiMeta' }, '将执行: ' + Object.keys(impPreview.plan.counts || {}).map((k) => (ACTION_LABEL[k] || k) + ' ' + impPreview.plan.counts[k]).join(' · ')),
+        (impPreview.plan.sessions || []).slice(0, 8).map((s) => React.createElement('div', { key: s.remoteId, className: 'stuiMeta' },
+          '  · ' + (s.title || s.remoteId) + ' [' + (s.boundTo || '?') + '] · ' + (IDENTITY_LABEL[s.identity] || s.identity) + ' ⇒ ' + (ACTION_LABEL[s.action] || s.action) +
+          ' (' + (s.localRows === undefined ? '新' : s.localRows) + '→' + (s.pkgLines || 0) + ' 行)' + (s.detail ? ' ' + s.detail : ''))),
         (impPreview.plan.sessions || []).length > 8 ? React.createElement('div', { className: 'stuiMeta' }, '  …共 ' + impPreview.plan.sessions.length + ' 个会话') : null,
         (impPreview.conflicts || []).length > 0 && React.createElement('div', { className: 'stuiErr' }, '⚠ 冲突: ' + impPreview.conflicts.map((c) => c.kind + '=' + c.detail).join('; ') + ' — ' + ((impPreview.conflicts[0] || {}).hint || '')),
         (impPreview.warnings || []).length > 0 && React.createElement('div', { className: 'stuiMeta' }, '提示: ' + impPreview.warnings.slice(0, 4).join(' / ')),
@@ -370,7 +403,7 @@ function apply(ctx) {
           React.createElement('button', {
             type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || impPreview.canImport !== true,
             onClick: () => doConfirmImport()
-          }, ioBusy ? '导入中…' : '✓ 确认导入' + (impPreview.mode === 'copy' ? '（另存为副本）' : '')),
+          }, ioBusy ? '导入中…' : '✓ 确认' + (impPreview.mode === 'copy' ? '另存副本' : impPreview.mode === 'overwrite' ? '覆盖导入' : '合并导入')),
           React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, onClick: () => setImpPreview(null) }, '取消')
         )
       )
