@@ -3,7 +3,10 @@
 // 做法: 用最小 React/DOM/fetch 桩真实执行 bundle 的 factory 与组件函数，遍历元素树
 //       触发 onClick/onChange，断言打到 /study-rpc 的调用序列与界面文案。
 // 覆盖: 面板开合 → 目标列表 → 展开 → 📤 导出 → 成功提示 + 切到 📦 视图 + 下载链接 →
-//       导入路径 → 🔍 预览（含"将重写会话 cwd"）→ ✓ 确认导入 → 冲突时确认按钮禁用 → 🔗 重新绑定会话。
+//       导入路径 → 🔍 预览（含"将重写会话 cwd"）→ ✓ 确认导入 → 冲突时确认按钮禁用 → 🔗 重新绑定会话 →
+//       📄 打开会话(D10 幂等) → researching 三态(D16: 未派发/已派发/会话已销毁) 与「▶ 开始调研」。
+// React 桩的 useEffect/useCallback 按槽位记 deps（与真实 React 一致）：否则每次渲染都会重跑
+// 「打开面板就 refresh」的副作用，把 doAction 刚写上的失败红字异步清掉，测试就会假失败。
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -24,6 +27,31 @@ const goalRow = {
   path: '/home/me/.dsh/study-work/goal-demo', draft: null,
   chapters: [{ index: 1, title: '计算机系统基础', file: '01-chapter.md', status: 'ready', sessionId: 'session-c1', lastError: '' }]
 }
+// researching 态的三种真相：建档后从未派发 / 已派发 / 记录过的会话已被销毁
+const researchRow = {
+  id: 'goal-never', title: '尚未派发', status: 'researching', target_level: '入门', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g', researchDispatched: false,
+  path: '/home/me/.dsh/study-work/goal-never', draft: null, chapters: []
+}
+const dispatchedRow = {
+  id: 'goal-running', title: '正在调研', status: 'researching', target_level: '入门', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g',
+  researchDispatched: true, researchDispatchedAt: '2026-09-10T04:02:16.000Z',
+  path: '/home/me/.dsh/study-work/goal-running', draft: null, chapters: []
+}
+const ghostRow = {
+  id: 'goal-ghost', title: '会话已销毁', status: 'researching', target_level: '入门', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-gone', researchDispatched: false,
+  path: '/home/me/.dsh/study-work/goal-ghost', draft: null, chapters: []
+}
+let dispatchResult = { ok: true, sessionId: 'session-g', message: '已派发' }
+const pendingRow = {
+  id: 'goal-pending', title: '草案待批', status: 'draft_pending', target_level: '入门', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g', researchDispatched: true,
+  researchDispatchedAt: '2026-09-10T04:02:16.000Z',
+  path: '/home/me/.dsh/study-work/goal-pending', chapters: [],
+  draft: { overview: '六章', approved: false, lastError: '', chapters: [{ index: 1, title: '地基', summary: '', est_hours: 2, focus_points: [] }] }
+}
 const planOk = {
   goalId: 'goal-demo', dir: '/home/me/.dsh/study-work/goal-demo', title: '软件设计', chapters: 10,
   sessionCount: 3, attachments: 1, files: 9, bytesTotal: 260431, rewriteCwd: true,
@@ -35,7 +63,10 @@ const planOk = {
 }
 let inspectResult = { ok: true, canImport: true, conflicts: [], warnings: ['附件服务不可用时图片不会落盘'], plan: planOk }
 const handlers = {
-  'study.list': () => ({ goals: [goalRow] }),
+  'study.list': () => ({ goals: [goalRow, researchRow, dispatchedRow, ghostRow, pendingRow] }),
+  'study.rejectDraft': (a) => { rpc.push(['reject', a]); return { ok: true } },
+  'study.dispatchResearch': (a) => { rpc.push(['dispatch', a]); return dispatchResult },
+  'study.recordGoalSession': (a) => { rpc.push(['record', a]); return { ok: true, sessionId: a.sessionId } },
   'study.exportGoal': (a) => { rpc.push(['export', a]); return { ok: true, file: 'study-goal-goal-demo.zip', path: '/exp/study-goal-goal-demo.zip', downloadUrl: '/study-export?file=study-goal-goal-demo.zip', bytes: 152043, counts: { files: 9, sessions: 3, attachments: 1, sessionBytes: 148000 }, warnings: [] } },
   'study.listExports': () => ({ ok: true, dir: '/home/me/.dsh/study-work/exports', exports: [{ file: 'study-goal-goal-demo.zip', bytes: 152043, mtime: '2026-09-10T02:00:00.000Z', downloadUrl: '/study-export?file=study-goal-goal-demo.zip' }] }),
   'study.deleteExport': (a) => { rpc.push(['deleteExport', a]); return { ok: true } },
@@ -54,7 +85,20 @@ globalThis.fetch = async (url, init) => {
 }
 
 // ── 最小 React / DOM 桩 ──────────────────────────────────────────────────────
-let inst = { state: {}, idx: 0 }
+let inst = { state: {}, idx: 0, cb: {}, effects: {} }
+const sameDeps = (a, b) => {
+  if (b === undefined) return false // 无 deps = 每次渲染都跑（与 React 一致）
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+  return a.every((v, i) => v === b[i])
+}
+// effect 钩子按槽位记 deps；useCallback 按槽位记忆，令 [refresh] 这类依赖跨渲染稳定
+const hookSlot = () => inst.idx++
+const effectHook = (fn, deps, name) => {
+  const i = hookSlot()
+  if (i in inst.effects && sameDeps(inst.effects[i], deps)) return
+  inst.effects[i] = deps
+  try { fn() } catch (e) { throw new Error(name + ' 抛错: ' + e.message) }
+}
 const React = {
   Fragment: 'Fragment',
   createElement: (type, props, ...children) => ({ type, props: Object.assign({}, props, children.length ? { children: children.flat(6) } : {}) }),
@@ -63,11 +107,15 @@ const React = {
     if (!(i in inst.state)) inst.state[i] = typeof init === 'function' ? init() : init
     return [inst.state[i], (v) => { inst.state[i] = typeof v === 'function' ? v(inst.state[i]) : v }]
   },
-  useCallback: (fn) => fn,
+  useCallback: (fn, deps) => {
+    const i = hookSlot()
+    if (!(i in inst.cb) || !sameDeps(inst.cb[i].deps, deps)) inst.cb[i] = { fn, deps }
+    return inst.cb[i].fn
+  },
   useMemo: (fn) => fn(),
   useRef: () => ({ current: { getBoundingClientRect: () => ({ left: 24 }) } }),
-  useEffect: (fn) => { try { fn() } catch (e) { throw new Error('useEffect 抛错: ' + e.message) } },
-  useLayoutEffect: (fn) => { try { fn() } catch (e) { throw new Error('useLayoutEffect 抛错: ' + e.message) } },
+  useEffect: (fn, deps) => effectHook(fn, deps, 'useEffect'),
+  useLayoutEffect: (fn, deps) => effectHook(fn, deps, 'useLayoutEffect'),
   useReducer: (r, init) => [init, () => {}]
 }
 const flat = []
@@ -231,5 +279,62 @@ ok('「← 返回目标列表」可切回目标视图')
 await click(flat.find((e) => e.type === 'button' && textOf(e) === '📄 打开会话'), 'open session')
 assert.deepEqual(opened, ['session-g'], '应直接打开已记录的目标会话')
 ok('D10 未被破坏：「📄 打开会话」直接复用 goal.sessionId，不新建会话')
+
+// ── researching 态的三种真相（D16）：未派发 / 已派发 / 目标会话已销毁 ──────────
+const rowRange = (title) => {
+  const starts = []
+  flat.forEach((e, i) => { if (e.props && e.props.className === 'stuiGoal') starts.push(i) })
+  for (let k = 0; k < starts.length; k++) {
+    const seg = flat.slice(starts[k], starts[k + 1] === undefined ? flat.length : starts[k + 1])
+    if (seg.length && textOf(seg[0]).indexOf(title) >= 0) return seg
+  }
+  return []
+}
+const btnIn = (title, label) => rowRange(title).find((e) => e.type === 'button' && textOf(e) === label)
+const expand = async (title) => { await click(rowRange(title).find((e) => e.props.className === 'stuiGoalTitle'), 'expand ' + title); return await renderAll() }
+
+await expand('尚未派发')
+assert.ok(textOf(rowRange('尚未派发')[0]).indexOf('待调研') >= 0, '未派发目标 chip 应为「待调研」')
+assert.ok(rowRange('尚未派发').some((e) => textOf(e).indexOf('调研还没开始') >= 0), '未派发缺提示文案')
+assert.ok(btnIn('尚未派发', '▶ 开始调研'), '未派发应有「▶ 开始调研」按钮')
+ok('D16：researching 且未派发 → chip「待调研」+「▶ 开始调研」出口')
+
+await click(btnIn('尚未派发', '▶ 开始调研'), 'start research')
+const dispatchCalls = rpc.filter((c) => c[0] === 'dispatch').map((c) => c[1])
+assert.deepEqual(dispatchCalls, [{ goalId: 'goal-never' }], 'dispatchResearch 参数不对')
+assert.ok(!rpc.some((c) => c[0] === 'record' && c[1].goalId === 'goal-never'), '会话仍在镜像时不该重建')
+assert.deepEqual(opened, ['session-g'], '不该为已存活会话再次新建/切换')
+ok('「▶ 开始调研」调用 study.dispatchResearch（复用已存活的目标会话，不重建）')
+
+dispatchResult = { ok: false, need_open: true, error: '目标会话代理未激活：请打开该目标会话' }
+await click(btnIn('尚未派发', '▶ 开始调研'), 'start research fail')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('代理未激活') >= 0, '动作失败原因被刷新冲掉了（doAction 应保留 error）')
+ok('动作失败的红字在其后 study.list 刷新后仍然可见')
+dispatchResult = { ok: true, sessionId: 'session-g', message: '已派发' }
+
+await expand('正在调研')
+const running = textOf(rowRange('正在调研')[0])
+assert.ok(running.indexOf('待调研') < 0 && running.indexOf('调研中…') >= 0, '已派发行不该显示「待调研」')
+assert.ok(running.indexOf('正在联网调研') >= 0 && running.indexOf('派发于') >= 0, '已派发应显示进行中含派发时间')
+assert.ok(btnIn('正在调研', '🔁 重新调研'), '已派发应有「🔁 重新调研」')
+ok('D16：researching 且已派发 → 「⏳ …派发于 HH:mm」+「🔁 重新调研」')
+
+const openedBefore = opened.length
+await expand('会话已销毁')
+await click(btnIn('会话已销毁', '▶ 开始调研'), 'start research on ghost')
+const rec = rpc.filter((c) => c[0] === 'record').map((c) => c[1])
+assert.ok(rec.some((c) => c.goalId === 'goal-ghost' && c.sessionId === 'session-g'), '会话已销毁时应先重建并 recordGoalSession：' + JSON.stringify(rec))
+assert.ok(rpc.filter((c) => c[0] === 'dispatch').some((c) => c[1].goalId === 'goal-ghost'), '重建后应完成派发')
+assert.equal(opened.length, openedBefore + 1, '重建后应打开新会话')
+ok('D16：记录过的会话已销毁 → 先重建+回写 sessionId，再派发调研')
+
+// 草案待批准的「重新调研」= 退回 + 立刻重新派发（旧行为只退回，目标就此停在「调研中」）
+await expand('草案待批')
+await click(btnIn('草案待批', '重新调研'), 're-research')
+const seq = rpc.filter((c) => c[0] === 'reject' || c[0] === 'dispatch').map((c) => c[0] + ':' + c[1].goalId)
+assert.ok(seq.indexOf('reject:goal-pending') >= 0 && seq.indexOf('dispatch:goal-pending') === seq.indexOf('reject:goal-pending') + 1,
+  '应「先 rejectDraft 再 dispatchResearch」: ' + JSON.stringify(seq))
+ok('D16：草案待批准的「重新调研」名副其实——rejectDraft 后紧接 dispatchResearch')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')

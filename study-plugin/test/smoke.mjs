@@ -174,6 +174,15 @@ let exportedGoalId = ''
   const r3 = await callRpc('study.startResearch', { goalId, sessionId: 'sess-goal-1' })
   check('startResearch ok', r3.json && r3.json.ok === true, r3.json)
   check('调研指令已注入会话', injected.length === 1 && injected[0].id === 'sess-goal-1' && /课程规划 AI/.test(injected[0].msg.content[0].text), injected)
+  const gDisp = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+  check('startResearch 记录「已派发」事实(researchDispatched + 时间)', gDisp.researchDispatched === true && typeof gDisp.researchDispatchedAt === 'string', gDisp)
+
+  // recordGoalSession：面板「打开会话」重建目标会话后的回写口
+  const rgs = await callRpc('study.recordGoalSession', { goalId, sessionId: 'sess-goal-9' })
+  check('recordGoalSession ok', rgs.json && rgs.json.ok === true && rgs.json.sessionId === 'sess-goal-9', rgs.json)
+  check('recordGoalSession 缺 sessionId → error', (await callRpc('study.recordGoalSession', { goalId, sessionId: '' })).json.ok === false)
+  check('recordGoalSession 目标不存在 → error', /目标不存在/.test((await callRpc('study.recordGoalSession', { goalId: 'nope', sessionId: 'x' })).json.error || ''))
+  await callRpc('study.recordGoalSession', { goalId, sessionId: 'sess-goal-1' })
 
   // 写 draft.json → 轮询采纳 → draft_pending
   const draftAbs = path.join(tmpRoot, goalId, 'draft.json')
@@ -357,6 +366,18 @@ let exportedGoalId = ''
   const g3 = (await callRpc('study.list', {})).json.goals.find((g) => g.id === id2)
   const draftOnDisk = await fsp.readFile(d2, 'utf8').catch(() => '<missing>')
   check('reject 后回 researching 且磁盘草案被清空', g3.status === 'researching' && draftOnDisk.trim() === '', { status: g3.status, disk: draftOnDisk.slice(0, 40) })
+  check('rejectDraft 清掉「已派发」事实（退回=需要重新派发）', g3.researchDispatched === false, g3.researchDispatched)
+
+  // study.dispatchResearch = 面板「▶ 开始调研 / 🔁 重新调研」的派发口（owner = chatResearch）
+  const rNoSess = await callRpc('study.dispatchResearch', { goalId: id2 })
+  check('dispatchResearch 无目标会话 → need_open', rNoSess.json && rNoSess.json.ok === false && rNoSess.json.need_open === true, rNoSess.json)
+  await callRpc('study.recordGoalSession', { goalId: id2, sessionId: 'sess-goal-2' })
+  const injBefore = injected.length
+  const rDisp = await callRpc('study.dispatchResearch', { goalId: id2 })
+  check('dispatchResearch 注入并返回 sessionId', rDisp.json && rDisp.json.ok === true && rDisp.json.sessionId === 'sess-goal-2' && injected.length === injBefore + 1, rDisp.json)
+  check('dispatchResearch 带上退回意见（走重试指令）', /上次意见: 章节太少/.test((injected[injected.length - 1] || {}).msg.content[0].text || ''), injected[injected.length - 1])
+  check('dispatchResearch 后 researchDispatched=true', (await callRpc('study.list', {})).json.goals.find((g) => g.id === id2).researchDispatched === true)
+  check('dispatchResearch 未知目标 → error', (await callRpc('study.dispatchResearch', { goalId: 'nope' })).json.ok === false)
   const r10 = await callRpc('study.deleteGoal', { goalId: exportedGoalId })
   check('deleteGoal ok', r10.json && r10.json.ok === true, r10.json)
   const r11 = await callRpc('study.list', {})

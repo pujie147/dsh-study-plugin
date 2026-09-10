@@ -40,6 +40,10 @@ function apply(ctx) {
     return r.json()
   }
 
+  const hhmm = (iso) => {
+    try { return new Date(String(iso)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) } catch (e) { return String(iso) }
+  }
+
   const StudyApp = (props) => {
     const sessionsHook = props.useSessions
     const workspacesSvc = props.workspaces
@@ -98,15 +102,17 @@ function apply(ctx) {
     const doAction = async (key, fn) => {
       setBusyKey(key)
       setError('')
+      let msg = ''
       try {
         const r = await fn()
-        if (r && r.ok === false) setError(String(r.error || '操作失败'))
-        await refresh()
+        if (r && r.ok === false) msg = String(r.error || '操作失败')
       } catch (e) {
-        setError(String((e && e.message) || e))
-      } finally {
-        setBusyKey(null)
+        msg = String((e && e.message) || e)
       }
+      await refresh()
+      // 刷新会清掉 error，动作失败的原因必须留在面板上（否则用户只看到"没反应"）
+      if (msg !== '') setError(msg)
+      setBusyKey(null)
     }
 
     const unwrapSessionId = (v) => {
@@ -144,10 +150,10 @@ function apply(ctx) {
       }
     }
 
-    // 打开该目标的「目标总会话」（= 产出草案的那个会话）。仅当它已被销毁/从未记录时，
-    // 才在目标工作区新建一个会话，并把新 id 记回 goal.json。
+    // 打开该目标的「目标总会话」（= 产出草案的那个会话），返回其会话 id。仅当它已被销毁/从未记录
+    // 时，才在目标工作区新建一个会话并记回 goal.json。失败返回 undefined（错误已展示）。
     const openGoalSession = async (g) => {
-      if (!sessionsSvc) { setError('会话服务不可用'); return }
+      if (!sessionsSvc) { setError('会话服务不可用'); return undefined }
       setBusyKey('open:' + g.id)
       setError('')
       try {
@@ -156,26 +162,39 @@ function apply(ctx) {
           if (!sessionIsLive(recorded)) await refreshMirror(sessionsSvc)
           if (sessionIsLive(recorded)) {
             sessionsSvc.open(recorded)
-            return
+            return recorded
           }
         }
         let wsId = g.workspaceId
         if (!wsId) {
           const r = await call('study.ensureGoalWorkspace', { goalId: g.id })
-          if (!r || r.ok !== true) { setError(String((r && r.error) || '无法建立目标工作区')); return }
+          if (!r || r.ok !== true) { setError(String((r && r.error) || '无法建立目标工作区')); return undefined }
           wsId = r.workspaceId
         }
         const sessionId = await connectGoalWorkspace(wsId)
-        if (!sessionId) { setError('未能取得会话 id'); return }
+        if (!sessionId) { setError('未能取得会话 id'); return undefined }
         const rec = await call('study.recordGoalSession', { goalId: g.id, sessionId: sessionId })
-        if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录目标会话失败')); return }
+        if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录目标会话失败')); return undefined }
         sessionsSvc.open(sessionId)
         await refresh()
+        return sessionId
       } catch (e) {
         setError('打开会话失败: ' + String((e && e.message) || e))
+        return undefined
       } finally {
         setBusyKey(null)
       }
+    }
+
+    // 派发调研（唯一 owner 在宿主：study.dispatchResearch → chatResearch）。status='researching' 只是
+    // 建档初值，不代表指令已发出；所以这里先保证目标会话存在且活着（必要时重建），再派发。
+    const dispatchResearch = async (g) => {
+      const sid = g.sessionId ? String(g.sessionId) : ''
+      if (!sid || !sessionIsLive(sid)) {
+        const made = await openGoalSession(g)
+        if (!made) return { ok: false, error: '目标会话未就绪，派发已取消' }
+      }
+      return await call('study.dispatchResearch', { goalId: g.id })
     }
 
     const createGoal = async () => {
@@ -409,11 +428,13 @@ function apply(ctx) {
                 const chapterList = g.chapters || []
                 const goalBusy = busyKey === g.id || busyKey === 'create'
                 const opening = busyKey === 'open:' + g.id
+                // status='researching' 是建档初值；只有宿主记下"指令已注入"才算真在调研
+                const awaitingResearch = g.status === 'researching' && g.researchDispatched !== true
                 return React.createElement('div', { key: g.id, className: 'stuiGoal' },
                   React.createElement('div', { className: 'stuiGoalHead' },
                     React.createElement('span', { className: 'stuiGoalTitle', title: g.id, onClick: () => setExpanded({ ...expanded, [g.id]: !exp }) },
                       exp ? '▾ ' : '▸ ', g.title),
-                    React.createElement('span', { className: 'stuiChip', 'data-tone': toneOf(g.status) }, labelOf(g.status)),
+                    React.createElement('span', { className: 'stuiChip', 'data-tone': awaitingResearch ? 'warn' : toneOf(g.status) }, awaitingResearch ? '待调研' : labelOf(g.status)),
                     React.createElement('button', {
                       type: 'button', className: 'stuiOpen', disabled: opening || goalBusy,
                       onClick: () => openGoalSession(g)
@@ -433,12 +454,28 @@ function apply(ctx) {
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiDraftOv' }, '草案: ' + ((g.draft && g.draft.overview) || '')),
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiRow' },
                         React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.approveDraft', { goalId: g.id })) }, '✓ 批准'),
-                        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.rejectDraft', { goalId: g.id, reason: '用户重新考虑' })) }, '重新调研')
+                        React.createElement('button', {
+                          type: 'button', className: 'stuiAct', disabled: goalBusy,
+                          // 名副其实：退回并清空草案后立刻把调研重新派发（旧行为只退回，目标就此停在「调研中」）
+                          onClick: () => doAction(g.id, async () => {
+                            const rj = await call('study.rejectDraft', { goalId: g.id, reason: '用户重新考虑' })
+                            if (!rj || rj.ok !== true) return rj
+                            return await dispatchResearch(g)
+                          })
+                        }, '重新调研')
                       ),
                       g.status === 'research_failed' && React.createElement('div', { className: 'stuiRow' },
                         React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.retryResearch', { goalId: g.id })) }, '重试调研')
                       ),
-                      g.status === 'researching' && React.createElement('div', { className: 'stuiMeta' }, '⏳ 目标会话 AI 正在联网调研…完成后自动转入待批准'),
+                      g.status === 'researching' && React.createElement('div', { className: 'stuiMeta' },
+                        awaitingResearch
+                          ? '⚠️ 调研还没开始：建档时状态就被预置为「调研中」，但目标会话从未收到过指令。点下面按钮派发调研。'
+                          : '⏳ 目标会话 AI 正在联网调研…完成后自动转入待批准' + (g.researchDispatchedAt ? '（派发于 ' + hhmm(g.researchDispatchedAt) + '）' : '')),
+                      g.status === 'researching' && React.createElement('div', { className: 'stuiRow' },
+                        React.createElement('button', {
+                          type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy,
+                          onClick: () => doAction(g.id, () => dispatchResearch(g))
+                        }, busyKey === g.id ? '派发中…' : (awaitingResearch ? '▶ 开始调研' : '🔁 重新调研'))),
                       chapterList.map((c) => {
                         const chBusy = busyKey === g.id + ':' + c.index || busyKey === 'ch:' + g.id + ':' + c.index
                         const readyForLearn = c.status === 'ready' || c.status === 'done'

@@ -40,7 +40,7 @@ study_dsh_plugin/
 │   ├── lib/portable.js  可携化工具（零依赖 ZIP + zstd 会话帧改写 + 附件引用收集 + zip-slip 防御）
 │   ├── lib/client.js    客户端 bundle（构建产物，勿手改）
 │   ├── src/client.mjs   客户端源码 + scripts/（build-client / install-profile / cleanroom-check）
-│   └── test/            smoke.mjs(69 断言，含导出→导入往返) · portable.test.mjs(14) · client.test.mjs(13，桩 React 真实渲染点击)
+│   └── test/            smoke.mjs(79 断言，含导出→导入往返) · portable.test.mjs(14) · client.test.mjs(19，桩 React 真实渲染点击)
 └── package.json
 ```
 
@@ -82,12 +82,14 @@ study-work/
 | status | researching / draft_pending / approved / active / completed / deleted |
 | draft | 采纳后的草案（course/overview/chapters/rejected/reject_reason/approved） |
 | chapters[] | 章节：index/title/summary/est_hours/focus_points/file/status/sessionId/qaFile |
-| sessionId / workspaceId | 目标总会话 / 工作区（由 GUI 打开会话后记录） |
+| sessionId / workspaceId | 目标总会话 / 工作区（面板「打开会话」或调研发起时记录） |
+| research | 调研**派发事实** `{dispatchedAt, sessionId, source}`：只有真正把指令注入目标会话才写；`status:'researching'` 本身只是建档初值（见 D16） |
 | reviewItems | 保留字段（测验/错题功能已移除，恒为空，不产生行为） |
 
 ### 状态机
 
 - 目标：`researching → draft_pending → approved → active → completed`；退回草案 → `researching`（草案文件被清空，防止旧草案被重新采纳）。
+- `researching` 有两副面孔，靠 `research.dispatchedAt` 区分：**有值** = 调研指令已注入目标会话（面板「调研中…」+「🔁 重新调研」）；**无值** = 只是建档初值，会话没收到过任何指令（面板「待调研」+「▶ 开始调研」）。`createGoalDoc` 建目标即置 `researching`，所以该状态不等于"AI 在跑"（D16）。
 - 章节：`draft（待生成）→ generating（生成中）→ ready（讲义就绪）`；历史数据中的 `done` 读取时归一化为 `ready`。
 - 讲义采纳规则：文件存在且正文 >200 字符 → `ready`（列表/状态读取时轮询采纳）。
 - 讲义回写规则：章节会话中 AI 每次回答后自检，若有讲义未覆盖的补充内容则询问用户是否回写。回写采用「总结+链接+独立详细文件」模式：
@@ -101,17 +103,18 @@ study-work/
 
 | method | 入参 | 行为 |
 | --- | --- | --- |
-| study.list | – | 目标列表 + 采纳扫描（草案/讲义） |
+| study.list | – | 目标列表 + 采纳扫描（草案/讲义）；每行含 `researchDispatched` / `researchDispatchedAt` |
 | study.createGoal | topic,target_level,requirements | 建 goal 目录 + index 注册 + 工作区（workspaceRegistry） |
-| study.startResearch | goalId,sessionId | 记录目标会话 → 清空旧草案 → 注入调研指令 |
-| study.retryResearch | goalId | 向目标会话重发调研（带上次意见） |
+| study.startResearch | goalId,sessionId | 记录目标会话 → 清空旧草案 → 注入调研指令 → 记 `research.dispatchedAt` |
+| study.retryResearch | goalId | 向目标会话重发调研（带上次意见）→ 记 `research.dispatchedAt` |
 | study.approveDraft | goalId | 草案→章节清单（含 qaFile），状态 approved |
-| study.rejectDraft | goalId,reason | 退回并清空 draft.json（防旧草案被采纳） |
+| study.rejectDraft | goalId,reason | 退回并清空 draft.json（防旧草案被采纳）+ 清 `research`（退回=需重新派发） |
 | study.generateChapter | goalId,chapter_index | 章节→generating，向章节会话（无则目标会话）注入讲义任务；无可将会话→回退 draft |
 | study.continueChapter | goalId,chapter_index | 先查文件：已产出→ready；否则会话可用→重发任务；不可用→回退 draft 并提示 |
 | study.recordChapterSession | goalId,chapter_index,sessionId | 记录章节会话 id |
 | study.startChapter | goalId,chapter_index,sessionId | 向章节会话注入「本章学习教练」开场指令（读讲义→讲解→每次回答后检查是否有值得回写的补充内容并询问用户→写回 NN-qa.md） |
 | study.recordGoalSession | goalId,sessionId | 回写目标总会话 id（旧会话被销毁后面板新建会话时使用，配合 D10） |
+| study.dispatchResearch | goalId | 面板「▶ 开始调研 / 🔁 重新调研」的派发口：宿主内委托 `chatResearch`（解析目标会话 → 按 reject_reason 选首次/重试指令 → 注入 → 记 `research.dispatchedAt`），派发调研的唯一 owner |
 | study.deleteGoal | goalId | 移出 index 并标记 deleted（文件保留） |
 | study.ensureGoalWorkspace | goalId | 按需创建/解析目标工作区 |
 | study.exportGoal | goalId | 导出该目标为 zip（目标树 + 全部会话 + 附件 + manifest），落 `exports/` |
@@ -173,13 +176,15 @@ study-work/
 | D13 | 工作区登记走公开 API（`create` + `attachSession`），**永不覆盖** `storages/workspace.json` | 那是全局单文件且注册表有启动不变量（同会话被两个工作区索引 / 两条记录同路径 / 顺序偏离 ⇒ 拒绝启动）；整包覆盖会摧毁目标机其它工作区甚至让 DSH 起不来 |
 | D14 | 导入 = 预览/确认两段式 + 逐文件 sha256 校验先于写盘 + 写入后宿主 `inspect()` 自检 + 任一步失败整体回滚 | 导入会跨目录写会话与索引，必须可判定、可拒绝、可撤销；`inspect()` 是官方"非修改式检查"，用它证明宿主真读得懂，而不是我们自说自话 |
 | D15 | ZIP 与 zstd 帧工具自己实现（`lib/portable.js`，只用 `node:zlib`/`node:crypto`） | 插件既有的「纯 JS、零 npm 依赖、宿主平面受信」约定；不为了 zip 引入 fflate。外部解压器（Windows Expand-Archive）互操作已入测试 |
+| D16 | 「调研已派发」升格为 goal.json 的 `research` 事实，由三处注入成功点写入；面板 `researching` 按该事实分岔给「▶ 开始调研 / 🔁 重新调研」（RPC `study.dispatchResearch` 委托 `chatResearch`） | 事故复盘：目标由 `study_plan_create` 建档（该路径按设计不调研）→ 用户点「打开会话」只建了会话没发指令 → 面板因初值 `status:'researching'` 长亮「⏳ 正在联网调研」，且 researching 分支零按钮 → 用户以为"卡住"，实际是"从没开始"，唯一出路是隐式的「对我说开始调研」。不新增 `created` 状态（方案 B 会牵动状态机/老数据归一化/全量文案），改为给事实加一个字段并在 UI 分岔；派发口只留一个 owner，避免与 startResearch/retryResearch 三处重复 |
 
 ## 7. 已知限制 / 后续路线
 
 - 动态插件会话级生命周期：重启后需按 INSTALL.md 恢复（快照已放 `~/.dsh/study-work/plugin/`）。
-- 面板「重新调研」已与聊天一致（退回即清草案）；研究失败态（research_failed）仅兼容旧数据。
+- 面板「重新调研」= 退回草案 + 清空草案文件 + **立刻重新派发指令**（D16；此前只退回不派发，目标会停在「调研中」）；研究失败态（research_failed）仅兼容旧数据。
+- **D16 之前创建的 `researching` 目标没有 `research` 标记**，升级后会显示「待调研」。若它其实还在跑，点「▶ 开始调研」等于再发一次指令（幂等成本一次会话轮次）；一旦草案落地转 `draft_pending` 就自动归位，不做数据迁移。
 - 正式持久化插件（profile `cordis.patch.yml` 组合行 + `dsh.client` 客户端模块 + host↔client 远程桥）尚未实施——实施后将不再依赖会话级重装。
-- **导出/导入（M4）只在常驻版实现**（D7 决策）：动态版 `src/host.js` 是路线 A 回退，不追新特性；两版数据契约仍一致，用常驻版导出的包可被任一版本的目标列表读取。
+- **导出/导入（M4）与派发事实（D16）只在常驻版实现**（D7 决策）：动态版 `src/host.js` 是路线 A 回退，不追新特性；两版数据契约仍一致，用常驻版导出的包可被任一版本的目标列表读取。
 - 导入后需重启 DSH 才会在左栏分组与会话列表里完整可见（工作区/会话发现与投影缓存在宿主启动期定型）；`study.reattachGoalSessions` 是重启后的修复入口。
 - 导出包目前只在同机 `exports/` 与浏览器下载之间流转；多目标合包、云同步、全文路径替换（D2②）都未做。
 - 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）。
@@ -190,7 +195,7 @@ study-work/
 - RPC/工具返回值必须是无损 JSON（递归剔除 undefined）。
 - 修改 `src/host.js|client.js` 后执行 `npm run build && npm run install:dsh` 重新打包快照。
 - 改常驻版：`cd study-plugin && node scripts/build-client.mjs`（改过 `src/client.mjs` 必须重建 bundle）→ `node scripts/install-profile.mjs` → 重启 DSH。
-- 提交前跑全套：`cd study-plugin && npm test`（smoke 69 + portable 14 + client 13）与 `node scripts/cleanroom-check.mjs`（净室 tarball 探针）。
+- 提交前跑全套：`cd study-plugin && npm test`（smoke 79 + portable 14 + client 19）与 `node scripts/cleanroom-check.mjs`（净室 tarball 探针）。
 - 动了 transcript 帧处理就跑 `node test/transcript-sweep.mjs`：它拿本机全部真实会话日志（本仓所在机器 108 个 / 59.3MB）验「切帧 / header 重写 / 逐行不变 / 帧数不变」，合成数据替代不了这一层。
 - 触碰宿主落盘格式（会话帧 / 附件 / 注册表）前先读 §5「可携化用到的宿主事实」，路径一律用 `sessionPersistence.locate()` 解析，不要复刻 projectKey/encodeSegment。
 - ⚠️ 未提交的工作在这个仓库被一次 IDE 回退吃掉过（2026-09-09 18:30，`git restore` 类操作不写 reflog）：**能验证过就立刻 commit**，别把成果只留在工作区。
