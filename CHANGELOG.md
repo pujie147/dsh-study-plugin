@@ -2,7 +2,35 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-09-10
+
+### added
+- **目标导出 / 导入（可携化）**：一个学习目标打成单个 zip（目标目录整棵树 + 该目标工作区**全部**会话 transcript 逐字节原文 + 会话引用的附件对象 + 工作区登记信息 + `manifest.json`），可在另一台机器/另一个 `DSH_HOME` 还原
+  - 新宿主 RPC ×6：`study.exportGoal` / `study.listExports` / `study.deleteExport` / `study.inspectImport` / `study.importGoal`（不带 confirm 即预览） / `study.reattachGoalSessions`
+  - 新 GET 路由 `/study-export?file=…`（loopback 守卫、只认 exports 目录内裸文件名的 `.zip`）
+  - 新聊天工具 ×2：`study_goal_export` / `study_goal_import`（与面板 RPC 同一实现）
+  - 面板：目标行「📤 导出 zip」「🔗 重新绑定会话」、顶部「📦」导出包视图（列表 / ⬇ 下载 / 删除 / 路径预览 / 确认导入）
+- `lib/portable.js`：零依赖 ZIP（store + deflate）与 zstd 会话帧工具（帧切分复刻宿主 `scanZstdFrames`、只重写 header 帧、明文↔zstd 转换、附件引用收集、zip-slip 防御）
+- `test/portable.test.mjs`（14 断言）与 `test/client.test.mjs`（13 断言，最小 React/DOM/fetch 桩真实渲染并点击面板）
+
+### 契约与取舍
+- 会话正文**不**改写：跨机导入只重写会话 header 帧的 `cwd`（帧描述符与宿主写出一致：非 single-segment + content checksum，已 spike 验证）
+- 工作区登记走公开 API（`workspaceRegistry.create` + `ws.attachSession`），**不覆盖**全局 `storages/workspace.json`
+- 不含：凭据/设置/日志/profile/`session_projcache.json`（自愈缓存）/`study-work/plugin/` 快照/目标目录内 `.mnemon/` 记忆
+- 导入写入后用宿主 `sessionPersistence.inspect()` 自检，任一会话读不懂即整体回滚；包内逐文件 sha256 校验先于写盘
+- 导入/迁移后需重启 DSH 才会完整刷新左栏分组与会话列表
+
+### fixed
+- 恢复被一次工作区回退吃掉的 D10（面板「📄 打开会话」幂等复用 `goal.sessionId` + `study.recordGoalSession`），双轨（常驻版 + 动态版）逐字节还原：动态版 `dist` hash 与幸存快照一致；常驻版重建 bundle 与安装副本 375 行逐行一致；并与已发布的 v0.1.1 逐行核对 —— 发布仓内容无一行为本仓所缺，等价确认
+- `scripts/install-profile.mjs`：`node_modules/study-plugin` 是**官方安装器留下的真实目录**时不再 `ENOTEMPTY` 崩溃 —— 改用 `readlink` 区分「Junction/符号链接」与「真实目录」，真实目录改名让位（不删字节），卸载路径同样不再误删真实目录
+- 可携化服务缺席时报明确错误（`会话持久化服务不可用…`），并在日志里点名缺哪个服务；只有三项齐备才打印「portable deps ready」
+
+### added（测试）
+- `test/transcript-sweep.mjs`：用本机全部真实会话日志验帧处理（切帧/重写/行数与帧数不变/身份不变），无 DSH 数据时自动跳过
+
 ## [0.1.1] - 2026-09-09
+
+> 注：本节与 GitHub 发布仓 `pujie147/dsh-study-plugin` 的 v0.1.1 内容一致。开发仓当时被一次工作区回退吃掉了这份未提交改动（见 v0.2.0 的 fixed 条），现补回以保持版本史连续。
 
 ### changed
 - **面板「📄 打开会话」不再每次新建会话**：优先切回 `goal.json` 里记录的「目标总会话」（即产出课程草案的那个会话，反复点都回到同一个会话）；只有它未记录或已被销毁时，才在目标工作区新建会话。旧实现直接走 `workspaces.connectWorkspace`，而它只复用**空白**会话——目标会话一旦产过草案就不再空白，导致每次点击都多出一个新会话、调研上下文被留在旧会话里。
