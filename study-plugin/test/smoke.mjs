@@ -1,13 +1,19 @@
-// smoke.mjs — 宿主半运行时冒烟测试（纯 Node，mock webServer/agents/workspaceRegistry/sessionPersistence/sessions/attachments）
+// smoke.mjs — 宿主半运行时冒烟测试（纯 Node）
 // 运行: node study-plugin/test/smoke.mjs
-// 覆盖: 路由守卫(GET/loopback)、study.* 全链路(list→create→draft 采纳→批准→讲义采纳→章节会话注入→删除)、
-//       unknown method、M4 导出/导入（含跨路径 header 重写、附件往返、冲突拒绝、副本模式、下载路由）。
+// 覆盖: 路由守卫(GET/loopback)、study.* 全链路(list→create→草案采纳→批准→讲义采纳→章节会话注入→删除)、
+//       unknown method、M4 导出/导入、**M4.1 覆盖式同步语义**（身份重发/幂等/快进追加/回退需 force/
+//       归档继承防护/工作区投影自检/回滚不留空目录）。
+//
+// 关键：会话存储与工作区注册表用**宿主真实实现**（test/host-fixture.mjs），只假一个内存 storageDomain。
+// 上一版这里用我自己写的宽松 mock（attach 永远成功、列表从盘上现读），结果 96 条断言全绿却漏掉了
+// 「导入保留源 session id ⇒ 宿主 list() 抛 duplicate / 继承归档态 ⇒ 会话看不见」这个真 bug。
 import { EventEmitter } from 'node:events'
 import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import * as P from '../lib/portable.js'
+import { createHostServices } from './host-fixture.mjs'
 import { apply } from '../lib/index.js'
 
 let passed = 0
@@ -17,40 +23,31 @@ function check(name, cond, extra) {
   else { failed++; console.log('  ✗ ' + name + (extra !== undefined ? '  [' + JSON.stringify(extra) + ']' : '')) }
 }
 
-// ── mock 基础设施 ────────────────────────────────────────────────────────────
+// ── 基础设施 ─────────────────────────────────────────────────────────────────
 const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-smoke-'))
 const injected = []
 const flushed = []
 const routes = {}
 const effects = []
 const registeredTools = []
-const createdWorkspaces = []
 
-// 会话存储根（模拟 ~/.dsh/sessions）：项目目录名由 cwd 派生，会话目录名 = encodeSegment(id)
 const sessRoot = path.join(tmpRoot, '_sessions')
-const encodeSeg = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, (c) => '~' + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0'))
-const projectKey = (cwd) => '--' + String(cwd).replace(/[\\/:]+/g, '-').replace(/^-+/, '').slice(0, 251) + '--'
-const mockPersistence = {
-  compression: 'zstd',
-  locate: (meta) => ({ kind: 'jsonl', path: path.join(sessRoot, projectKey(meta.cwd), encodeSeg(meta.id), 'session.jsonl.zstd') }),
-  // 非修改式检查：按 id 扫项目目录，找到后校验 header.id === id（与宿主同一套身份校验）
-  inspect: async (id) => {
-    const projects = await fsp.readdir(sessRoot, { withFileTypes: true }).catch(() => [])
-    for (const pr of projects) {
-      if (!pr.isDirectory()) continue
-      const dir = path.join(sessRoot, pr.name, encodeSeg(id))
-      let buf
-      try { buf = await fsp.readFile(path.join(dir, 'session.jsonl.zstd')) } catch { continue }
-      const hdr = P.readSessionHeader(buf)
-      if (hdr.id !== id) throw new Error('session identity mismatch: ' + hdr.id + ' != ' + id)
-      if (hdr.cwd && !pr.name.includes(encodeSeg('probe')) && path.dirname(path.dirname(path.join(dir, 'x'))) !== path.join(sessRoot, pr.name)) {
-        throw new Error('transcript not under its cwd project dir')
-      }
-      return { id, header: hdr, lines: P.decodeTranscript(buf).text.split('\n').filter(Boolean).length }
-    }
-    throw new Error('session log not found: ' + id)
-  }
+await fsp.mkdir(sessRoot, { recursive: true })
+const live = []                       // 每项 {id, header:{id,cwd}} —— 用于「该会话正被打开」的硬冲突
+const sessionsSvc = {
+  list: () => live,
+  get: (id) => live.find((s) => s.id === id),
+  flush: async (s) => { flushed.push(s.id) },
 }
+const H = await createHostServices({ sessionsRoot: sessRoot, sessions: sessionsSvc })
+if (!H) {
+  console.error('FAIL: 取不到宿主真实实现（@deepseek-ai/dsh-session-persistence-jsonl / dsh-workspace）。\n' +
+    '      这条测试的前提就是跑宿主代码；请确认本机装了 DSH（或 profile 里有这两个包）。')
+  process.exit(1)
+}
+const mockPersistence = H.persistence
+const wsRegistryReal = H.registry
+
 // 附件存储根（模拟 ~/.dsh/attachments/v1，内容寻址）
 const attachRoot = path.join(tmpRoot, '_attachments', 'objects')
 const mockAttachments = {
@@ -66,6 +63,10 @@ const mockAttachments = {
     return { attachmentId: 'sha256:' + sha, mediaType: input.mediaType }
   }
 }
+/** index.json 里的目标行（多条断言共用）。 */
+const readIndexGoals = async () => { try { return (JSON.parse(await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')).goals) || [] } catch { return [] } }
+/** 会话在项目目录下的位置（不自己复刻 projectKey，走真 locate）。 */
+const projectDirOf = (cwd) => path.dirname(path.dirname(mockPersistence.locate({ cwd, id: 'probe-x' }).path))
 const ctx = {
   inject: (names, fn) => {
     const scope = {
@@ -77,24 +78,9 @@ const ctx = {
         register: (def) => { registeredTools.push(def); return () => { const i = registeredTools.indexOf(def); if (i >= 0) registeredTools.splice(i, 1) } }
       },
       agents: { get: (id) => ({ followup: (msg) => { injected.push({ id, msg }) } }) },
-      workspaceRegistry: {
-        resolveByPath: async () => undefined,
-        create: async (p, title) => {
-          const ws = {
-            id: 'ws-test',
-            path: p,
-            title: title,
-            sessionIds: [],
-            attachSession: async function (sid) { this.sessionIds.push(sid) }
-          }
-          createdWorkspaces.push(ws)
-          return ws
-        },
-        get: () => undefined,
-        archivedSessionIds: []
-      },
+      workspaceRegistry: wsRegistryReal,
       sessionPersistence: mockPersistence,
-      sessions: { get: (id) => ({ id }), flush: async (s) => { flushed.push(s.id) } },
+      sessions: sessionsSvc,
       attachments: mockAttachments
     }
     for (const n of names) if (scope[n] === undefined) throw new Error('unexpected service: ' + n)
@@ -163,12 +149,13 @@ let exportedGoalId = ''
   const r1 = await callRpc('study.createGoal', { topic: 'Transformer 基础', target_level: '能读懂论文', requirements: '中文讲义' })
   check('createGoal ok', r1.json && r1.json.ok === true && String(r1.json.goalId).startsWith('goal-'), r1.json)
   const goalId = r1.json.goalId
-  check('workspaceId 来自注册表', r1.json.workspaceId === 'ws-test', r1.json)
+  const wsIdOfGoal = String(r1.json.workspaceId || '')
+  check('workspaceId 来自真注册表（uuid 形态、可在 registry.get 拿回）', /^[0-9a-f-]{36}$/.test(wsIdOfGoal) && !!wsRegistryReal.get(wsIdOfGoal), r1.json)
 
   const r2 = await callRpc('study.list', {})
   const g0 = r2.json.goals[0]
   check('list 含新目标(researching)', g0 && g0.status === 'researching' && g0.title === 'Transformer 基础', g0)
-  check('list 含 path/workspaceId/sessionId 字段', typeof g0.path === 'string' && g0.workspaceId === 'ws-test', g0)
+  check('list 含 path/workspaceId/sessionId 字段', typeof g0.path === 'string' && g0.workspaceId === wsIdOfGoal, g0)
 
   // 注入目标会话 → startResearch
   const r3 = await callRpc('study.startResearch', { goalId, sessionId: 'sess-goal-1' })
@@ -229,38 +216,55 @@ let exportedGoalId = ''
   const r9 = await callRpc('study.continueChapter', { goalId, chapter_index: 1 })
   check('continueChapter(已就绪) → ready 短路', r9.json && r9.json.ok === true && r9.json.result === 'ready', r9.json)
 
-  // ── M4 前置：为该目标造出真实会话 transcript（目标会话 + 章节会话 + subagent 会话）
+  // ── M4 前置：用真 locate 造出该目标的会话 transcript（目标会话 + 章节会话 + 空 subagent 会话）
   const goalAbsDir = path.join(tmpRoot, goalId)
-  async function makeSession(sid, cwd, extraEvents) {
+  const ev = (type, seq, data, extra) => JSON.stringify(Object.assign({ type, seq, time: 1788000100000 + seq, data }, extra || {}))
+  async function makeSession(sid, cwd, rows) {
     const abs = mockPersistence.locate({ cwd, id: sid }).path
     await fsp.mkdir(path.dirname(abs), { recursive: true })
-    const lines = [
-      JSON.stringify({ type: 'session', version: 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }),
-      ...extraEvents
-    ]
+    const lines = [JSON.stringify({ type: 'session', version: 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }), ...rows]
     await fsp.writeFile(abs, await P.jsonlToZstdFrames(lines.join('\n') + '\n', 2))
     return abs
   }
   const pngBytes = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4' + '0'.repeat(40), 'hex')
   const pngRef = await mockAttachments.saveImage({ data: new Uint8Array(pngBytes), mediaType: 'image/png' })
   await makeSession('sess-goal-1', goalAbsDir, [
-    JSON.stringify({ type: 'session/title', seq: 0, data: { title: 'Transformer 课程规划草案' } }),
-    JSON.stringify({ type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '请调研并写 ' + goalAbsDir.replace(/\\/g, '/') + '/draft.json' }] } })
+    ev('turn/start', 0, { turn: 1 }),
+    ev('session/title', 1, { title: 'Transformer 课程规划草案', messageSeqs: [2], source: { kind: 'llm' } }),
+    ev('user/message', 2, { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '请调研并写 ' + goalAbsDir.replace(/\\/g, '/') + '/draft.json' }] }, { surfaceOp: 'append' }),
+    ev('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
   ])
   await makeSession('sess-ch-1', goalAbsDir, [
-    JSON.stringify({ type: 'user/message', seq: 0, data: { content: [{ type: 'text', text: '看这张图' }, { type: 'image', attachment: { attachmentId: pngRef.attachmentId, mediaType: 'image/png' } }] } }),
-    JSON.stringify({ type: 'turn/end', seq: 1, data: {} })
+    ev('turn/start', 0, { turn: 1 }),
+    ev('user/message', 1, { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '看这张图' }, { type: 'image', attachment: { attachmentId: pngRef.attachmentId, mediaType: 'image/png' } }] }, { surfaceOp: 'append' }),
+    ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   await makeSession('sess-sub-1', goalAbsDir, [
-    JSON.stringify({ type: 'user/message', seq: 0, data: { content: [{ type: 'text', text: '子代理任务' }] } })
+    ev('user/message', 0, { id: 'u3', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '子代理任务' }] }, { surfaceOp: 'append' }),
   ])
   // 另一个目标工作区里混进的无关会话（同 sessRoot、不同项目目录）——不得被带走
-  await makeSession('sess-other', path.join(tmpRoot, 'other-goal'), [JSON.stringify({ type: 'user/message', seq: 0, data: { content: [{ type: 'text', text: '无关' }] } })])
+  await makeSession('sess-other', path.join(tmpRoot, 'other-goal'), [ev('turn/start', 0, { turn: 1 }), ev('turn/end', 1, { turn: 1, reason: { kind: 'completed' } })])
+  for (const sid of ['sess-goal-1', 'sess-ch-1', 'sess-sub-1']) {
+    const v = await mockPersistence.inspect(sid)
+    if (!v || !v.meta) throw new Error('测试前置数据未被宿主认账: ' + sid)
+  }
+  const rowsOf = async (sid, cwd) => { try { return P.analyzeTranscript(await fsp.readFile(mockPersistence.locate({ cwd, id: sid }).path)).lines.length } catch { return -1 } }
+  const projectionOf = async (dir) => { const w = await wsRegistryReal.resolveByPath(dir).catch(() => undefined); return w ? w.sessionIds.map(String) : [] }
+  const emptySessionDirs = async () => {
+    const out = []
+    for (const pr of await fsp.readdir(sessRoot, { withFileTypes: true }).catch(() => [])) {
+      if (!pr.isDirectory()) continue
+      for (const sd of await fsp.readdir(path.join(sessRoot, pr.name), { withFileTypes: true })) {
+        if (sd.isDirectory() && !(await fsp.readdir(path.join(sessRoot, pr.name, sd.name))).length) out.push(pr.name + '/' + sd.name)
+      }
+    }
+    return out
+  }
 
-  // 导出
+  // ── P1 导出（含 v2 清单与导出卫生） ────────────────────────────────────────
   const rE = await callRpc('study.exportGoal', { goalId })
   check('exportGoal ok', rE.json && rE.json.ok === true && /\.zip$/.test(rE.json.file), rE.json)
-  check('导出包落在 exports/', rE.json && path.dirname(rE.json.path).endsWith('exports') && !!await fsp.stat(rE.json.path).catch(() => undefined), rE.json && rE.json.path)
+  check('导出包落在 exports/', rE.json && path.dirname(rE.json.path).endsWith('exports') && !!(await fsp.stat(rE.json.path).catch(() => undefined)), rE.json && rE.json.path)
   exportedFile = rE.json.file
   exportedGoalId = goalId
   check('导出含 3 个会话（含 subagent、排除别的工作区会话）', rE.json.counts.sessions === 3, rE.json.counts)
@@ -268,22 +272,22 @@ let exportedGoalId = ''
   const zipBuf = await fsp.readFile(rE.json.path)
   const zentries = P.readZip(zipBuf)
   const man = P.readJsonEntry(zentries, 'manifest.json')
-  check('manifest 格式版本/kind', man.formatVersion === 1 && man.kind === 'study-goal-export', { v: man.formatVersion, k: man.kind })
-  const wantGoal = [
-    'goal/goal.json', 'goal/draft.json',
-    'goal/chapters/' + gj.chapters[0].file, 'goal/chapters/01-qa.md',
-    'goal/chapters/01-notes/梯度消失.md', 'goal/demo.py'
-  ]
-  check('goal 树全部内容入包（讲义/qa/notes/代码/draft/goal.json）', wantGoal.every((n) => zentries.has(n)), wantGoal.filter((n) => !zentries.has(n)))
+  check('manifest formatVersion=2 / kind', man.formatVersion === 2 && man.kind === 'study-goal-export', { v: man.formatVersion, k: man.kind })
+  check('包内条目名唯一（每份 transcript 只存一遍）', new Set(man.files.map((f) => f.name)).size === man.files.length, man.files.map((f) => f.name))
+  check('导出带 deviceId 与 sync.remoteGoalId', typeof man.deviceId === 'string' && !!man.deviceId && man.sync.remoteGoalId === goalId, man.deviceId && man.sync)
   const sRec = man.sessions.find((s) => s.id === 'sess-ch-1')
   check('会话按逐字节原文入包（zstd 帧、header 保留源 cwd）', !!sRec && sRec.encoding === 'zstd' && sRec.frames >= 2 && P.normPath(sRec.cwd) === P.normPath(goalAbsDir), sRec)
+  check('v2 会话带稳定身份与 seq/行数/blank', sRec.remoteId === 'sess-ch-1' && sRec.rows === 3 && sRec.maxSeq === 2 && typeof sRec.lastTime === 'number' && sRec.blank === false, sRec && { r: sRec.remoteId, rows: sRec.rows, seq: sRec.maxSeq, blank: sRec.blank })
+  check('空会话被识别为 blank（宿主会隐藏，不是导入丢失）', man.sessions.find((s) => s.id === 'sess-sub-1').blank === true, man.sessions.map((s) => [s.id, s.blank]))
+  const wantGoal = ['goal/goal.json', 'goal/draft.json', 'goal/chapters/' + gj.chapters[0].file, 'goal/chapters/01-qa.md', 'goal/chapters/01-notes/梯度消失.md', 'goal/demo.py']
+  check('goal 树全部内容入包（讲义/qa/notes/代码/draft/goal.json）', wantGoal.every((n) => zentries.has(n)), wantGoal.filter((n) => !zentries.has(n)))
   check('会话绑定关系被记录(goal/chapter-1/unbound)', man.sessions.map((s) => s.boundTo).sort().join(',') === 'chapter-1,goal,unbound', man.sessions.map((s) => [s.id, s.boundTo]))
-  check('会话标题被提取', sRec.title === '' || typeof sRec.title === 'string', sRec.title)
   check('附件按内容寻址入包', zentries.has(man.attachments[0].entry) && man.attachments[0].sha256 === pngRef.attachmentId.slice(7), man.attachments)
   check('导出包不含 .mnemon/凭据/缓存等', ![...zentries.keys()].some((k) => /\.mnemon|credentials|settings\.yaml|projcache/.test(k)), [...zentries.keys()])
+  check('导出不含设备本地账本 .study-sync.json', ![...zentries.keys()].some((k) => k.endsWith('.study-sync.json')), [...zentries.keys()])
   check('manifest.files 逐条 sha256 与包内一致', man.files.every((f) => P.sha256Hex(zentries.get(f.name)) === f.sha256))
   const srcBody = P.decodeTranscript(zentries.get('sessions/sess-goal-1/transcript.jsonl.zstd')).text
-  check('正文按 D2 不改写（源路径作为历史文本原样入包）', /draft\.json/.test(srcBody) && srcBody.indexOf(goalAbsDir.replace(/\\/g, '/')) > 0, srcBody.slice(0, 80))
+  check('正文按 D2 不改写（源路径作为历史文本原样入包）', /draft\.json/.test(srcBody) && srcBody.indexOf(goalAbsDir.replace(/\\/g, '/')) > 0, srcBody.slice(0, 60))
 
   // 下载路由
   const d1 = await callFile('/study-export?file=' + encodeURIComponent(exportedFile))
@@ -293,65 +297,120 @@ let exportedGoalId = ''
   check('下载拒绝路径穿越', (await callFile('/study-export?file=..%2F..%2Fetc%2Fpasswd.zip')).code === 400)
   check('下载 404 未知文件', (await callFile('/study-export?file=nope.zip')).code === 404)
 
-  // ── 模拟"另一台机器"：清掉目标目录 + index + 全部会话，然后导入
+  // ── P2 全新机器式恢复：清掉一切 ⇒ 预览 ⇒ 导入 ⇒ 宿主自己的投影认账 ─────────
   await fsp.rm(goalAbsDir, { recursive: true, force: true })
-  await fsp.rm(path.join(sessRoot, projectKey(goalAbsDir)), { recursive: true, force: true })
+  await fsp.rm(projectDirOf(goalAbsDir), { recursive: true, force: true })
   await fsp.writeFile(path.join(tmpRoot, 'index.json'), JSON.stringify({ goals: [] }, null, 2))
   const insp = await callRpc('study.inspectImport', { path: rE.json.path })
-  check('inspectImport 预览 ok 且无冲突', insp.json && insp.json.ok === true && insp.json.canImport === true && insp.json.conflicts.length === 0, insp.json)
-  check('同路径导入无需改写 header（rewriteCwd=false）', insp.json.plan.rewriteCwd === false, insp.json.plan.rewriteCwd)
-  const inspCopy = await callRpc('study.inspectImport', { path: rE.json.path, mode: 'copy' })
-  check('副本模式预告要改写 header（rewriteCwd=true）', inspCopy.json && inspCopy.json.ok === true && inspCopy.json.plan.rewriteCwd === true && inspCopy.json.plan.goalId !== exportedGoalId, inspCopy.json && { rc: inspCopy.json.plan.rewriteCwd, id: inspCopy.json.plan.goalId })
-  check('预览列出会话与附件与章节数', insp.json.plan.sessionCount === 3 && insp.json.plan.attachments === 1 && insp.json.plan.chapters === 2, insp.json.plan)
+  check('inspectImport 预览 ok 且无冲突', insp.json && insp.json.ok === true && insp.json.canImport === true && insp.json.conflicts.length === 0, insp.json && insp.json.conflicts)
+  check('预览给出每条身份与动作', insp.json.plan.sessions.length === 3 && insp.json.plan.sessions.every((x) => x.identity === 'fresh' && x.action === 'create'), insp.json.plan.sessions.map((x) => [x.identity, x.action]))
+  check('预览列出会话/附件/章节计数', insp.json.plan.sessionCount === 3 && insp.json.plan.attachments === 1 && insp.json.plan.chapters === 2, insp.json.plan)
   const imp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true })
-  check('importGoal ok', imp.json && imp.json.ok === true && imp.json.goalId === exportedGoalId, imp.json)
+  check('importGoal ok 且 goalId 沿用包内值', imp.json && imp.json.ok === true && imp.json.goalId === exportedGoalId, imp.json)
   check('导入还原了目标目录树', !!(await fsp.stat(path.join(goalAbsDir, 'goal.json')).catch(() => undefined)) && !!(await fsp.stat(path.join(goalAbsDir, 'demo.py')).catch(() => undefined)), imp.json)
-  const wsForImport = createdWorkspaces.filter((w) => P.normPath(w.path) === P.normPath(path.join(tmpRoot, exportedGoalId))).pop()
-  check('导入重新登记工作区并挂回全部会话', imp.json.workspaceId === 'ws-test' && !!wsForImport && wsForImport.sessionIds.slice().sort().join(',') === 'sess-ch-1,sess-goal-1,sess-sub-1', imp.json && wsForImport && wsForImport.sessionIds)
-  const goalAfter = JSON.parse(await fsp.readFile(path.join(goalAbsDir, 'goal.json'), 'utf8'))
-  check('goal.json 的会话绑定按原 id 保留', goalAfter.sessionId === 'sess-goal-1' && goalAfter.chapters[0].sessionId === 'sess-ch-1', { s: goalAfter.sessionId, c: goalAfter.chapters && goalAfter.chapters[0].sessionId })
-  const idxAfter = JSON.parse(await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8'))
-  check('index.json 合并进该目标（不丢其它行）', idxAfter.goals.length === 1 && idxAfter.goals[0].id === exportedGoalId, idxAfter.goals.map((g) => g.id))
+  const proj2 = await projectionOf(goalAbsDir)
+  check('宿主工作区投影认账全部 3 条会话（这是"看不看得见"的权威）', proj2.slice().sort().join(',') === 'sess-ch-1,sess-goal-1,sess-sub-1', { projected: proj2, warnings: imp.json.warnings })
+  check('导入复用/登记工作区（真注册表 uuid，path 指向目标目录）', /^[0-9a-f-]{36}$/.test(String(imp.json.workspaceId)) && (await wsRegistryReal.get(String(imp.json.workspaceId))).path === await fsp.realpath(goalAbsDir), imp.json.workspaceId)
   const tPath = mockPersistence.locate({ cwd: goalAbsDir, id: 'sess-ch-1' }).path
-  const tBuf = await fsp.readFile(tPath)
-  const tHdr = P.readSessionHeader(tBuf)
-  const tLines = P.decodeTranscript(tBuf).text.split('\n').filter(Boolean)
-  check('导入后会话落在新机项目目录且 header.cwd 已改写', P.normPath(tHdr.cwd) === P.normPath(goalAbsDir), tHdr.cwd)
-  check('导入后会话正文逐行不变、id 不变', tHdr.id === 'sess-ch-1' && tLines.length === 3 && /看这张图/.test(tLines[1]), tLines.length)
+  const tHdr = P.readSessionHeader(await fsp.readFile(tPath))
+  const wsRec = await wsRegistryReal.get(String(imp.json.workspaceId))
+  check('header.cwd 用宿主 canonical 形态（realpath，与 workspace.path 逐字相同）', tHdr.cwd === wsRec.path, { hdr: tHdr.cwd, ws: wsRec.path })
+  check('导入后会话正文逐行不变、id 不变（本地身份空闲时沿用）', tHdr.id === 'sess-ch-1' && (await rowsOf('sess-ch-1', goalAbsDir)) === 3 && /看这张图/.test(P.decodeTranscript(await fsp.readFile(tPath)).text), tHdr.id)
   const shaPng = pngRef.attachmentId.slice(7)
   const backPng = await fsp.readFile(path.join(attachRoot, shaPng.slice(0, 2), shaPng)).catch(() => undefined)
   check('附件按内容寻址回写，attachmentId 不变（会话引用不悬空）', !!backPng && Buffer.compare(backPng, pngBytes) === 0)
-  check('导入报告需要重启提示', imp.json.ok === true && imp.json.verified === true, { verified: imp.json.verified })
+  check('导入自检 = 宿主 inspect() 通过', imp.json.ok === true && imp.json.verified === true, { verified: imp.json.verified })
+  const led2 = JSON.parse(await fsp.readFile(path.join(goalAbsDir, '.study-sync.json'), 'utf8'))
+  check('写了设备本地身份账本（remoteId↔localId 三条）', led2.remoteGoalId === exportedGoalId && led2.sessions.length === 3 && led2.sessions.every((x) => x.remoteId === x.localId), led2.sessions.map((x) => [x.remoteId, x.localId]))
+  check('导入报告哪几条按宿主规则不会单独出现', /不会在工作区里单独出现/.test((imp.json.warnings || []).join(' ')), imp.json.warnings)
+  // 往返：从恢复出来的副本再导出一次，稳定身份必须还是原来的
+  const rE2 = await callRpc('study.exportGoal', { goalId: exportedGoalId })
+  const man2b = P.readJsonEntry(P.readZip(await fsp.readFile(rE2.json.path)), 'manifest.json')
+  check('二次导出的 remoteId 保持（账本让身份跨机旅行不漂移）', man2b.sessions.every((s) => s.remoteId === s.id) && man2b.sync.remoteGoalId === exportedGoalId, man2b.sessions.map((s) => [s.id, s.remoteId]))
+  await fsp.unlink(path.join(tmpRoot, 'exports', rE2.json.file)).catch(() => {})
 
-  // 重复导入 → 冲突拒绝（同 goalId + 同会话 id）
-  const dup = await callRpc('study.importGoal', { path: rE.json.path, confirm: true })
-  check('重复导入被冲突挡住（不覆盖已有会话/目录）', dup.json && dup.json.ok === false && /冲突/.test(dup.json.error || ''), dup.json)
-  // 副本模式 → 新 goalId + 会话 header 再次改写
-  const cp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'copy' })
-  check('copy 模式另存为新 goalId', cp.json && cp.json.ok === true && cp.json.goalId !== exportedGoalId, cp.json && cp.json.goalId)
-  const cpDir = path.join(tmpRoot, cp.json.goalId)
-  const cpHdr = P.readSessionHeader(await fsp.readFile(mockPersistence.locate({ cwd: cpDir, id: 'sess-goal-1' }).path))
-  check('副本会话 header.cwd 指向新副本目录', P.normPath(cpHdr.cwd) === P.normPath(cpDir), cpHdr.cwd)
-  check('副本 goal.json 换了 id（会话 id 保持）', JSON.parse(await fsp.readFile(path.join(cpDir, 'goal.json'), 'utf8')).id === cp.json.goalId)
-  // 坏包 → 校验失败
+  // ── P3 幂等：同一个包再导一次 ⇒ 全 no-op，不新增副本 ──────────────────────
+  const impAgain = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite' })
+  check('重复导入同一包 = 幂等 no-op（不再复制一份目标）', impAgain.json && impAgain.json.ok === true && impAgain.json.idempotent === true && impAgain.json.applied.noop === 3, JSON.parse(JSON.stringify(impAgain.json, (k, v) => (k === 'plan' ? undefined : v))))
+  check('幂等导入后投影仍是 3 条、目录未翻倍', (await projectionOf(goalAbsDir)).length === 3 && (await readIndexGoals()).length === 1, await readIndexGoals())
+
+  // ── P4 快进 / 回退（尊重宿主 append-only + seq 连续性） ────────────────────
+  const gp = mockPersistence.locate({ cwd: goalAbsDir, id: 'sess-goal-1' }).path
+  const base = await fsp.readFile(gp)
+  const baseRows = P.analyzeTranscript(base).lines.length
+  const extra = [ev('turn/start', baseRows, { turn: 2 }), ev('user/message', baseRows + 1, { id: 'u9', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '第二章开始' }] }, { surfaceOp: 'append' }), ev('turn/end', baseRows + 2, { turn: 2, reason: { kind: 'completed' } })]
+  await fsp.writeFile(gp, (await P.appendLinesToTranscript(base, extra)).bytes)
+  check('本地会话被追加过（模拟"这边又学了"）', (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows + 3, await rowsOf('sess-goal-1', goalAbsDir))
+  const rEExt = await callRpc('study.exportGoal', { goalId: exportedGoalId })
+  const zipExtPath = rEExt.json.path
+  // 旧包覆盖新本地 ⇒ 回退：不带 force 必须被挡
+  const rewind = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite' })
+  check('包比本地旧 ⇒ 无 force 被挡（不悄悄吃掉本地历史）', rewind.json && rewind.json.ok === false && rewind.json.conflicts.some((c) => c.kind === 'sessionDiverged' && /比本地旧/.test(c.hint || '')), rewind.json && { err: rewind.json.error, conflicts: rewind.json.conflicts })
+  check('被挡时本地历史未被改动', (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows + 3, await rowsOf('sess-goal-1', goalAbsDir))
+  const rewindForce = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite', force: true })
+  check('带 force 才允许回退覆盖', rewindForce.json && rewindForce.json.ok === true && (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows, { ok: rewindForce.json && rewindForce.json.ok, rows: await rowsOf('sess-goal-1', goalAbsDir) })
+  // 新包覆盖旧本地 ⇒ 只追加尾帧（不动已有字节 ⇒ 投影缓存 seq 围栏继续有效）
+  const ff = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite' })
+  check('更新的包 ⇒ 走 append 快进（1 条追加，其余 noop）', ff.json && ff.json.ok === true && ff.json.applied.append === 1 && ff.json.applied.noop === 2, ff.json && ff.json.applied)
+  check('快进不改本地身份（localId 未被换掉）', (await projectionOf(goalAbsDir)).sort().join(',') === 'sess-ch-1,sess-goal-1,sess-sub-1', await projectionOf(goalAbsDir))
+  check('快进行数正确且宿主 inspect 认账', (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows + 3 && !!(await mockPersistence.inspect('sess-goal-1')), await rowsOf('sess-goal-1', goalAbsDir))
+  const ffAgain = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite' })
+  check('快进收敛后再导一次 = 幂等', ffAgain.json && ffAgain.json.ok === true && ffAgain.json.idempotent === true, ffAgain.json && ffAgain.json.applied)
+
+  // ── P5 该会话正被打开 ⇒ 硬冲突（宿主回写会盖掉导入结果） ──────────────────
+  live.push({ id: 'sess-goal-1', header: { id: 'sess-goal-1', cwd: goalAbsDir } })
+  const liveImp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite', force: true })
+  check('会话 LIVE ⇒ sessionLive 冲突且 force 也不放行', liveImp.json && liveImp.json.ok === false && liveImp.json.conflicts.some((c) => c.kind === 'sessionLive'), JSON.parse(JSON.stringify(liveImp.json, (k, v) => (k === 'plan' ? undefined : v))))
+  live.length = 0
+
+  // ── P6 失败要回滚干净：不留空目录、不留半个目标、index 还原 ────────────────
+  const idxBefore = await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')
+  const realInspect = mockPersistence.inspect
+  mockPersistence.inspect = async () => { throw new Error('测试注入：宿主读不懂') }
+  const boom = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'copy' })
+  mockPersistence.inspect = realInspect
+  check('自检失败 ⇒ ok:false + rolledBack', boom.json && boom.json.ok === false && boom.json.rolledBack === true, boom.json)
+  check('回滚不留空 session 目录（上一版就是留了 6 个空壳）', (await emptySessionDirs()).length === 0, await emptySessionDirs())
+  check('回滚后 index.json 逐字还原', (await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')) === idxBefore, (await readIndexGoals()).map((g) => g.id))
+  check('回滚后没有留下半拉副本目录', !(await fsp.stat(boom.json.dir || path.join(tmpRoot, 'nope')).catch(() => undefined)) || (await fsp.readdir(boom.json.dir)).length > 0)
+
+  // ── P7 坏包 / 篡改包 ⇒ 校验先于写盘 ───────────────────────────────────────
   const badZip = path.join(tmpRoot, 'bad.zip')
-  await fsp.writeFile(badZip, P.createZip([{ name: 'manifest.json', data: Buffer.from(JSON.stringify({ kind: 'study-goal-export', formatVersion: 1, files: [] })) }]))
+  await fsp.writeFile(badZip, P.createZip([{ name: 'manifest.json', data: Buffer.from(JSON.stringify({ kind: 'study-goal-export', formatVersion: 2, files: [], goal: { id: 'x', dir: 'x' }, sessions: [] })) }]))
   const bad = await callRpc('study.inspectImport', { path: badZip })
-  check('缺 goal 信息的包在预览阶段即失败', bad.json && bad.json.ok === false, bad.json)
-  // 缺会话文件 / sha 被篡改 → 校验先于写盘，直接拒绝
+  check('缺 goal.json 的包 ⇒ 预览就报 canImport:false（不当能导入骗人）', bad.json && bad.json.ok === true && bad.json.canImport === false && bad.json.conflicts.some((c) => c.kind === 'packageNoGoal'), bad.json && { canImport: bad.json.canImport, conflicts: bad.json.conflicts })
   const tamperedZip = path.join(tmpRoot, 'tampered.zip')
-  const man2 = JSON.parse(JSON.stringify(man))
-  man2.files = man2.files.map((f) => f.name === 'sessions/sess-sub-1/transcript.jsonl.zstd' ? Object.assign({}, f, { sha256: 'deadbeef' }) : f)
+  const manT = JSON.parse(JSON.stringify(man))
+  manT.files = manT.files.map((f) => f.name === 'sessions/sess-sub-1/transcript.jsonl.zstd' ? Object.assign({}, f, { sha256: 'deadbeef' }) : f)
   await fsp.writeFile(tamperedZip, P.createZip([
-    { name: 'manifest.json', data: Buffer.from(JSON.stringify(man2), 'utf8') },
-    ...[...zentries.entries()].filter(([k]) => k !== 'manifest.json').map(([k, v]) => ({ name: k, data: v, store: /\.zstd$/.test(k) }))
+    { name: 'manifest.json', data: Buffer.from(JSON.stringify(manT), 'utf8') },
+    ...[...zentries.entries()].filter(([k]) => k !== 'manifest.json').map(([k, v]) => ({ name: k, data: v, store: /\.zstd$/.test(k) })),
   ]))
   const tam = await callRpc('study.importGoal', { path: tamperedZip, confirm: true, mode: 'copy' })
-  check('包内 sha256 被篡改 → 导入拒绝（校验先于写盘）', tam.json && tam.json.ok === false && /校验失败/.test(tam.json.error || ''), tam.json)
-  check('校验失败未留下半拉目录', !(await fsp.stat(path.join(tmpRoot, man2.goal.dir + '-x')).catch(() => undefined)))
+  check('包内 sha256 被篡改 ⇒ 导入拒绝（校验先于写盘）', tam.json && tam.json.ok === false && /校验失败/.test(tam.json.error || ''), tam.json)
 
-  // 清理副本，避免影响后面的断言
-  await callRpc('study.deleteGoal', { goalId: cp.json.goalId })
+  // ── P8 归档继承防护（宿主 archivedSessionIds 按 id 全局键控，且这个版本没有解档 API）
+  await wsRegistryReal.archiveSession('sess-ch-1')
+  check('前置：sess-ch-1 已进入宿主归档集', (wsRegistryReal.archivedSessionIds || []).indexOf('sess-ch-1') >= 0, wsRegistryReal.archivedSessionIds)
+  const dupImp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'copy' })
+  check('源仍在盘上 ⇒ 三条全部换发新身份（库里不出现 duplicate id，list() 仍正常）', dupImp.json && dupImp.json.ok === true && (dupImp.json.remap || []).length === 3 && (await mockPersistence.list()).length === 7, dupImp.json && { remap: (dupImp.json.remap || []).length, listed: (await mockPersistence.list()).length })
+  await callRpc('study.deleteGoal', { goalId: dupImp.json.goalId })
+  await fsp.rm(dupImp.json.dir, { recursive: true, force: true })
+  await fsp.rm(projectDirOf(dupImp.json.dir), { recursive: true, force: true })
+  // 8b 连源也抹掉 ⇒ 「id 空闲」时归档集仍然会藏会话 ⇒ 必须不换用该 id（上一版就在这里"导入即隐身"）
+  await fsp.rm(goalAbsDir, { recursive: true, force: true })
+  await fsp.rm(projectDirOf(goalAbsDir), { recursive: true, force: true })
+  await fsp.writeFile(path.join(tmpRoot, 'index.json'), JSON.stringify({ goals: [] }, null, 2))
+  const archImp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true })
+  const archRemap = (archImp.json && archImp.json.remap) || []
+  check('空闲但在归档集里的 id 不复用（why 说明归档）', archImp.json && archImp.json.ok === true && archRemap.length === 1 && archRemap[0].remoteId === 'sess-ch-1' && /归档/.test(archRemap[0].why), archRemap)
+  check('未归档的空闲 id 沿用原身份（不无谓换发）', (await projectionOf(goalAbsDir)).filter((id) => id === 'sess-goal-1' || id === 'sess-sub-1').length === 2, await projectionOf(goalAbsDir))
+
+  // ── P9 终态：主目标在、投影齐全、没有一条被归档集藏起来、无空目录残留 ──────
+  const finProj = await projectionOf(goalAbsDir)
+  check('终态：主目标工作区投影 3 条齐全', finProj.length === 3, finProj)
+  check('终态：投影里没有一条在归档集里（导入结果一定看得见）', finProj.every((id) => (wsRegistryReal.archivedSessionIds || []).indexOf(id) < 0), { finProj, archived: wsRegistryReal.archivedSessionIds })
+  check('终态：sessions 根下无空目录残留', (await emptySessionDirs()).length === 0, await emptySessionDirs())
 }
 
 // ── reject 路径 + 删除 ───────────────────────────────────────────────────────

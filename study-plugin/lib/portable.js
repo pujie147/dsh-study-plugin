@@ -278,19 +278,112 @@ export function readSessionHeader(buf) {
 }
 
 /**
- * 跨路径导入：只重写 header 帧的 cwd，其余帧逐字节保留（已经 spike 验证与宿主写出一致）。
- * 返回 { bytes, header }；cwd 未变时 changed=false（原字节直接落盘）。
+ * 重写 header 帧的身份字段（id / cwd / parentSession），其余帧逐字节保留。
+ *
+ * 为什么可以只改第 1 帧：宿主把 transcript 写成「独立 zstd 帧的拼接」，
+ * 且第 1 帧只含 header 行（见 encodeMaterialization：headerFrame + eventFrame）。
+ *
+ * 注意：换 id 后**必须**按 `sessionPersistence.locate({cwd,id})` 反推的新路径落盘 ——
+ * 宿主 assertStoredIdentity 会用 header 的 id+cwd 反推物理路径并校验一致性。
+ *
+ * @param {Buffer} buf 原 transcript 字节
+ * @param {{id?:string, cwd?:string, parentSession?:string|null}} patch 要改的字段；null = 删除该字段
+ * @returns {Promise<{bytes:Buffer, header:object, changed:boolean, idChanged:boolean}>}
  */
-export async function rewriteTranscriptCwd(buf, newCwd) {
+export async function rewriteTranscriptHeader(buf, patch) {
   const { frames, tornStart } = scanZstdFrames(buf)
   if (!frames.length) throw new Error('transcript 无有效帧')
   const header = readSessionHeader(buf)
-  if (header.cwd === newCwd) return { bytes: buf, header: header, changed: false }
-  const next = { ...header, cwd: newCwd }
+  const next = { ...header }
+  if (patch && patch.id !== undefined && patch.id !== null) next.id = String(patch.id)
+  if (patch && patch.cwd !== undefined && patch.cwd !== null) next.cwd = String(patch.cwd)
+  if (patch && patch.parentSession !== undefined) {
+    if (patch.parentSession === null) delete next.parentSession
+    else next.parentSession = String(patch.parentSession)
+  }
+  const changed = JSON.stringify(next) !== JSON.stringify(header)
+  if (!changed) return { bytes: buf, header, changed: false, idChanged: false }
+  const idChanged = String(header.id) !== String(next.id)
   const head = await compressFrame(JSON.stringify(next) + '\n')
   const tail = frames.slice(1).map((f) => buf.subarray(f.start, f.end))
   if (tornStart !== undefined) tail.push(buf.subarray(tornStart))
-  return { bytes: Buffer.concat([head, ...tail]), header: next, changed: true }
+  return { bytes: Buffer.concat([head, ...tail]), header: next, changed: true, idChanged }
+}
+
+/** 只改 cwd 的旧入口（等价于 rewriteTranscriptHeader(buf, {cwd})），保留给既有调用与测试。 */
+export async function rewriteTranscriptCwd(buf, newCwd) {
+  const r = await rewriteTranscriptHeader(buf, { cwd: newCwd })
+  return { bytes: r.bytes, header: r.header, changed: r.changed }
+}
+
+/**
+ * 分析一份 transcript：给导入决策与包清单用的全部元数据。
+ * 行的起始 seq：普通行 `{seq}`，打包行（text-chunks/reasoning-chunks/tool-call-chunks）`{seq0}`。
+ * @returns {{header:object, lines:string[], rows:object[], frames:number, torn:boolean,
+ *            logicalBytes:number, maxSeq:number|undefined, lastTime:number|undefined,
+ *            hasTurnStart:boolean, blank:boolean, origin:string|undefined}}
+ */
+export function analyzeTranscript(buf) {
+  const { frames, tornStart } = scanZstdFrames(buf)
+  const { text, torn } = decodeTranscript(buf)
+  const all = text.split('\n').filter(Boolean)
+  if (!all.length) throw new Error('transcript 无内容行')
+  const header = JSON.parse(all[0])
+  const lines = all.slice(1)
+  let maxSeq, lastTime, hasTurnStart = false
+  const rows = []
+  for (const line of lines) {
+    let o
+    try { o = JSON.parse(line) } catch { o = null }
+    if (!o || typeof o !== 'object') { rows.push({ bad: true }); continue }
+    const seq = typeof o.seq === 'number' ? o.seq : (typeof o.seq0 === 'number' ? o.seq0 : undefined)
+    const time = typeof o.time === 'number' ? o.time : (typeof o.time0 === 'number' ? o.time0 : undefined)
+    if (seq !== undefined && (maxSeq === undefined || seq > maxSeq)) maxSeq = seq
+    if (time !== undefined && (lastTime === undefined || time > lastTime)) lastTime = time
+    if (o.type === 'turn/start') hasTurnStart = true
+    rows.push({ type: o.type, seq, time })
+  }
+  return {
+    header, lines, rows, frames: frames.length,
+    torn: torn || tornStart !== undefined,
+    logicalBytes: Buffer.byteLength(text, 'utf8'),
+    maxSeq, lastTime, hasTurnStart,
+    blank: !hasTurnStart,
+    origin: header.origin,
+  }
+}
+
+/**
+ * 两份日志的行级关系（**不含 header 行**，因为 header 的 cwd/id 本来就该不同）。
+ * 宿主日志是 append-only 且导出是逐字节搬运 ⇒ 同一会话的两份快照在正常情况下必为前缀关系；
+ * 只有真正分叉（各自写了不同事件）才会落到 diverged。
+ * @returns {'same'|'fastforward'|'rewind'|'diverged'}
+ *   fastforward = 本地是包的真前缀（可只追加尾帧）；rewind = 包比本地旧。
+ */
+export function compareTranscriptLines(localLines, pkgLines) {
+  const a = localLines || [], b = pkgLines || []
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return 'diverged'
+  if (a.length === b.length) return 'same'
+  return a.length < b.length ? 'fastforward' : 'rewind'
+}
+
+/**
+ * 只追加尾帧：把包多出来的行按宿主帧规则编成若干帧拼到本地文件末尾（append-only，
+ * 不改一个已有字节 ⇒ 投影缓存的 seq 围栏天然继续有效，这是云同步的日常路径）。
+ * @param {Buffer} localBuf 本地文件字节
+ * @param {string[]} newLines 要追加的 JSONL 行（不含 header）
+ * @param {number} [batchLines] 每帧行数（默认 256，避免单帧过大）
+ */
+export async function appendLinesToTranscript(localBuf, newLines, batchLines = 256) {
+  if (!newLines || !newLines.length) return { bytes: localBuf, appended: 0 }
+  const { tornStart } = scanZstdFrames(localBuf)
+  if (tornStart !== undefined) throw new Error('本地 transcript 末尾有未完成帧，不能安全追加')
+  const parts = [localBuf]
+  for (let i = 0; i < newLines.length; i += batchLines) {
+    parts.push(await compressFrame(newLines.slice(i, i + batchLines).join('\n') + '\n'))
+  }
+  return { bytes: Buffer.concat(parts), appended: newLines.length }
 }
 
 /** 明文 JSONL（compression:'none' 根）→ 按宿主帧规则重编为 zstd（header 帧 + 每批一行帧）。 */

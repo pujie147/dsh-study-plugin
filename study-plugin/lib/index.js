@@ -12,6 +12,7 @@
 //   - console.log/error                                  → 同（宿主进程 console 可用）
 // ============================================================================
 import { promises as fsp } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -591,7 +592,13 @@ export function apply(ctx, config) {
     // 明确不含: 凭据/设置/日志/缓存(session_projcache)/插件快照/.mnemon 工作区记忆/其它目标
     // ══════════════════════════════════════════════════════════════════
     const EXPORTS_DIR = BASE + '/exports'
-    const EXPORT_FORMAT_VERSION = 1
+    // v2：会话带 remoteId/maxSeq/lastTime/rows/blank/origin，包带 deviceId —— 为覆盖式同步铺垫。
+    // v1 的包仍可导入（缺字段按 unknown 处理）。
+    const EXPORT_FORMAT_VERSION = 2
+    const SUPPORTED_FORMAT_VERSIONS = [1, 2]
+    const SYNC_FILE = '.study-sync.json'          // 设备本地身份账本：导出排除、绝不从包恢复
+    const DEVICE_FILE = BASE + '/device.json'
+    const MAX_BACKUP_BYTES = 64 * 1024 * 1024     // 事务内保留被覆盖 transcript 原字节的总预算
     const MAX_GOAL_FILE_BYTES = 20 * 1024 * 1024
     const MAX_ZIP_BYTES = 400 * 1024 * 1024
     const MAX_DECODE_BYTES = 60 * 1024 * 1024
@@ -624,6 +631,7 @@ export function apply(ctx, config) {
           continue
         }
         if (!it.isFile()) { warnings.push('跳过非常规文件 ' + rel); continue }
+        if (rel === SYNC_FILE) continue  // 设备本地身份账本：不随包旅行（导入侧自己生成）
         if (SKIP_FILE_RE.test(rel)) continue
         const st = await statOpt(abs)
         if (!st) continue
@@ -645,9 +653,118 @@ export function apply(ctx, config) {
       return pp.locate({ cwd: absCwd, id: sessionId }).path
     }
 
+    // ── 可携化身份层（云同步铺垫） ──────────────────────────────────────────
+    // 三条宿主事实决定了这层的设计（详见 docs/design/import-overwrite-sync.md）：
+    //   1) session id 在 sessions 根内**全局唯一**，同 id 出现在两个 project 目录会让宿主
+    //      JsonlSessionPersistence.list()(:1085)/loadStored()(:1331) 直接抛错，连带打爆 session.list；
+    //   2) archivedSessionIds / session_projcache 都**按 id 键控** ⇒ 沿用源 id 就继承源会话的状态；
+    //   3) 日志是 append-only 且按 seq 校验（实测：seq 不连续 ⇒ "corrupt session log: seq gap"）。
+    // 所以：远端身份（remoteId）随包旅行，本地身份（localId）由本机决定，二者用账本挂钩。
+
+    /** 本机设备 id（一次性生成；导出包只带它的值）。 */
+    async function deviceId() {
+      try {
+        const j = await readJson(DEVICE_FILE)
+        if (j && typeof j.deviceId === 'string' && j.deviceId) return j.deviceId
+      } catch {}
+      const id = 'dev-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+      await writeJson(DEVICE_FILE, { deviceId: id, createdAt: nowISO() }).catch(() => {})
+      return id
+    }
+
+    /** 空/损坏账本一律当作没有（账本是缓存性质的东西，不该挡住导入）。 */
+    async function readSyncLedger(absDir) {
+      try {
+        const j = await readJson(path.join(absDir, SYNC_FILE))
+        if (!j || typeof j !== 'object') return { v: 1, remoteGoalId: '', sessions: [] }
+        if (!Array.isArray(j.sessions)) j.sessions = []
+        return j
+      } catch { return { v: 1, remoteGoalId: '', sessions: [] } }
+    }
+    async function writeSyncLedger(absDir, ledger) {
+      ledger.v = 1
+      ledger.updatedAt = nowISO()
+      await writeJson(path.join(absDir, SYNC_FILE), ledger)
+    }
+    const ledgerLocalOf = (ledger, remoteId) => {
+      const e = (ledger && Array.isArray(ledger.sessions) ? ledger.sessions : []).find((x) => x && x.remoteId === remoteId)
+      return e && e.localId ? String(e.localId) : ''
+    }
+    const ledgerRemoteOf = (ledger, localId) => {
+      const e = (ledger && Array.isArray(ledger.sessions) ? ledger.sessions : []).find((x) => x && x.localId === localId)
+      return e && e.remoteId ? String(e.remoteId) : ''
+    }
+
+    /** 宿主用 fs.realpath 作为 workspace/会话 cwd 的规范形态，我按同一套来，别自己发明。 */
+    async function canonicalDirOf(p) {
+      try { return await fsp.realpath(p) } catch { return String(p) }
+    }
+
+    /** 只读第 1 帧拿 header（扫全根用，成本与文件大小无关）。 */
+    async function readHeaderCheap(abs) {
+      const fh = await fsp.open(abs, 'r')
+      try {
+        let pos = 0
+        const chunks = []
+        for (;;) {
+          const buf = Buffer.alloc(Math.min(65536, 4194304))
+          const { bytesRead } = await fh.read(buf, 0, buf.length, pos)
+          if (!bytesRead) break
+          chunks.push(buf.subarray(0, bytesRead))
+          const joined = Buffer.concat(chunks)
+          try {
+            const { frames } = P.scanZstdFrames(joined, 1)
+            if (frames.length) return P.readSessionHeader(joined)
+          } catch { return undefined }
+          pos += bytesRead
+          if (joined.length > 8 * 1024 * 1024) return undefined  // header 帧不可能这么大
+        }
+        return undefined
+      } finally { await fh.close().catch(() => {}) }
+    }
+
+    /**
+     * 全根会话索引：id → [{cwd, path}]。**导入前必查**（约束 1）。
+     * 主路径走宿主 sessionPersistence.list()（它自带 header 校验，且是宿主的权威视图）；
+     * 库已经处于「有重复 id」坏状态时它会抛 ⇒ 退化成自己扫盘，至少能看清是谁占了。
+     */
+    async function globalSessionIndex() {
+      const byId = new Map()
+      const push = (id, cwd, p) => {
+        if (!id) return
+        if (!byId.has(id)) byId.set(id, [])
+        byId.get(id).push({ cwd: cwd || '', path: p })
+      }
+      const pp = portableDeps.persistence
+      let degraded = ''
+      if (pp && typeof pp.list === 'function') {
+        try {
+          for (const h of await pp.list()) push(String(h.id), h.cwd, undefined)
+          return { byId, degraded: '' }
+        } catch (e) { degraded = '宿主 list() 失败（库内可能已有重复 id）：' + errText(e) }
+      } else degraded = '宿主 sessionPersistence.list() 不可用'
+      let root = ''
+      try { root = path.dirname(projectDirOf(BASE)) } catch {}
+      if (!root) return { byId, degraded: degraded + '；且无法定位 sessions 根目录' }
+      for (const pk of await fsp.readdir(root, { withFileTypes: true }).catch(() => [])) {
+        if (!pk.isDirectory()) continue
+        const pdir = path.join(root, pk.name)
+        for (const sd of await fsp.readdir(pdir, { withFileTypes: true }).catch(() => [])) {
+          if (!sd.isDirectory()) continue
+          const dirAbs = path.join(pdir, sd.name)
+          let h = await readHeaderCheap(path.join(dirAbs, 'session.jsonl.zstd'))
+          if (!h) { try { h = JSON.parse((await fsp.readFile(path.join(dirAbs, 'session.jsonl'), 'utf8')).split('\n').filter(Boolean)[0]) } catch {} }
+          if (h) push(String(h.id), h.cwd, dirAbs)
+        }
+      }
+      return { byId, degraded }
+    }
+
     /** 收集该目标工作区项目目录下的全部会话（含 subagent / 孤儿 / 已归档）。 */
     async function collectSessions(absDir, g, warnings) {
       const sessions = []
+      const ledger = await readSyncLedger(absDir)
+      const remoteOf = (localId) => ledgerRemoteOf(ledger, localId)
       let projectDir = ''
       try { projectDir = projectDirOf(absDir) } catch (e) { warnings.push(errText(e)); return { sessions, projectDir } }
       let dirs
@@ -690,6 +807,9 @@ export function apply(ctx, config) {
         } catch (e) { warnings.push('会话 ' + sid + ' flush 失败，包内可能是上次落盘的前缀: ' + errText(e)) }
         const rec = {
           id: sid,
+          // remoteId = 这条会话的「稳定身份」：本机若是导入来的，账本里存着包里原本的 id，
+          // 就沿用它继续当远端身份导出 ⇒ A→B→A 往返时同一会话始终认得出（幂等的前提）。
+          remoteId: remoteOf(sid) || sid,
           dirName: it.name,
           encoding: kind,
           entry: 'sessions/' + safeSeg(sid) + '/transcript.' + (kind === 'zstd' ? 'jsonl.zstd' : 'jsonl'),
@@ -700,7 +820,11 @@ export function apply(ctx, config) {
           delegationDepth: header.delegationDepth,
           title: '',
           lines: 0,
+          rows: 0,
           frames: 0,
+          maxSeq: undefined,
+          lastTime: undefined,
+          blank: false,
           compressedBytes: bytes.length,
           logicalBytes: 0,
           archived: archived.indexOf(sid) >= 0,
@@ -710,14 +834,19 @@ export function apply(ctx, config) {
         if (rec.dirName !== safeSeg(sid)) warnings.push('会话目录名与 header id 不一致（' + rec.dirName + ' vs ' + sid + '），按 header id 入包')
         if (bytes.length <= MAX_DECODE_BYTES) {
           try {
-            const d = kind === 'zstd' ? P.decodeTranscript(bytes) : { text: bytes.toString('utf8'), torn: false }
-            if (d.torn) warnings.push('会话 ' + sid + ' 末尾有未完成帧（崩溃残留），已按完整帧导出')
-            const lines = d.text.split('\n').filter(Boolean)
-            rec.lines = lines.length
-            rec.logicalBytes = d.text.length
-            if (kind === 'zstd') rec.frames = P.scanZstdFrames(bytes).frames.length
-            for (const l of lines) { try { const o = JSON.parse(l); if (o.type === 'session/title') rec.title = String((o.data && o.data.title) || o.title || '') } catch {} }
-            rec._refs = P.collectImageRefs(d.text)
+            const a = kind === 'zstd' ? P.analyzeTranscript(bytes)
+              : (() => { const text = bytes.toString('utf8'); const rows = text.split('\n').filter(Boolean); return { header, lines: rows.slice(1), rows: rows.slice(1).map((l) => { try { const o = JSON.parse(l); return { type: o.type, seq: typeof o.seq === 'number' ? o.seq : o.seq0, time: o.time ?? o.time0 } } catch { return { bad: true } } }), frames: 0, torn: false, logicalBytes: Buffer.byteLength(text, 'utf8'), maxSeq: undefined, lastTime: undefined, hasTurnStart: false, blank: true } })()
+            rec.rows = a.lines.length
+            rec.lines = a.lines.length + 1
+            rec.logicalBytes = a.logicalBytes
+            rec.frames = a.frames
+            rec.maxSeq = a.maxSeq
+            rec.lastTime = a.lastTime
+            rec.blank = a.blank
+            rec.origin = a.header.origin || (header.origin || '')
+            if (a.torn) warnings.push('会话 ' + sid + ' 末尾有未完成帧（崩溃残留），已按完整帧导出')
+            for (const l of a.lines) { try { const o = JSON.parse(l); if (o.type === 'session/title') rec.title = String((o.data && o.data.title) || o.title || '') } catch {} }
+            rec._refs = P.collectImageRefs([JSON.stringify(a.header)].concat(a.lines).join('\n'))
           } catch (e) { warnings.push('会话 ' + sid + ' 正文解码失败（原字节仍照抄入包）: ' + errText(e)) }
         } else {
           warnings.push('会话 ' + sid + ' 超过 ' + MAX_DECODE_BYTES + ' B，未解正文（原字节照抄入包，附件引用未收集）')
@@ -734,6 +863,7 @@ export function apply(ctx, config) {
       const g = await loadGoal(goalId)
       if (!g) throw new Error('目标不存在: ' + goalId)
       const absDir = await goalDir(g)
+      const selfLedger = await readSyncLedger(absDir)
       const idx = await readIndex()
       const row = (idx.goals || []).find((r) => r.id === goalId)
       const entries = []
@@ -789,7 +919,6 @@ export function apply(ctx, config) {
         }
       } catch (e) { warnings.push('工作区登记读取失败（不影响导出）: ' + errText(e)) }
 
-      for (const s of sessions) entries.push({ name: s.entry, data: await fsp.readFile(path.join(collected.projectDir, s.dirName, s.encoding === 'zstd' ? 'session.jsonl.zstd' : 'session.jsonl')), store: s.encoding === 'zstd' })
       const files = entries.map((e) => ({ name: e.name, bytes: e.data.length, sha256: P.sha256Hex(e.data) }))
       const goalJson = entries.find((e) => e.name === 'goal/goal.json')
       const manifest = {
@@ -797,6 +926,12 @@ export function apply(ctx, config) {
         kind: 'study-goal-export',
         tool: 'study-plugin',
         exportedAt: nowISO(),
+        deviceId: await deviceId(),
+        sync: {
+          // 目标的稳定身份：本机若是导入来的，账本里存着包里原本的 goalId ⇒ 往返时认得出同一个目标
+          remoteGoalId: String(selfLedger.remoteGoalId || g.id),
+          note: '会话的稳定身份见每条 sessions[].remoteId；本机 localId↔remoteId 记在目标目录的 ' + SYNC_FILE
+        },
         source: {
           platform: process.platform,
           dshHome: path.dirname(BASE),
@@ -825,7 +960,10 @@ export function apply(ctx, config) {
         const goalId = String((args && args.goalId) || '')
         const { zip, manifest } = await buildGoalBundle(goalId)
         await fsp.mkdir(EXPORTS_DIR, { recursive: true })
-        const file = 'study-goal-' + manifest.goal.dir + '-' + stampNow() + '.zip'
+        const stem = 'study-goal-' + manifest.goal.dir + '-' + stampNow()
+        // 同一秒内连续导出很常见（面板连点/脚本循环）⇒ 名字必须唯一，绝不静默覆盖上一个包
+        let file = stem + '.zip', n = 1
+        while (await statOpt(path.join(EXPORTS_DIR, file))) file = stem + '-' + (n++) + '.zip'
         await fsp.writeFile(path.join(EXPORTS_DIR, file), zip)
         return stripUndefined({
           ok: true,
@@ -888,7 +1026,8 @@ export function apply(ctx, config) {
       const entries = P.readZip(await fsp.readFile(abs))
       const manifest = P.readJsonEntry(entries, 'manifest.json')
       if (!manifest || manifest.kind !== 'study-goal-export') throw new Error('不是学习区目标导出包（manifest.json 缺失或 kind 不符）')
-      if (manifest.formatVersion !== EXPORT_FORMAT_VERSION) throw new Error('导出格式版本不支持: ' + manifest.formatVersion + '（本插件认 ' + EXPORT_FORMAT_VERSION + '）')
+      if (!SUPPORTED_FORMAT_VERSIONS.includes(manifest.formatVersion)) throw new Error('导出格式版本不支持: ' + manifest.formatVersion + '（本插件认 ' + SUPPORTED_FORMAT_VERSIONS.join(' / ') + '）')
+      for (const s of (manifest.sessions || [])) if (!s.remoteId) s.remoteId = s.id   // v1 包：稳定身份就是它当时的 id
       const bad = []
       for (const f of (manifest.files || [])) {
         const buf = entries.get(f.name)
@@ -899,117 +1038,285 @@ export function apply(ctx, config) {
       return { abs, entries, manifest }
     }
 
-    /** 计算导入落点与冲突（dry-run 与真导入共用）。 */
-    async function planImport(manifest, opts) {
+    /**
+     * 导入解析：算出目标落点 + 每条会话的**本地身份** + 每条的落盘动作。
+     * 预览与真写入共用这一个函数 ⇒ 「预览说什么，写入就做什么」，不存在第二套判定。
+     * 决策依据见 docs/design/import-overwrite-sync.md（D17–D21）。
+     */
+    async function resolveImport(manifest, opts) {
+      const mode = opts.mode === 'overwrite' ? 'overwrite' : opts.mode === 'copy' || opts.mode === 'rename' ? 'copy' : 'merge'
+      const force = opts.force === true
       const srcId = String(manifest.goal.id)
-      const srcDirName = String(manifest.goal.dir || srcId)
-      const asCopy = opts.mode === 'copy' || opts.mode === 'rename'
-      let goalId = asCopy ? 'goal-' + Date.now().toString(36) + '-' + slug(manifest.goal.title || manifest.goal.topic || 'study', 'study') : srcId
-      if (!asCopy && opts.goalId) goalId = String(opts.goalId)
+      const remoteGoalId = String((manifest.sync && manifest.sync.remoteGoalId) || srcId)
+      const srcCwds = [...new Set((manifest.sessions || []).map((s) => String(s.cwd || '')).filter(Boolean))]
+
+      // 1) 目标 id / 目录（copy 永远换新 id，merge/overwrite 沿用远端 id ⇒ 幂等的前提）
+      let goalId = mode === 'copy'
+        ? 'goal-' + Date.now().toString(36) + '-' + slug(manifest.goal.title || manifest.goal.topic || 'study', 'study')
+        : srcId
+      if (mode !== 'copy' && opts.goalId) goalId = String(opts.goalId)
       if (!/^[A-Za-z0-9._\u4e00-\u9fff-]+$/.test(goalId)) throw new Error('目标 id 含非法字符: ' + goalId)
       const absDir = BASE + '/' + goalId
+      // canonical：对**父目录**做 realpath 再拼 goalId ⇒ 不创建目录也能拿到宿主会用的规范形态
+      const canonicalDir = path.join(await canonicalDirOf(path.dirname(absDir)), path.basename(absDir))
+
       const conflicts = []
       const warnings = []
-      if (await statOpt(absDir)) conflicts.push({ kind: 'goalDir', detail: absDir, hint: '目标目录已存在。用「另存为副本」导入（换一个新 goalId），或先把该目录移走' })
+      const gi = await globalSessionIndex()
+      if (gi.degraded) warnings.push(gi.degraded)
+      // 归档集按 id 全局键控且**宿主没有取消归档 API** ⇒ 沿用被归档过的 id 就等于把会话藏起来
+      let archivedSet = new Set()
+      try { archivedSet = new Set(((wsRegistry && wsRegistry.archivedSessionIds) || []).map(String)) } catch {}
+
+      // 2) 目标目录已存在时：是不是同一个目标的血缘？
+      const dirExists = !!(await statOpt(absDir))
+      const existingLedger = dirExists ? await readSyncLedger(absDir) : { v: 1, sessions: [] }
+      let existingGoal = undefined
+      if (dirExists) existingGoal = await readJson(path.join(absDir, 'goal.json')).catch(() => undefined)
+      const sameLineage = !dirExists || mode === 'copy'
+        || String(existingLedger.remoteGoalId || '') === remoteGoalId
+        || String((existingGoal && existingGoal.id) || '') === goalId && !existingLedger.remoteGoalId
+      if (dirExists && mode !== 'copy') {
+        if (!sameLineage) conflicts.push({ kind: 'goalUnrelated', detail: absDir, hint: '同名目录已存在但血缘不同（不是这个目标导出的）：带 force 才会覆盖，或改用「另存为副本」' })
+      }
       const idx = await readIndex()
-      if ((idx.goals || []).some((r) => r.id === goalId)) conflicts.push({ kind: 'goalId', detail: goalId, hint: 'index.json 已有同 id 目标' })
-      const srcCwd = manifest.sessions.length ? String(manifest.sessions[0].cwd || '') : ''
-      const sessionPlan = []
-      for (const s of manifest.sessions) {
-        const target = sessionTargetPath(absDir, s.id)
-        const exists = await statOpt(target)
-        if (exists) conflicts.push({ kind: 'session', detail: s.id, hint: '目标机该会话已存在: ' + target })
-        if (s.encoding === 'jsonl' && portableDeps.persistence && portableDeps.persistence.compression === 'zstd') warnings.push('会话 ' + s.id + ' 源为明文 jsonl，导入时会转成 zstd 帧')
-        if (!s.cwd) warnings.push('会话 ' + s.id + ' header 无 cwd，导入后可能无法挂到工作区')
-        sessionPlan.push({ id: s.id, title: s.title || '', boundTo: s.boundTo || 'unbound', lines: s.lines || 0, bytes: s.compressedBytes, entry: s.entry, encoding: s.encoding, targetPath: target, exists: !!exists, fromCwd: s.cwd || '' })
+      if ((idx.goals || []).some((r) => r.id === goalId && r.status === 'active') && mode !== 'copy') {
+        warnings.push('index.json 已有同 id 目标 ⇒ 本次按覆盖式同步处理（不会新增第二份）')
       }
-      const rewrite = sessionPlan.some((p) => P.normPath(p.fromCwd) !== P.normPath(absDir))
-      const agentPresets = [...new Set(manifest.sessions.map((s) => s.agentPreset).filter(Boolean))]
-      return {
-        goalId, absDir, conflicts, warnings,
-        plan: {
-          goalId,
-          dir: absDir,
-          srcGoalId: srcId,
-          srcGoalDir: srcDirName,
-          title: manifest.goal.title || '',
-          status: manifest.goal.status || '',
-          chapters: manifest.goal.chapterCount || 0,
-          sessions: sessionPlan,
-          sessionCount: sessionPlan.length,
-          attachments: (manifest.attachments || []).length,
-          files: (manifest.files || []).length,
-          bytesTotal: (manifest.files || []).reduce((a, f) => a + f.bytes, 0),
-          rewriteCwd: rewrite,
-          fromCwd: srcCwd,
-          agentPresets,
-          exportedAt: manifest.exportedAt,
-          source: manifest.source || {},
-          restartNeeded: true
+      if (!(manifest.files || []).some((f) => f.name === 'goal/goal.json')) {
+        conflicts.push({ kind: 'packageNoGoal', detail: absDir, hint: '包里连 goal/goal.json 都没有，不是一个可导入的目标包' })
+      }
+
+      // 3) 逐条会话定身份 + 定动作
+      const sessions = []
+      const usedLocalIds = new Set()
+      for (const s of (manifest.sessions || [])) {
+        const remoteId = String(s.remoteId || s.id)
+        const item = {
+          remoteId, pkgId: s.id, title: s.title || '', boundTo: s.boundTo || 'unbound',
+          encoding: s.encoding || 'zstd', entry: s.entry, fromCwd: String(s.cwd || ''),
+          pkgLines: s.rows, pkgMaxSeq: s.maxSeq, pkgLastTime: s.lastTime, pkgBytes: s.compressedBytes,
+          pkgSha: s.sha256, blank: !!s.blank, archivedAtSource: !!s.archived, origin: s.origin || '',
+          pkgParent: String(s.parentSession || ''),
         }
+        const occOf = (id) => gi.byId.get(id) || []
+        const atTarget = (id) => occOf(id).some((o) => {
+          try { return sessionTargetPath(canonicalDir, id) === (o.path || sessionTargetPath(o.cwd || canonicalDir, id)) } catch { return false }
+        })
+        const mappedId = ledgerLocalOf(existingLedger, remoteId)
+        // 候选顺序：账本里已分配的本地 id（幂等的关键）→ 包里的 id → 换新 id。
+        // 淘汰条件：该 id 已被别的 project 目录占用（约束 1）；或它在宿主归档集里（约束 2）。
+        const candidates = []
+        if (mappedId) candidates.push({ id: mappedId, from: 'ledger' })
+        if (s.id !== mappedId) candidates.push({ id: s.id, from: 'pkg' })
+        let chosen = null, why = ''
+        for (const c of candidates) {
+          const occ = occOf(c.id)
+          if (occ.length && !atTarget(c.id)) { why = 'id ' + c.id + ' 已被别的目录占用（沿用会让宿主 list() 抛重复）'; continue }
+          if (occ.length && atTarget(c.id)) { chosen = { id: c.id, identity: 'update' }; break }
+          if (archivedSet.has(c.id)) { why = 'id ' + c.id + ' 在宿主归档集里（沿用会被隐藏，宿主没有取消归档 API）'; continue }
+          chosen = { id: c.id, identity: c.from === 'ledger' ? 'adopt' : 'fresh' }
+          break
+        }
+        if (!chosen) { chosen = { id: 'session-' + randomUUID(), identity: 'reissue' }; why = why || '包内 id 与本机已有会话冲突' }
+        if (usedLocalIds.has(chosen.id)) { chosen = { id: 'session-' + randomUUID(), identity: 'reissue' }; why = '包内 id 重复，换发新身份' }
+        usedLocalIds.add(chosen.id)
+        item.localId = chosen.id
+        item.identity = chosen.identity
+        if (chosen.identity === 'reissue') item.why = why
+        item.targetPath = sessionTargetPath(canonicalDir, item.localId)
+        item.targetDir = path.dirname(item.targetPath)
+
+        // 3a) 该会话在本机是否正被打开 —— 宿主 write-behind 会覆盖我的写入，硬冲突
+        const liveId = [item.localId, s.id].find((id) => { try { return !!(portableDeps.sessions && portableDeps.sessions.get && portableDeps.sessions.get(id)) } catch { return false } })
+        // 3b) 与本地文件的行级关系 ⇒ 动作（尊重 append-only）
+        let action = 'create', detail = ''
+        const localBuf = await fsp.readFile(item.targetPath).catch(() => undefined)
+        if (localBuf) {
+          item.localBytes = localBuf.length
+          item.localSha = P.sha256Hex(localBuf)
+          if (item.localSha === item.pkgSha) action = 'noop'
+          else if (liveId) action = 'liveBlocked'
+          else {
+            let rel = 'unknown'
+            try {
+              const la = localBuf.length <= MAX_DECODE_BYTES ? P.analyzeTranscript(localBuf) : undefined
+              const pkg = await decodeEntry(s)
+              if (la && pkg) {
+                rel = P.compareTranscriptLines(la.lines, pkg.lines)
+                item.localRows = la.lines.length
+                item.localMaxSeq = la.maxSeq
+                item.torn = !!(la.torn || pkg.torn)
+              }
+            } catch (e) { warnings.push('会话 ' + remoteId + ' 行级比对失败: ' + errText(e)) }
+            if (rel === 'same') action = 'noop'
+            else if (rel === 'fastforward' && !item.torn) action = 'append'
+            else if (rel === 'rewind') { action = 'rewind'; detail = '包里比本地旧（本地 ' + (item.localRows || '?') + ' 行 > 包 ' + (item.pkgLines || '?') + ' 行）' }
+            else if (rel === 'diverged') { action = 'diverged'; detail = '两边各自写了不同事件（首个差异行起分叉）' }
+            else { action = 'replace'; item.blind = rel === 'unknown'; detail = item.torn ? '尾部有未完成帧，需整份替换（修复）' : '无法按行比对（超大或明文），按整份替换处理' }
+          }
+        } else if (liveId) action = 'liveBlocked'
+        item.action = action
+        item.detail = detail
+        if (liveId) item.liveId = liveId
+        sessions.push(item)
       }
+      async function decodeEntry(s) {
+        const buf = (opts._entries || new Map()).get(s.entry)
+        if (buf === undefined) return undefined
+        if ((s.encoding || 'zstd') === 'zstd') { if (buf.length > MAX_DECODE_BYTES) return undefined; return P.analyzeTranscript(buf) }
+        const lines = buf.toString('utf8').split('\n').filter(Boolean)
+        return { lines: lines.slice(1), torn: false }
+      }
+      // 4) 模式策略（merge 保守、overwrite 可覆盖但要为"真分叉/回退"付 force）
+      const isDiverging = (it) => it.action === 'rewind' || it.action === 'diverged' || (it.action === 'replace' && it.blind)
+      for (const b of sessions.filter((it) => it.action === 'liveBlocked')) {
+        conflicts.push({ kind: 'sessionLive', detail: b.remoteId + ' → ' + b.localId, hint: '该会话在本机正被打开，宿主回写会盖掉导入结果；先在 GUI 关掉那个会话再导入' })
+      }
+      if (mode === 'merge') {
+        for (const it of sessions) if (isDiverging(it)) { it.plannedAction = it.action; it.action = 'skippedDiverged' }
+      } else if (!force) {
+        for (const it of sessions) if (isDiverging(it)) conflicts.push({ kind: 'sessionDiverged', detail: it.remoteId, hint: (it.detail || '与本地内容有差异') + '；带 force=true 才会覆盖' })
+      }
+      const count = {}
+      for (const it of sessions) count[it.action] = (count[it.action] || 0) + 1
+
+      const plan = {
+        goalId, dir: canonicalDir, srcGoalId: srcId, remoteGoalId, mode, force,
+        title: manifest.goal.title || '', status: manifest.goal.status || '',
+        chapters: manifest.goal.chapterCount || 0,
+        goalExists: dirExists, sameLineage,
+        sessions, sessionCount: sessions.length, counts: count,
+        reissue: sessions.filter((x) => x.identity === 'reissue').length,
+        attachments: (manifest.attachments || []).length,
+        files: (manifest.files || []).length,
+        bytesTotal: (manifest.files || []).reduce((a, f) => a + f.bytes, 0),
+        fromCwds: srcCwds,
+        hiddenByHostRule: sessions.filter((x) => x.blank || x.origin === 'subagent').map((x) => ({ localId: x.localId, reason: x.blank ? '空会话（无 turn/start）' : 'subagent 子会话' })),
+        agentPresets: [...new Set((manifest.sessions || []).map((s) => s.agentPreset).filter(Boolean))],
+        exportedAt: manifest.exportedAt, source: manifest.source || {}, deviceId: manifest.deviceId || '',
+        restartNeeded: true,
+      }
+      return { goalId, absDir, canonicalDir, conflicts, warnings, resolution: { mode, force, sessions, plan, ledger: existingLedger, remoteGoalId, globalIds: gi }, plan }
     }
 
     handlers['study.inspectImport'] = async (args) => {
       try {
-        const { manifest } = await readExport(args || {})
-        const r = await planImport(manifest, args || {})
-        return stripUndefined({ ok: true, canImport: r.conflicts.length === 0, ...r })
+        const { entries, manifest } = await readExport(args || {})
+        const r = await resolveImport(manifest, Object.assign({}, args || {}, { _entries: entries }))
+        return stripUndefined({ ok: true, canImport: r.conflicts.length === 0, goalId: r.goalId, dir: r.canonicalDir, conflicts: r.conflicts, warnings: r.warnings, plan: r.plan })
       } catch (e) { return { ok: false, error: errText(e) } }
     }
 
+    /**
+     * 导入 = apply-package（幂等 upsert）。可重复执行：同一 remoteId 永远落到同一 localId，
+     * 内容一致时是 no-op，包更新了就走 append-only 追加尾帧。
+     * 事务性：任何一步失败 ⇒ restore() 还原被覆盖的字节、删掉本次自建的目录与索引/工作区登记。
+     */
     handlers['study.importGoal'] = async (args) => {
-      const written = { goalDir: '', sessionFiles: [], indexAdded: false, workspaceId: '' }
-      let indexSnapshot = ''
+      const tx = { backups: new Map(), createdDirs: [], indexSnapshot: '', workspaceId: '', wsCreated: false }
+      let backupBytes = 0
+      const ensureDir = async (dir) => {
+        const missing = []
+        let up = path.resolve(dir)
+        while (up !== path.dirname(up) && !(await statOpt(up))) { missing.unshift(up); up = path.dirname(up) }
+        await fsp.mkdir(dir, { recursive: true })
+        for (const m of missing) if (!tx.createdDirs.includes(m)) tx.createdDirs.push(m)
+      }
+      const stage = async (p, nextBuf) => {
+        if (!tx.backups.has(p)) {
+          const prev = await fsp.readFile(p).catch(() => null)
+          if (prev === null) tx.backups.set(p, null)
+          else {
+            if (backupBytes + prev.length > MAX_BACKUP_BYTES) throw new Error('回滚预算不足（已 ' + backupBytes + ' B + ' + prev.length + ' B > ' + MAX_BACKUP_BYTES + ' B），拒绝覆盖 ' + path.basename(p))
+            backupBytes += prev.length
+            tx.backups.set(p, prev)
+          }
+        }
+        await ensureDir(path.dirname(p))
+        await fsp.writeFile(p, nextBuf)
+      }
+      const restore = async () => {
+        for (const [p, buf] of tx.backups) { try { if (buf === null) await fsp.unlink(p); else await fsp.writeFile(p, buf) } catch {} }
+        if (tx.indexSnapshot) { try { await writeIndex(JSON.parse(tx.indexSnapshot)) } catch {} }
+        if (tx.wsCreated && tx.workspaceId && wsRegistry && typeof wsRegistry.delete === 'function') { try { await wsRegistry.delete(tx.workspaceId) } catch {} }
+        for (const d of tx.createdDirs.slice().reverse()) { try { await fsp.rm(d, { recursive: true, force: true }) } catch {} }
+      }
       try {
         const a = args || {}
         const { entries, manifest } = await readExport(a)
-        const planned = await planImport(manifest, a)
-        const { goalId, absDir, conflicts, warnings } = planned
-        if (a.confirm !== true) {
-          return stripUndefined({ ok: false, preview: true, needConfirm: true, canImport: conflicts.length === 0, ...planned })
-        }
+        const resolved = await resolveImport(manifest, Object.assign({}, a, { _entries: entries }))
+        const { goalId, conflicts, warnings, resolution } = resolved
+        const canonicalDir = resolution.plan.dir
+        const items = resolution.sessions
+        const mode = resolution.mode, force = resolution.force
         const skip = new Set((Array.isArray(a.skipSessions) ? a.skipSessions : []).map(String))
-        const blocking = conflicts.filter((c) => !(c.kind === 'session' && skip.has(c.detail)))
-        if (blocking.length) {
-          return { ok: false, error: '导入被冲突挡住: ' + blocking.map((c) => c.kind + '=' + c.detail).join(', '), conflicts, hint: blocking[0] && blocking[0].hint }
+        for (const it of items) if (skip.has(it.remoteId) || skip.has(it.pkgId)) it.action = 'skippedByRequest'
+        if (a.confirm !== true) {
+          return stripUndefined({ ok: false, preview: true, needConfirm: true, canImport: conflicts.length === 0, goalId, dir: canonicalDir, conflicts, warnings, plan: resolution.plan, mode, force })
         }
-        indexSnapshot = (await readTextFile(INDEX)) || ''
-        // 1) 目标目录树
-        await fsp.mkdir(absDir, { recursive: true })
-        written.goalDir = absDir
+        if (conflicts.length) {
+          return { ok: false, error: '导入被冲突挡住: ' + conflicts.map((c) => c.kind + '=' + c.detail).join(', '), conflicts, warnings, hint: conflicts[0] && conflicts[0].hint, plan: resolution.plan }
+        }
+        // 身份表：包里的两种写法（pkgId / remoteId）→ 本机 localId，供 goal.json 与 parentSession 重映射
+        const idMap = new Map()
+        for (const it of items) { idMap.set(it.pkgId, it.localId); idMap.set(it.remoteId, it.localId) }
+        const localIds = items.map((it) => it.localId)
+
+        tx.indexSnapshot = (await readTextFile(INDEX)) || ''
+        // 1) 目标目录树（包里有的逐个覆盖；本地多余文件**不动** —— prune 明确不做）
+        await ensureDir(canonicalDir)
+        let goalFilesWritten = 0, goalFilesSame = 0, goalJsonWritten = 0
         for (const f of manifest.files) {
           if (!f.name.startsWith('goal/')) continue
-          const dest = P.safeJoin(absDir, f.name.slice('goal/'.length))
-          await fsp.mkdir(path.dirname(dest), { recursive: true })
-          await fsp.writeFile(dest, entries.get(f.name))
+          const rel = f.name.slice('goal/'.length)
+          if (rel === SYNC_FILE) continue
+          const dest = P.safeJoin(canonicalDir, rel)
+          const same = await fsp.readFile(dest).then((b) => P.sha256Hex(b) === f.sha256).catch(() => false)
+          if (same) { goalFilesSame++; continue }
+          await stage(dest, entries.get(f.name))
+          goalFilesWritten++
+          if (rel === 'goal.json') goalJsonWritten++   // goal.json 必然与包里不同（它带本机身份），不计入"非幂等"
         }
-        // 2) 会话 transcript（必要时只重写 header 帧）
-        const restored = []
-        for (const s of manifest.sessions) {
-          if (skip.has(s.id)) { warnings.push('按请求跳过会话 ' + s.id); continue }
-          const raw = entries.get(s.entry)
-          if (raw === undefined) { warnings.push('会话 ' + s.id + ' 条目缺失，跳过'); continue }
-          const target = sessionTargetPath(absDir, s.id)
-          if (await statOpt(target)) { warnings.push('会话 ' + s.id + ' 目标已存在，跳过（不覆盖）'); continue }
-          let data = raw
-          if (s.encoding === 'zstd') {
-            const rw = await P.rewriteTranscriptCwd(raw, absDir)
-            data = rw.bytes
-            if (rw.changed) { /* header cwd 已指向新机目录 */ }
-          } else {
-            const text = raw.toString('utf8')
-            const first = JSON.parse(text.split('\n').filter(Boolean)[0])
-            if (P.normPath(first.cwd || '') !== P.normPath(absDir)) {
-              first.cwd = absDir
-              const rest = text.split('\n').filter(Boolean).slice(1)
-              data = await P.jsonlToZstdFrames(JSON.stringify(first) + '\n' + rest.join('\n') + '\n')
-            }
+        // 2) 会话：按解析出来的 action 落盘
+        const applied = {}
+        for (const it of items) {
+          if (it.action === 'skippedByRequest' || it.action === 'skippedDiverged') { applied[it.action] = (applied[it.action] || 0) + 1; continue }
+          const raw = entries.get(it.entry)
+          if (raw === undefined) throw new Error('包内缺少会话条目 ' + it.entry)
+          const kind = it.encoding === 'jsonl' ? 'jsonl' : 'zstd'
+          if (it.action === 'noop') { applied.noop = (applied.noop || 0) + 1; continue }
+          if (it.action === 'append') {
+            // 快进：同 id、同目录，只在末尾补包多出来的行 ⇒ 不动一个已有字节
+            const localBuf = await fsp.readFile(it.targetPath)
+            const la = P.analyzeTranscript(localBuf)
+            const pkgLines = kind === 'zstd' ? P.analyzeTranscript(raw).lines : raw.toString('utf8').split('\n').filter(Boolean).slice(1)
+            const tail = pkgLines.slice(la.lines.length)
+            if (!tail.length) { applied.noop = (applied.noop || 0) + 1; continue }
+            const r = await P.appendLinesToTranscript(localBuf, tail)
+            await stage(it.targetPath, r.bytes)
+            it.newSha = P.sha256Hex(r.bytes)
+            applied.append = (applied.append || 0) + 1
+            continue
           }
-          await fsp.mkdir(path.dirname(target), { recursive: true })
-          await fsp.writeFile(target, data)
-          written.sessionFiles.push(target)
-          restored.push(s.id)
+          const patch = { cwd: canonicalDir }
+          if (it.localId !== it.pkgId) patch.id = it.localId
+          const parentLocal = it.pkgParent ? idMap.get(it.pkgParent) : undefined
+          if (it.pkgParent && parentLocal && parentLocal !== it.pkgParent) patch.parentSession = parentLocal
+          let data
+          if (kind === 'zstd') data = (await P.rewriteTranscriptHeader(raw, patch)).bytes
+          else {
+            const lines = raw.toString('utf8').split('\n').filter(Boolean)
+            const first = JSON.parse(lines[0])
+            const next = Object.assign({}, first, { cwd: canonicalDir })
+            if (patch.id) next.id = patch.id
+            if (patch.parentSession) next.parentSession = patch.parentSession
+            data = await P.jsonlToZstdFrames(JSON.stringify(next) + '\n' + lines.slice(1).join('\n') + '\n')
+            if (!lines.slice(1).length) data = (await P.rewriteTranscriptHeader(await P.jsonlToZstdFrames(JSON.stringify(next) + '\n'), {})).bytes
+          }
+          await stage(it.targetPath, data)
+          it.newSha = P.sha256Hex(data)
+          applied[it.action] = (applied[it.action] || 0) + 1
         }
         // 3) 附件（内容寻址 ⇒ 重新落盘后 attachmentId 不变，会话引用继续有效）
         let attachCount = 0
@@ -1018,75 +1325,100 @@ export function apply(ctx, config) {
           const buf = entries.get(ref.entry)
           if (buf === undefined) { warnings.push('附件条目缺失: ' + ref.attachmentId); continue }
           if (!svc || typeof svc.saveImage !== 'function') { warnings.push('附件服务不可用，图片 ' + ref.attachmentId + ' 未落盘'); continue }
-          try {
-            await svc.saveImage({ data: new Uint8Array(buf), mediaType: ref.mediaType })
-            attachCount++
-          } catch (e) { warnings.push('附件 ' + ref.attachmentId + ' 落盘失败: ' + errText(e)) }
+          try { await svc.saveImage({ data: new Uint8Array(buf), mediaType: ref.mediaType }); attachCount++ }
+          catch (e) { warnings.push('附件 ' + ref.attachmentId + ' 落盘失败: ' + errText(e)) }
         }
-        // 4) goal.json 换身份 + index.json 合并
-        const goalPath = path.join(absDir, 'goal.json')
+        // 4) goal.json：换成本机身份（**不能**照抄包里的远端 id）+ index.json 合并
+        const goalPath = path.join(canonicalDir, 'goal.json')
         const g = await readJson(goalPath)
         if (!g) throw new Error('包内 goal/goal.json 缺失或不可解析')
+        const remapId = (sid) => (sid ? (idMap.get(String(sid)) || String(sid)) : sid)
         g.id = goalId
         g.dir = goalId
+        g.sessionId = remapId(g.sessionId)
+        if (Array.isArray(g.chapters)) for (const c of g.chapters) c.sessionId = remapId(c.sessionId)
+        if (g.research && g.research.sessionId) g.research.sessionId = remapId(g.research.sessionId)
         g.workspaceId = undefined
         g.updatedAt = nowISO()
         await writeJson(goalPath, g)
         const idx = await readIndex()
         idx.goals = (idx.goals || []).filter((r) => r.id !== goalId)
-        idx.goals.unshift({ id: goalId, title: g.title || manifest.goal.title || '', status: g.status || manifest.goal.status || 'researching', createdAt: g.createdAt || manifest.goal.createdAt, updatedAt: g.updatedAt, path: absDir })
+        idx.goals.unshift({ id: goalId, title: g.title || manifest.goal.title || '', status: g.status || manifest.goal.status || 'researching', createdAt: g.createdAt || manifest.goal.createdAt, updatedAt: g.updatedAt, path: canonicalDir })
         await writeIndex(idx)
-        written.indexAdded = true
-        // 5) 工作区登记：公开 API 重建（绝不手改全局 workspace.json）
-        let wsId = ''
+        // 5) 工作区：先解析复用，没有才创建；标题按需刷新；席位重挂（走公开 API，绝不手改全局文件）
+        let wsId = '', ws = undefined
         const attachFail = []
         if (wsRegistry) {
           try {
-            const ws = await wsRegistry.create(absDir, g.title || g.topic || goalId)
+            ws = await wsRegistry.resolveByPath(canonicalDir)
+            if (!ws) { ws = await wsRegistry.create(canonicalDir, resolution.plan.title || g.topic || goalId); tx.wsCreated = true }
+            else if (typeof ws.setTitle === 'function' && String(ws.title || '') !== String(resolution.plan.title || g.title || '')) { await ws.setTitle(resolution.plan.title || g.title || goalId) }
             wsId = String(ws && ws.id)
-            if (wsId) {
-              written.workspaceId = wsId
-              for (const sid of restored) {
-                try {
-                  if (ws && typeof ws.attachSession === 'function') await ws.attachSession(sid)
-                } catch (e) { attachFail.push(sid + ': ' + errText(e)) }
-              }
-              g.workspaceId = wsId
-              await writeJson(goalPath, g)
+            tx.workspaceId = wsId
+            if (!wsId) throw new Error('工作区登记未返回 id')
+            const seatsBefore = Array.isArray(ws.sessionIds) ? ws.sessionIds.map(String) : []
+            for (const sid of localIds) {
+              try { if (typeof ws.attachSession === 'function') await ws.attachSession(sid) }
+              catch (e) { attachFail.push(sid + ': ' + errText(e)) }
             }
-          } catch (e) { warnings.push('工作区登记失败（重启后目标文件与会话仍在，可用「重新绑定工作区」再试）: ' + errText(e)) }
+            // 摘掉两类幽灵席位：① 账本里被本次换掉的旧本地身份；② transcript 已不在盘上的（早先删过/回滚过留下的）。
+            // 只摘席位、绝不删文件 —— 删除会话不是本插件的职责（宿主也没有删除 API）。
+            const superseded = (resolution.ledger.sessions || []).map((e) => String(e.localId || '')).filter((id) => id && localIds.indexOf(id) < 0)
+            const ghosts = seatsBefore.filter((id) => localIds.indexOf(id) < 0 && !(resolution.globalIds.byId.has(id)))
+            const toDetach = [...new Set(superseded.concat(ghosts))]
+            for (const sid of toDetach) { try { if (typeof ws.detachSession === 'function') await ws.detachSession(sid) } catch {} }
+            if (ghosts.length) warnings.push('摘除 ' + ghosts.length + ' 个 transcript 已不存在的幽灵席位')
+            if (superseded.length) warnings.push('摘除上次导入留下的旧席位 ' + superseded.length + ' 个（对应 transcript 仍在盘上，会转入 Ungrouped，如需清理由宿主侧删除会话）')
+            g.workspaceId = wsId
+            await writeJson(goalPath, g)
+          } catch (e) { warnings.push('工作区登记失败（文件与会话已落盘，可用「🔗 重新绑定会话」重试）: ' + errText(e)) }
         } else warnings.push('工作区注册表不可用，未登记工作区')
         for (const m of attachFail) warnings.push('会话挂到工作区失败: ' + m)
-        // 6) 宿主自检：inspect 非修改式读取，读不懂就回滚
+        // 6) 自检：① 宿主 inspect() 读得懂（非修改式）② 宿主自己的可见投影 ws.sessionIds 认账
         const verifyFail = []
-        for (const sid of restored) {
+        const pp = portableDeps.persistence
+        for (const it of items) {
+          if (it.action === 'skippedByRequest' || it.action === 'skippedDiverged') continue
           try {
-            const pp = portableDeps.persistence
-            if (pp && typeof pp.inspect === 'function') { const v = await pp.inspect(sid); if (!v) verifyFail.push(sid + ': inspect 返回空') }
-          } catch (e) { verifyFail.push(sid + ': ' + errText(e)) }
+            if (pp && typeof pp.inspect === 'function') { const v = await pp.inspect(it.localId); if (!v || !v.meta) verifyFail.push(it.localId + ': inspect 返回空') }
+          } catch (e) { verifyFail.push(it.localId + ': ' + errText(e)) }
         }
+        const projected = ws && Array.isArray(ws.sessionIds) ? ws.sessionIds.map(String) : []
+        const notShown = localIds.filter((id) => projected.indexOf(id) < 0)
+        if (notShown.length) verifyFail.push('工作区投影里没有这些会话（宿主不会显示）: ' + notShown.slice(0, 3).join(', ') + (attachFail.length ? '；attach 失败: ' + attachFail.slice(0, 2).join(' | ') : ''))
         if (verifyFail.length) {
-          for (const f of written.sessionFiles) { await fsp.unlink(f).catch(() => {}) }
-          if (written.goalDir) { await fsp.rm(written.goalDir, { recursive: true, force: true }).catch(() => {}) }
-          const prev = indexSnapshot ? JSON.parse(indexSnapshot) : { goals: [] }
-          await writeIndex(prev)
-          if (written.workspaceId && wsRegistry && typeof wsRegistry.delete === 'function') { try { await wsRegistry.delete(written.workspaceId) } catch {} }
-          return { ok: false, error: '导入自检未通过，已全部回滚: ' + verifyFail.slice(0, 3).join('; '), rolledBack: true, warnings }
+          await restore()
+          return { ok: false, error: '导入自检未通过，已全部回滚: ' + verifyFail.slice(0, 3).join('; '), rolledBack: true, warnings, conflicts }
+        }
+        // 7) 设备本地身份账本（下次同步靠它认出同一个会话；不随包旅行）
+        const ledger = {
+          v: 1, deviceId: manifest.deviceId || '', remoteGoalId: resolution.remoteGoalId,
+          remoteSource: (manifest.source && (manifest.source.dshHome || manifest.source.studyWorkRoot)) || '',
+          appliedFrom: { ref: a.file || a.path || '', exportedAt: manifest.exportedAt || '', at: nowISO() },
+          sessions: items.filter((it) => it.action !== 'skippedByRequest').map((it) => ({
+            remoteId: it.remoteId, localId: it.localId, pkgId: it.pkgId, title: it.title || '',
+            boundTo: it.boundTo || 'unbound', appliedSha: it.newSha || it.pkgSha || '',
+            appliedSeq: it.pkgMaxSeq, appliedRows: it.pkgLines, appliedAt: nowISO(), lastAction: it.action,
+          })),
+        }
+        try { await writeSyncLedger(canonicalDir, ledger) }
+        catch (e) { warnings.push('身份账本写入失败（本次导入不受影响，但下次同步会被当成首次）: ' + errText(e)) }
+        if (resolution.plan.hiddenByHostRule.length) {
+          warnings.push(resolution.plan.hiddenByHostRule.length + ' 条会话按宿主规则不会在工作区里单独出现：' + resolution.plan.hiddenByHostRule.map((h) => String(h.localId).slice(8, 16) + '…(' + h.reason + ')').join('，'))
         }
         return stripUndefined({
-          ok: true,
-          goalId,
-          dir: absDir,
-          title: g.title,
-          sessions: restored.length,
-          skipped: skip.size,
-          attachments: attachCount,
-          workspaceId: wsId || undefined,
-          verified: verifyFail.length === 0 && portableDeps.persistence && typeof portableDeps.persistence.inspect === 'function',
-          warnings
+          ok: true, goalId, dir: canonicalDir, title: g.title, mode,
+          sessions: localIds.length, applied,
+          remap: items.filter((it) => it.identity === 'reissue' || it.identity === 'adopt').map((it) => ({ remoteId: it.remoteId, pkgId: it.pkgId, localId: it.localId, why: it.why || '' })),
+          goalFiles: { written: goalFilesWritten, same: goalFilesSame, goalJson: goalJsonWritten },
+          skipped: skip.size, attachments: attachCount, workspaceId: wsId || undefined,
+          idempotent: items.every((it) => it.action === 'noop' || it.action === 'skippedDiverged') && goalFilesWritten === goalJsonWritten,
+          verified: !!(pp && typeof pp.inspect === 'function'),
+          restartNeeded: true, warnings,
         })
       } catch (e) {
-        return { ok: false, error: errText(e) }
+        await restore().catch(() => {})
+        return { ok: false, error: errText(e), rolledBack: true }
       }
     }
 
@@ -1102,11 +1434,20 @@ export function apply(ctx, config) {
         if (!ws) ws = await wsRegistry.create(absDir, g.title || g.topic)
         const wsId = String(ws && ws.id)
         if (!wsId) return { ok: false, error: '工作区创建失败' }
-        const ids = [g.sessionId, ...(g.chapters || []).map((c) => c.sessionId)].filter(Boolean)
+        const ids = [g.sessionId, ...(g.chapters || []).map((c) => c.sessionId)].filter(Boolean).map(String)
         const failed = []
         for (const sid of ids) { try { await ws.attachSession(sid) } catch (e) { failed.push(sid + ': ' + errText(e)) } }
         if (g.workspaceId !== wsId) { g.workspaceId = wsId; g.updatedAt = nowISO(); await saveGoal(g) }
-        return stripUndefined({ ok: true, workspaceId: wsId, attached: ids.length - failed.length, failed })
+        // 以宿主自己的可见投影为准判定成败（attach 不抛 ≠ 会显示）
+        const projected = Array.isArray(ws.sessionIds) ? ws.sessionIds.map(String) : []
+        const notShown = ids.filter((id) => projected.indexOf(id) < 0)
+        return stripUndefined({
+          ok: failed.length === 0 && notShown.length === 0,
+          workspaceId: wsId, attached: ids.length - notShown.length, failed,
+          notShown: notShown.length ? notShown : undefined,
+          error: notShown.length ? '宿主工作区投影里仍看不到 ' + notShown.length + ' 条会话（多为 header.cwd 与工作区路径不一致或 header 读不出）' : undefined,
+          archived: ids.filter((id) => { try { return (wsRegistry.archivedSessionIds || []).indexOf(id) >= 0 } catch { return false } }),
+        })
       } catch (e) { return { ok: false, error: errText(e) } }
     }
 
