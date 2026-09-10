@@ -51,8 +51,11 @@
 | H10 | 会话 LIVE 时宿主协调器独占该文件（write-behind），外部写入会被回写盖掉 | `PersistenceCoordinator` 写路径 |
 
 > 测试怎么拿到这些：`study-plugin/test/host-fixture.mjs` 用**宿主真实的** `JsonlSessionPersistence` +
-> `WorkspaceRegistry`（只假一个内存 `storageDomain`）。注意必须把模块路径 `realpath` 成**长文件名**再
-> import——走 8.3 短名（`PYG12~1`）时 cordis 的 `/@deepseek-ai/` URL 模式匹配不上，裸标识符导入全灭。
+> `WorkspaceRegistry` + 真实 `SessionStore`（只假一个内存 `storageDomain`）。两点实测坑：
+> ① 模块路径必须 `realpath` 成**长文件名**再 import —— 走 8.3 短名（`PYG12~1`）时 cordis 的
+> `/@deepseek-ai/` URL 模式匹配不上，裸标识符导入全灭；
+> ② `ctx.sessions` 用真实 `SessionStore` 而不是手写 `prepare` stub —— stub 会漏掉
+> `Session.fromRestore` 的 surfaceOp 校验（实测一个坏 `surfaceOp` 行 stub 放过、真 store 拒）。
 
 ## 3. 方案：双身份 + 幂等 upsert
 
