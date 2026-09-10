@@ -18,7 +18,7 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-node test/smoke.mjs                 # 宿主半运行时冒烟（69 断言，含导出→导入端到端往返）
+node test/smoke.mjs                 # 宿主半运行时冒烟（79 断言，含导出→导入端到端往返）
 npm test                            # smoke + portable(14) + client(13，桩 React 真实渲染点击)
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
 node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
@@ -42,7 +42,7 @@ dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.gi
 cd study-plugin
 node scripts/build-client.mjs        # 改过 src/ 后重建客户端 bundle（--sync-css 从动态版同步 CSS）
 node scripts/install-profile.mjs     # 默认 $DSH_HOME/profiles/web；支持 --profile <dir> / --uninstall
-node test/smoke.mjs                  # 冒烟 33 断言
+node test/smoke.mjs                  # 冒烟 79 断言
 node scripts/cleanroom-check.mjs     # 净室安装验证（离线）
 ```
 Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：

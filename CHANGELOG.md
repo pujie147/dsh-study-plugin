@@ -2,6 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-09-10
+
+### changed
+- **「调研中」不再谎报进度（D16）**：`status:'researching'` 一直是建档初值（`createGoalDoc` 建目标即置位），并不代表指令已发出。现在由 `goal.json` 的 `research.dispatchedAt` 记录「调研指令确实注入过目标会话」——`study.startResearch` / `study.retryResearch` / `study_plan_research` 三处注入成功后写入，`study.rejectDraft` 退回时清除。面板按事实分岔：未派发 → chip「待调研」+「⚠️ 调研还没开始」；已派发 → 「⏳ 正在联网调研（派发于 HH:mm）」。
+- 草案待批准的「重新调研」名副其实：退回并清空草案后**紧接着**重新派发指令（旧行为只退回不派发，目标就此停在「调研中」——本次事故的第二个死锁点）。
+- 动作失败的红字不再被随后的 `study.list` 刷新冲掉（`doAction`：先刷新、再落回错误），消除「点了没反应」。
+- `study_plan_status` 的 `next_action` 按派发事实分别给指引，并输出 `research_dispatched` / `research_dispatched_at`。
+
+### added
+- 宿主 RPC `study.dispatchResearch {goalId}`：面板「▶ 开始调研 / 🔁 重新调研」的派发口，委托宿主内既有的 `chatResearch`（解析目标会话 → 按 `reject_reason` 选首次或重试指令 → 注入 → 记派发事实），派发调研只留一个 owner。
+- `study.list` 每行新增 `researchDispatched` / `researchDispatchedAt`；面板派发前若发现目标会话已销毁或未建立，先重建并回写 `sessionId` 再派发。
+- 测试：`test/smoke.mjs` 69 → 79 断言（派发事实、`dispatchResearch` 参数/意见/无会话 `need_open`、reject 清除标记）；`test/client.test.mjs` 13 → 19 断言（researching 三态、reject→dispatch 顺序、红字存活）。React 桩的 `useEffect`/`useCallback` 改为按槽位记 deps（此前每次渲染都重跑副作用，会把 doAction 刚写上的失败红字异步清掉 → 测试假失败）。
+
+### 说明
+- 与 M4 一致，只落常驻版（D7：动态版 `src/host.js` 为路线 A 回退，不追新特性）。
+- 老数据兼容：升级前已派发的目标没有 `research` 字段，会显示「待调研」——这正是需要人工确认的一次点击；一旦目标进入 `draft_pending/approved` 或用户点过一次派发，事实即归位。
+
 ## [0.2.0] - 2026-09-10
 
 ### added
