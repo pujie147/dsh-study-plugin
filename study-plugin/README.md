@@ -8,7 +8,7 @@
   - `ctx.inject(['webServer','agents','workspaceRegistry','tools'], …)` 注入服务；导出/导入另用一条 inject 取 `sessionPersistence / sessions / attachments`（缺席只降级该功能，面板与聊天工具不受影响）
   - `/study-rpc` webServer prefix 路由（loopback 守卫）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip
   - `study_plan_*` 聊天工具 ×5 + `study_goal_export`/`study_goal_import` ×2：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
-- **可携化** `lib/portable.js`：零依赖 ZIP（store + deflate，已与 Windows 自带解压器互操作验证）+ zstd 会话帧工具（复刻宿主帧切分、跨机导入只重写 header 帧的 cwd、zip-slip 防御、附件引用收集）
+- **可携化** `lib/portable.js`：零依赖 ZIP（store + deflate，已与 Windows 自带解压器互操作验证）+ zstd 会话帧工具（复刻宿主帧切分、帧级 header 重写〔可换 id/cwd/parentSession〕、只追加尾帧、行级前缀关系判定、zip-slip 防御、附件引用收集）
 - **客户端半** `lib/client.js`（构建产物，勿手改）：`window.__ModuleLoader__.load({id, factory:(require)=>…})` 形态；
   源码 `src/client.mjs`；CSS 从仓库根 `src/client.js` 的 `styles.insert` 提取并内联。
   - `dsh.client` 清单在 `package.json`：`platform: web` + inject 边（runtime/layout/ui-sidebar）
@@ -18,8 +18,10 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-node test/smoke.mjs                 # 宿主半运行时冒烟（79 断言，含导出→导入端到端往返）
-npm test                            # smoke + portable(14) + client(13，桩 React 真实渲染点击)
+node test/smoke.mjs                 # 宿主半运行时冒烟（101 断言，跑在宿主真实 persistence + registry 上）
+npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(24，桩 React 真实渲染点击)
+node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
+npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
 node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
 ```
@@ -42,7 +44,7 @@ dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.gi
 cd study-plugin
 node scripts/build-client.mjs        # 改过 src/ 后重建客户端 bundle（--sync-css 从动态版同步 CSS）
 node scripts/install-profile.mjs     # 默认 $DSH_HOME/profiles/web；支持 --profile <dir> / --uninstall
-node test/smoke.mjs                  # 冒烟 79 断言
+node test/smoke.mjs                  # 冒烟 101 断言（含覆盖式同步回归）
 node scripts/cleanroom-check.mjs     # 净室安装验证（离线）
 ```
 Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：

@@ -2,6 +2,49 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-09-10
+
+### fixed
+- **导入后工作区文件夹正常、会话却不显示**（用户实机报告）。根因：宿主把 **session id 当作全局身份**，而 0.2.x 的导入照抄源 id（D2/D12）。三条宿主规则被违反：
+  1. 同一个 id 不能出现在两个 project 目录 —— `JsonlSessionPersistence.list()`(`:1085`) 与 `loadStored()`(`:1331`) 遇重复**直接抛错**，连带打爆整个 `session.list` API（症状：全库会话消失，文件夹照常）；
+  2. `workspaceRegistry.archivedSessionIds` 按 id 全局键控，且**这个版本没有解档 API/UI** —— 沿用源 id 就继承源会话的归档态（Web 可见性谓词 `origin!=='subagent' && !archived.has(id) && (!blank||id===current)` ⇒ 直接隐藏）；
+  3. `storages/session_projcache.json` 按 id + `seq` 围栏存派生投影 —— 整体替换日志会让统计/标题滞后到下次写入才自愈。
+  取证与规则全文见 `docs/design/import-overwrite-sync.md`。
+- **自检只看 `attachSession` 抛没抛**：宿主 `ws.sessionIds` 是**投影**（按 `realpath(header.cwd)===record.path` 过滤，写入时还会剪枝），attach 不抛 ≠ 会显示。现改为「逐条 `inspect()` 读得懂 **且** 出现在工作区投影里」，任一不过整体回滚 ⇒ 不再出现"导入成功却看不见"。
+- **回滚只删文件不删自建目录**：失败导入留下空 `session-*` 目录（实机抓到 6 个）。现在事务记录自建目录并一并删除，`index.json` 逐字还原，本次新建的工作区记录也删除。
+- **同一秒连续导出会互相覆盖**：`study-goal-<id>-<秒级时间戳>.zip` 同名 ⇒ 后一次盖掉前一次。现在自动加 `-2/-3` 后缀。
+- **导出包把每份 transcript 存了两遍**（zip 条目重复 + `manifest.files` 双记录；两次读到的字节一旦不同还会自校验失败）。现在每个会话只入包一次。
+- 会话 header 的 `cwd` 此前写成混合分隔符（`C:\Users\me/.dsh/…`，源于 `BASE` 的拼法）；宿主用 `fs.realpath` 比较侥幸能过，但任何按字符串比 cwd 的消费方都会漏。现统一写宿主 canonical 形态（与 workspace 记录 `path` 逐字相同）。
+- `study.reattachGoalSessions` 同样改为以宿主投影判定成败，返回 `notShown[]` 并报告哪些 id 在归档集里。
+
+### changed
+- **导入 = 应用一个包（幂等 upsert）**，为云同步铺垫：目标 / 会话 / 工作区已存在时更新而非报错。
+- **双身份模型 + 设备本地账本**：包携带稳定身份 `remoteId`，本机 `localId` 按需换发，映射与已应用快照记在 `<goal>/.study-sync.json`（导出不含、绝不从包恢复）。同一目标目录内的同一条会话仍沿用原 id（原地更新/追加）；换目录、撞 id、或该 id 在宿主归档集里 ⇒ 一律换发新 id。`goal.json` 的 `sessionId` / `chapters[].sessionId` / `research.sessionId` 与包内 `parentSession` 按映射重写。
+- **会话落盘按 append-only 分档**：内容一致 `noop`；本地是包的前缀 ⇒ **只追加尾帧**（不动已有字节，seq 天然连续、投影缓存不受影响）；本地撕裂尾帧 / 超大无法比对 ⇒ `replace`；包比本地旧或与本地分叉 ⇒ 需 `force`；该会话在本机正被打开 ⇒ `liveBlocked`（`force` 也不放行，宿主回写会盖掉结果）。
+- **三种模式统一作用于三层**：`overwrite`（面板默认，用户拍板）/ `merge`（聊天缺省，分叉项 `skippedDiverged`）/ `copy`（新 goalId + 全部换身份）。目标已存在不再硬冲突：账本血缘一致即更新，不一致报 `goalUnrelated` 需 force。
+- 工作区登记：`resolveByPath` 命中即复用（标题不同则 `setTitle`），否则 `create`；重挂席位并摘除幽灵席位（被本次换掉的旧身份、以及 transcript 已不存在的在册席位）。**只摘席位，不删文件**。
+- 覆盖写入事务化：被覆盖的每个文件先入内存备份（预算 64 MB），失败可逐字节还原。
+- 面板导入区改为 三模式 + force 勾选 + 预览**分类计数**（新增/追加尾帧/整份替换/不变/回退/分叉/被挡）+ 每条会话显示「身份 ⇒ 动作」与 `本地行数→包行数`；幂等时提示「已是最新（无改动）」；切换模式或 force 自动重新预览。
+- `manifest` 升到 **v2**（会话加 `remoteId`/`rows`/`maxSeq`/`lastTime`/`blank`/`origin`，包加 `deviceId` 与 `sync.remoteGoalId`）；**v1 的包仍可导入**（`remoteId` 回落为其 `id`）。
+- `study_goal_import` 工具暴露 `mode` / `force`，预览返回 `plan.counts` 与 `summary`。
+
+### added
+- `lib/portable.js`：`rewriteTranscriptHeader`（可换 id/cwd/parentSession）、`analyzeTranscript`（行数/maxSeq/lastTime/blank/帧数）、`compareTranscriptLines`（same/fastforward/rewind/diverged）、`appendLinesToTranscript`（尾帧追加，本地撕裂即拒绝）。
+- 目标目录新增 `.study-sync.json`（身份账本）、`study-work/device.json`（本机设备 id）。
+- 导入返回值：`applied{create,append,replace,noop,rewind,diverged,liveBlocked,skipped*}`、`remap[]`（含换身份原因）、`idempotent`、`goalFiles{written,same,goalJson}`。
+- **`test/host-fixture.mjs`：测试底座换成宿主真实实现**（`JsonlSessionPersistence` + `WorkspaceRegistry`，只假一个内存 `storageDomain`）。此前 mock 照抄我自己的实现（attach 永远成功、列表从盘上现读）⇒ 96 条断言全绿仍漏掉真 bug；现在 duplicate id、`realpath` attach 校验、投影剪枝、`seq` 连续性都由宿主代码执行。模块路径必须 `realpath` 成长文件名（8.3 短名会让 cordis 的 URL 模式匹配失效）。
+
+### tests
+- `smoke.mjs` 79 → **101 断言**（跑在真宿主实现上）。新增回归：全新机器式恢复后**宿主投影认账**、同包重复导入幂等、快进只追加尾帧、包更旧无 force 被挡且本地未动、带 force 才回退、追加收敛后再导为 noop、LIVE 硬冲突、自检失败回滚不留空目录且 `index.json` 逐字还原、归档 id 不复用（原因说明归档）、终态无幽灵席位/无空目录、导出卫生（条目唯一、账本不入包、v2 字段齐备、往返 `remoteId` 不漂移）。
+- `portable.test.mjs` 14 → **29 断言**，含 6 条**真后端交叉验证**：换 id+换 cwd 后宿主 `inspect()` 认账、追加尾帧后事件连续、`inspect()` 确实只读、重复 id 宿主抛错、新登记工作区投影为空数组、attach 拒绝未知会话；取不到宿主模块时明确 skip 而非放宽断言。
+- `client.test.mjs` 21 → **24 断言**：三模式默认「覆盖」、预览分类计数与身份/动作渲染、force 勾选自动重新预览、幂等文案、分叉冲突禁用按钮与 force 指引、切副本模式重新预览。
+- `scripts/cleanroom-check.mjs`：tarball 必含 `lib/portable.js`；探针加端到端（导出→抹掉→覆盖式导入→重复导入幂等），mock 镜像宿主 duplicate / realpath 两条不变量。
+- `npm run sweep`：本机 103 份真实 transcript（69.9 MB）逐帧与 header 重写不变量全过。
+
+### notes
+- 数据兼容：0.2.x 的旧包直接可用。旧导入产生的"归档态隐身"会话，用本版重新导入一次即可恢复可见（本插件无法解档 —— 宿主没有该 API）。
+- 仍**不做 prune**（用户拍板）：本地比包多的文件/会话/席位一律保留，只报差异计数。云通道、增量帧传输、删除同步见 `docs/design/import-overwrite-sync.md` §7。
+
 ## [0.2.2] - 2026-09-10
 
 ### fixed

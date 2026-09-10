@@ -24,7 +24,8 @@ study_dsh_plugin/
 ├── docs/
 │   ├── PROJECT.md       本文档（架构 / 状态机 / API / 决策记录）
 │   ├── USAGE.md         使用手册（面向用户）
-│   └── design/          单特性范围与决策（export-import-scope.md = 导出包文件清单）
+│   └── design/          单特性范围与决策（export-import-scope.md = 导出包文件清单；
+│                        import-overwrite-sync.md = 覆盖式同步语义与宿主身份规则）
 ├── src/
 │   ├── host.js          宿主引擎源码（code.host 的 function body）
 │   └── client.js        面板 UI 源码（code.client 的 function body）
@@ -37,10 +38,12 @@ study_dsh_plugin/
 │   ├── package.json     双 exports + dsh.bundle.patch + dsh.client 清单
 │   ├── cordis.patch.yml 自注册 row（- insert: study-engine）
 │   ├── lib/index.js     宿主半（/study-rpc + /study-export + study.* ×19 + study_plan_* ×5 + study_goal_* ×2 + README）
-│   ├── lib/portable.js  可携化工具（零依赖 ZIP + zstd 会话帧改写 + 附件引用收集 + zip-slip 防御）
+│   ├── lib/portable.js  可携化工具（零依赖 ZIP + zstd 帧级 header 重写/尾帧追加/行级关系判定 + 附件引用收集 + zip-slip 防御）
 │   ├── lib/client.js    客户端 bundle（构建产物，勿手改）
 │   ├── src/client.mjs   客户端源码 + scripts/（build-client / install-profile / cleanroom-check）
-│   └── test/            smoke.mjs(79 断言，含导出→导入往返) · portable.test.mjs(14) · client.test.mjs(19，桩 React 真实渲染点击)
+│   └── test/            smoke.mjs(101，跑在宿主真实现上) · portable.test.mjs(29，含真后端交叉验证)
+│                        · client.test.mjs(24，桩 React 真实渲染点击) · transcript-sweep.mjs(npm run sweep)
+│                        · host-fixture.mjs（夹具：宿主真实 JsonlSessionPersistence + WorkspaceRegistry，只假内存 storageDomain）
 └── package.json
 ```
 
@@ -64,13 +67,17 @@ study_dsh_plugin/
 study-work/
 ├── README.md                使用说明（插件启动时同步覆盖）
 ├── index.json               目标注册表 { goals: [{id,title,status,path}] }
-├── exports/                 导出包 study-goal-<goalId>-<时间戳>.zip（面板 📦 视图可下载/删除）
+├── device.json              本机设备 id（一次性生成；导出包只带它的值）
+├── exports/                 导出包 study-goal-<goalId>-<时间戳>[-n].zip（面板 📦 视图可下载/删除；同秒连导自动加后缀，不互相覆盖）
 └── <goal>/goal.json         目标状态机（唯一权威文件）
+    └── .study-sync.json     设备本地身份账本：remoteId↔localId + 已应用快照（导出不含、绝不从包恢复）
     └── chapters/            NN-<slug>.md 讲义；NN-qa.md 问答写回；NN-notes/ 补充内容目录
     └── draft.json           目标会话 AI 写出的课程草案（JSON），采纳后转待批准
 ```
 
-导出包内容与会话/工作区的宿主侧落盘事实见 §5「可携化用到的宿主事实」与 [docs/design/export-import-scope.md](./design/export-import-scope.md)。
+导出包内容与会话/工作区的宿主侧落盘事实见 §5「可携化用到的宿主事实」与
+[docs/design/export-import-scope.md](./design/export-import-scope.md)（范围清单）、
+[docs/design/import-overwrite-sync.md](./design/import-overwrite-sync.md)（覆盖式同步语义、身份规则、事故取证）。
 
 ### goal.json 字段
 
@@ -117,11 +124,12 @@ study-work/
 | study.dispatchResearch | goalId | 面板「▶ 开始调研 / 🔁 重新调研」的派发口：宿主内委托 `chatResearch`（解析目标会话 → 按 reject_reason 选首次/重试指令 → 注入 → 记 `research.dispatchedAt`），派发调研的唯一 owner |
 | study.deleteGoal | goalId | 移出 index 并标记 deleted（文件保留） |
 | study.ensureGoalWorkspace | goalId | 按需创建/解析目标工作区 |
-| study.exportGoal | goalId | 导出该目标为 zip（目标树 + 全部会话 + 附件 + manifest），落 `exports/` |
+| study.exportGoal | goalId | 导出该目标为 zip（目标树 + 全部会话 + 附件 + manifest v2），落 `exports/`；同秒连导自动加 `-n` 后缀不互相覆盖 |
 | study.listExports / study.deleteExport | – / file | 导出包列表（大小/时间/下载 URL）/ 删除裸文件名 zip |
-| study.inspectImport | file 或 path[,mode] | 读包 + 逐文件 sha256 校验 + 计算落点/冲突/是否需重写 header（只读预览） |
-| study.importGoal | file 或 path,confirm[,mode,skipSessions] | 无 confirm 返回预览；有 confirm 执行还原（会话 header 重写 → 附件回写 → index 合并 → 工作区登记 → inspect 自检 → 失败整体回滚）；`mode=copy` 换新 goalId |
-| study.reattachGoalSessions | goalId | 修复入口：重建工作区登记并把 goal.json 记录的会话挂回分组（迁移/重启后分组丢失时） |
+| study.inspectImport | file 或 path[,mode,force] | 只读预览：校验包 → 解析每条会话的**本地身份**与**落盘动作** → 返回 `plan.counts` 分类计数 + conflicts/warnings |
+| study.importGoal | file 或 path,confirm[,mode,force,skipSessions] | 应用包（幂等 upsert）：无 confirm 返回同一份预览；有 confirm 执行 ⇒ 目标树按 sha 比对后覆盖 → 会话按 create/append/replace 落盘（换身份时重写 header 帧的 id+cwd，正文原样）→ 附件内容寻址回写 → goal.json 会话 id 重映射 + index 合并 → 工作区复用/创建/重挂/摘幽灵席位 → **宿主 `inspect()` + `ws.sessionIds` 投影双自检** → 写 `.study-sync.json` 账本；任一失败整体回滚（还原字节 + 删自建目录 + 恢复 index + 删自建工作区）。返回 `applied{create,append,replace,noop,…}` / `remap[]` / `idempotent` / `goalFiles{written,same,goalJson}` |
+| study.reattachGoalSessions | goalId | 修复入口：重建工作区登记并把 goal.json 记录的会话挂回分组；**以宿主投影判定成败**（`ok:false` + `notShown[]`），并报出哪些 id 在归档集里 |
+| `mode` 语义 | `overwrite`（面板默认，包为准；分叉/回退需 `force`）/ `merge`（聊天缺省：只新增与快进，分叉项 `skippedDiverged`）/ `copy`（新 goalId + 会话全部换身份，绝不碰现有目标） | |
 
 ### 文件路由（webServer prefix，GET 下载）
 
@@ -139,19 +147,28 @@ study-work/
 | study_plan_approve | 批准草案 |
 | study_plan_reject | 退回草案并记意见 |
 | study_goal_export | 导出/备份某目标为 zip |
-| study_goal_import | 从 zip 导入（无 confirm 只给预览与冲突；有 confirm 才写入；`mode=copy` 另存为副本） |
+| study_goal_import | 应用 zip（幂等）：无 confirm 只给预览与分类计数；`mode=overwrite\|merge(缺省)\|copy`、`force=true` 才覆盖分叉/更旧的本地会话；`confirm=true` 才写入 |
 
-### 可携化用到的宿主事实（M4）
+### 可携化用到的宿主事实（M4 / M4.1，全部读码 + 真后端离线实测）
 
 | 事实 | 说明 |
 | --- | --- |
 | 会话落盘 | `<sessionsRoot>/--<projectKey(cwd)>--/<encodeSegment(sessionId)>/session.jsonl.zstd` |
 | `projectKey` / `encodeSegment` | 分隔符→`-`、不安全字符→`~XXXX`、截断 251、外包 `--…--`；**不可自己复刻**，一律 `ctx.get('sessionPersistence').locate({cwd,id}).path`（无 IO），项目目录 = 该路径的上上级 |
 | transcript 物理形态 | 多帧 zstd 拼接：**第 1 帧只含 header 行**，其后每个 append 批次一帧；帧需 `ZSTD_c_checksumFlag=1` 且非 single-segment（用异步 `zlib.zstdCompress`，同步版会写成 single-segment） |
-| 会话归属 | 子代理会话与父会话同 cwd ⇒ 同项目目录；`archivedSessionIds` 是注册表级全局集合 |
+| **id 是全局身份** | session id 在整个 sessions 根内唯一：同 id 落两个 project 目录 ⇒ `list()`(`:1085`) / `loadStored()`(`:1331`) **抛错并连带打爆 `session.list`** ⇒ 跨目录导入必须换发新 id |
+| **路径由 header 反推** | `assertStoredIdentity`(`:1345`) 要求 `logPath(root, header.cwd, header.id)` 与实际路径一致 ⇒ 换 id 必须同步换目录名，换 cwd 必须换 project 目录 |
+| **header 字段严格校验** | `isHeaderLine`(`:70`)：`type==='session'` + `version:number` + `id:string` + `createdAt` 非负安全整数 + **`delegationDepth` 非负安全整数** + `origin ∈ {undefined,'subagent'}`；帧 1 必须**恰好一行**（`assertZstdHeaderFrame:741`） |
+| **seq 连续性** | 事件按 `seq` 连续校验，跳号 ⇒ `corrupt session log: seq gap in committed region`（实测）⇒ 只有"本地是包的前缀"才能安全追加尾帧 |
+| **归档按 id 且不可逆** | `archivedSessionIds` 注册表级全局、按 id 键控；该版本**没有解档 API/UI** ⇒ 沿用被归档过的 id = 会话永久隐藏 |
+| **可见性谓词** | Web 端：`origin!=='subagent' && !archived.has(id) && (!blank \|\| id===current)`；`blank` = 日志里没有 `turn/start` ⇒ 空会话/子代理会话按规则不单独出现，导入结果须明确报数 |
+| **attach 与投影** | `Workspace.attachSession` 要求 `fs.realpath(header.cwd) === record.path`；`ws.sessionIds` 是**投影**（`sessionPath(id)===record.path` 过滤 + 每次写入剪枝）⇒ attach 不抛 ≠ 会显示，自检必须读投影 |
+| 投影缓存 | `storages/session_projcache.json` 按 id + `seq` 围栏存派生投影 ⇒ 整体替换成更短的日志会让统计/标题滞后到下次写入；**只追加尾帧不受影响** |
+| 只读 vs 有副作用 | `inspect()` 只读（实测字节不变）；`load()` / `prepare()` 会追加合成 closer ⇒ 自检与测试只用 `inspect()` |
 | 附件 | `attachmentId = "sha256:<内容哈希>"`，内容寻址 ⇒ 重新落盘后 id 不变，会话引用不悬空 |
-| 全局单文件 | `storages/workspace.json`（所有工作区 + 持久顺序 + 归档集合）；`storages/session_projcache.json` 是可再生自愈缓存 ⇒ 都不进导出包 |
-| 存活会话 | 读文件前必须 `sessions.flush(sessions.get(id))`，否则包里只有上次 flush 的前缀 |
+| 全局单文件 | `storages/workspace.json`（所有工作区 + 持久顺序 + 归档集合）；`session_projcache.json` 可再生 ⇒ 都不进导出包、都不直接改写 |
+| 存活会话 | 导出前必须 `sessions.flush(sessions.get(id))`，否则包里只有上次 flush 的前缀；导入时该会话 LIVE ⇒ 宿主回写会盖掉结果 ⇒ 硬冲突 |
+| 测试夹具 | `test/host-fixture.mjs` 用宿主真实 `JsonlSessionPersistence` + `WorkspaceRegistry`（假一个内存 `storageDomain`，`ctx.sessions.prepare` 给轻量 stub）；**模块路径必须 realpath 成长文件名**，8.3 短名会让 cordis 的 URL 模式匹配失效 |
 
 ### 会话注入协议
 
@@ -172,22 +189,31 @@ study-work/
 | D9 | 恢复 = dist 快照 + 会话内重新 define/run | 动态插件重启即失；官方持久化（cordis.patch.yml + dsh.client 包）列为后续路线 |
 | D10 | 「📄 打开会话」= 幂等回到 `goal.sessionId`（目标总会话），仅当它未记录或已被销毁时才新建会话并 `study.recordGoalSession` 回写 | 旧实现走 `workspaces.connectWorkspace`，而它只复用**空白**会话：目标会话一旦产过草案就不再空白，于是每次点击都新建一个会话、把调研上下文丢在脑后。会话存活以客户端 `sessions.list` 镜像为准（镜像可能滞后 → 先 `refresh()` 再判定），因为 `sessions.open()` 只接受已列出的会话。（本条与其代码曾被一次工作区回退吃掉，2026-09-10 从安装副本 + dist 快照逐字节恢复） |
 | D11 | 导出的会话范围 = 目标工作区**项目目录下全部会话**，而非 `goal.json` 登记的那几个 | 「工作区的所有 session」的字面要求；`goal.json` 会漏掉 subagent 会话、面板丢绑定的孤儿会话与已归档会话。按项目目录整体扫描天然包含它们 |
-| D12 | transcript 以**逐字节原文**入包；跨路径导入**只重写 header 帧的 cwd**，正文不改写 | 逐字节 ⇒ 导入零解码零重压缩（宿主一个根只允许一种编码，重压缩反而引入风险）；正文里的旧绝对路径是历史文本，保留即可，全文替换需要解压重压且收益仅是「AI 回看历史时看到的路径更好看」 |
+| D12 | transcript 以**逐字节原文**入包；跨路径导入**只重写 header 帧的 cwd**，正文不改写 | 逐字节 ⇒ 导入零解码零重压缩（宿主一个根只允许一种编码，重压缩反而引入风险）；正文里的旧绝对路径是历史文本，保留即可，全文替换需要解压重压且收益仅是「AI 回看历史时看到的路径更好看」。**2026-09-10 修订**：「只改 cwd、不改 id」被证伪（见 D17/D18），正文原样这条仍然成立 |
 | D13 | 工作区登记走公开 API（`create` + `attachSession`），**永不覆盖** `storages/workspace.json` | 那是全局单文件且注册表有启动不变量（同会话被两个工作区索引 / 两条记录同路径 / 顺序偏离 ⇒ 拒绝启动）；整包覆盖会摧毁目标机其它工作区甚至让 DSH 起不来 |
 | D14 | 导入 = 预览/确认两段式 + 逐文件 sha256 校验先于写盘 + 写入后宿主 `inspect()` 自检 + 任一步失败整体回滚 | 导入会跨目录写会话与索引，必须可判定、可拒绝、可撤销；`inspect()` 是官方"非修改式检查"，用它证明宿主真读得懂，而不是我们自说自话 |
 | D15 | ZIP 与 zstd 帧工具自己实现（`lib/portable.js`，只用 `node:zlib`/`node:crypto`） | 插件既有的「纯 JS、零 npm 依赖、宿主平面受信」约定；不为了 zip 引入 fflate。外部解压器（Windows Expand-Archive）互操作已入测试 |
 | D16 | 「调研已派发」升格为 goal.json 的 `research` 事实，由三处注入成功点写入；面板 `researching` 按该事实分岔给「▶ 开始调研 / 🔁 重新调研」（RPC `study.dispatchResearch` 委托 `chatResearch`） | 事故复盘：目标由 `study_plan_create` 建档（该路径按设计不调研）→ 用户点「打开会话」只建了会话没发指令 → 面板因初值 `status:'researching'` 长亮「⏳ 正在联网调研」，且 researching 分支零按钮 → 用户以为"卡住"，实际是"从没开始"，唯一出路是隐式的「对我说开始调研」。不新增 `created` 状态（方案 B 会牵动状态机/老数据归一化/全量文案），改为给事实加一个字段并在 UI 分岔；派发口只留一个 owner，避免与 startResearch/retryResearch 三处重复 |
+| D17 | **双身份模型**：包里带稳定身份 `remoteId`，本机 `localId` 由导入侧决定；映射记在目标目录 `.study-sync.json`（设备本地，不入包、不从包恢复）；包级/目标级再加 `deviceId` 与 `remoteGoalId` | 宿主把 session id 当全局身份（H1/H6/H8）⇒ 沿用源 id 必然撞 duplicate 或继承归档态。云同步要求"同一个东西再同步一次还是它"，因此稳定身份必须与本机身份分离；账本让 A→B→A 往返时身份不漂移（二次导出仍带原 remoteId） |
+| D18 | 身份解析候选序：账本已分配的 localId → 包里的 id → 新 uuid；淘汰条件 = 该 id 已被别的 project 目录占用 **或** 该 id 在宿主归档集里 | 前者避开 H1（否则整个 `session.list` 炸）；后者避开 H6（该版本无解档 API ⇒ 沿用即永久隐身，正是本次事故的直接原因）。优先复用账本 id 才可能幂等 |
+| D19 | 会话落盘按 append-only 语义分档：`noop / append（只追加尾帧）/ replace（修复性）/ rewind 需 force / diverged 需 force / liveBlocked 不放行` | 宿主按 seq 连续校验（H5），整体替换成更短日志会让投影缓存滞后（H8）；前缀关系下只追加尾帧既不破不变量也不污染缓存，并为将来"只传增量帧"预留可比性。LIVE 会话由协调器 write-behind 独占（H10），外部写必被盖掉 ⇒ 硬冲突而不是静默丢失 |
+| D20 | 统一三模式 `overwrite / merge / copy`，作用于目标、会话、工作区三层同一开关；**面板默认 overwrite**，聊天工具缺省 merge | 用户拍板：为云同步铺垫，"已存在也要能覆盖"。面板是人主动操作、有预览与确认，默认覆盖最贴合意图；聊天由模型驱动，缺省保守（merge）避免误吃本地历史 |
+| D21 | 目标已存在不再是硬冲突：血缘一致（账本 `remoteGoalId` 相符）⇒ 直接更新；不一致 ⇒ `goalUnrelated` 需 force。工作区按 `resolveByPath→复用（必要时 setTitle）`，否则 `create`；重挂席位并摘除幽灵席位 | 覆盖式同步的日常就是"对同一个目标反复应用"；`create()` 对同一路径本就幂等（宿主 realpath）。幽灵席位（transcript 已不存在的在册会话）与账本被换掉的旧身份会让分组里堆积看不见的条目 |
+| D22 | **不做 prune**：本地比包多的文件、会话、席位一律保留，只报差异计数 | 用户拍板"先不做"。镜像式删除需要可靠 tombstone 与双向账本，风险远大于收益；真上云时再单独决策（见 import-overwrite-sync.md §7） |
+| D23 | 测试底座用**宿主真实实现**（`test/host-fixture.mjs`：真 `JsonlSessionPersistence` + 真 `WorkspaceRegistry`，只假内存 `storageDomain`）；mock 只留给宿主不可得时的降级跳过 | 上一版 mock 照抄我自己的实现（attach 永远成功、列表从盘上现读），96 条断言全绿却漏掉真 bug。身份/归档/投影/seq 这些不变量必须由宿主代码自己执行，我才骗不过去 |
 
 ## 7. 已知限制 / 后续路线
 
 - 动态插件会话级生命周期：重启后需按 INSTALL.md 恢复（快照已放 `~/.dsh/study-work/plugin/`）。
 - 面板「重新调研」= 退回草案 + 清空草案文件 + **立刻重新派发指令**（D16；此前只退回不派发，目标会停在「调研中」）；研究失败态（research_failed）仅兼容旧数据。
 - **D16 之前创建的 `researching` 目标没有 `research` 标记**，升级后会显示「待调研」。若它其实还在跑，点「▶ 开始调研」等于再发一次指令（幂等成本一次会话轮次）；一旦草案落地转 `draft_pending` 就自动归位，不做数据迁移。
-- 正式持久化插件（profile `cordis.patch.yml` 组合行 + `dsh.client` 客户端模块 + host↔client 远程桥）尚未实施——实施后将不再依赖会话级重装。
-- **导出/导入（M4）与派发事实（D16）只在常驻版实现**（D7 决策）：动态版 `src/host.js` 是路线 A 回退，不追新特性；两版数据契约仍一致，用常驻版导出的包可被任一版本的目标列表读取。
-- 导入后需重启 DSH 才会在左栏分组与会话列表里完整可见（工作区/会话发现与投影缓存在宿主启动期定型）；`study.reattachGoalSessions` 是重启后的修复入口。
-- 导出包目前只在同机 `exports/` 与浏览器下载之间流转；多目标合包、云同步、全文路径替换（D2②）都未做。
-- 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）。
+- 正式持久化插件（profile `cordis.patch.yml` 组合行 + `dsh.client` 客户端模块 + host↔client 远程桥）**已实施**＝`study-plugin/`（主形态）；动态版 `src/*.js` + `dist/` 保留为路线 A 回退。本机当前以 junction 方式把 `~/.dsh/profiles/web/node_modules/study-plugin` 指向仓库，改完 `npm run build` 后重启即生效；要用官方通道更新则先 `node scripts/install-profile.mjs --uninstall`（只删链接）再 `dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.git`。
+- **导出/导入（M4 / M4.1）与派发事实（D16）只在常驻版实现**（D7 决策）：动态版 `src/host.js` 是路线 A 回退，不追新特性；两版数据契约仍一致，用常驻版导出的包可被任一版本的目标列表读取。
+- 导入后仍建议重启 DSH 再看左栏（宿主分组与投影缓存在启动期定型）；但**可见性已在写入时按宿主投影自检**（D14 加强）：`ws.sessionIds` 不认账就整体回滚，不会再出现"导入成功却看不见"。`study.reattachGoalSessions` 是重启后的修复入口，同样按投影判定成败。
+- 覆盖式导入的已知边界：① 换发新 id 后，会话**正文文本**里提到的旧 id 不会改写（D12 保留正文原样）；② `force` 覆盖 = 吃掉本地更完整的历史，无本地快照可回退（导入前想留就自己备份 zip）；③ 被换下的旧 transcript 留在盘上转 Ungrouped（宿主无删除会话 API，本插件不越权删）；④ 不做 prune（D22）。
+- 归档集里的 id 会被自动避开（D18），但**已存在的旧归档会话本插件无法解档**（宿主这个版本没有解档 API）——只能在导入时换身份绕开。
+- 导出包目前只在同机 `exports/` 与浏览器下载之间流转；云通道、增量帧传输、删除同步（tombstone）、多目标合包未做（路径已留好，见 [design/import-overwrite-sync.md](./design/import-overwrite-sync.md) §7）。
+- 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）；超过 60MB 的 transcript 不解正文 ⇒ 无法按行比对，落盘动作降级为需要 force 的 `replace`。
 
 ## 8. 开发约定
 
