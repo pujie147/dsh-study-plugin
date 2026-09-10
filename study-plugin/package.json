@@ -1,7 +1,7 @@
 {
   "name": "study-plugin",
-  "version": "0.1.0",
-  "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_* 聊天工具。",
+  "version": "0.2.0",
+  "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_*/study_goal_* 聊天工具 + 目标导出导入（zip 可携化）。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -11,6 +11,7 @@
   },
   "files": [
     "lib/index.js",
+    "lib/portable.js",
     "lib/client.js",
     "cordis.patch.yml",
     "README.md",
@@ -23,7 +24,7 @@
   },
   "scripts": {
     "build": "node scripts/build-client.mjs",
-    "test": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs && node test/portable.test.mjs && node test/client.test.mjs",
     "cleanroom": "node scripts/cleanroom-check.mjs"
   },
   "license": "MIT",

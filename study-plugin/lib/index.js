@@ -15,6 +15,7 @@ import { promises as fsp } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import * as P from './portable.js'
 
 // ── M2 前置：静态 defineTool 解析（带降级）。解析失败只缺聊天工具，绝不拖垮 M1 路由/面板。
 let defineTool
@@ -73,6 +74,22 @@ export function apply(ctx, config) {
   const BASE = (config && config.workRoot) || (os.homedir() + '/.dsh/study-work')
   const INDEX = BASE + '/index.json'
   const README_PATH = BASE + '/README.md'
+
+  // ── M4 前置：可携化（导出/导入）需要的宿主服务。单独一条 inject ——
+  // 服务缺席时只有导出/导入降级为「服务不可用」，面板与 study_plan_* 不受影响（同 M2 手法）。
+  const portableDeps = { persistence: undefined, sessions: undefined, attachments: undefined, ready: false }
+  ctx.inject(['sessionPersistence', 'sessions', 'attachments'], (pctx) => {
+    portableDeps.persistence = pctx.sessionPersistence
+    portableDeps.sessions = pctx.sessions
+    portableDeps.attachments = pctx.attachments
+    const missing = []
+    if (!portableDeps.persistence) missing.push('sessionPersistence')
+    if (!portableDeps.sessions) missing.push('sessions')
+    if (!portableDeps.attachments) missing.push('attachments')
+    portableDeps.ready = missing.length === 0
+    if (portableDeps.ready) console.log('study-plugin: portable deps ready (导出/导入可用)')
+    else console.error('study-plugin: 可携化服务缺席，导出/导入将报错: ' + missing.join(', '))
+  })
 
   ctx.inject(['webServer', 'agents', 'workspaceRegistry', 'tools'], (sctx) => {
     const agents = sctx.agents
@@ -538,6 +555,558 @@ export function apply(ctx, config) {
       return { ok: true, sessionId: sessionId }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // M4: 目标可携化 —— 导出 zip / 从 zip 导入
+    // 契约（详见仓库 docs/design/export-import-scope.md，2026-09-09 确认）:
+    //   导出 = 目标目录整棵树（goal/chapters/notes/工作区内任意文件）
+    //          + 该目标工作区「项目目录」下全部会话 transcript（逐字节 zstd 原文）
+    //          + 会话正文引用的附件对象（内容寻址）
+    //          + 工作区登记 row（仅作信息，导入侧走公开 API 重建，绝不覆盖全局 workspace.json）
+    //          + manifest.json（格式版本 / 文件 sha256 / 会话 header / 路径改写信息 / warnings）
+    //   导入 = 落盘（跨路径时只重写会话 header 帧的 cwd）→ 宿主 inspect() 自检 → 失败回滚
+    //          → index.json 合并 + workspaceRegistry.create + ws.attachSession
+    // 明确不含: 凭据/设置/日志/缓存(session_projcache)/插件快照/.mnemon 工作区记忆/其它目标
+    // ══════════════════════════════════════════════════════════════════
+    const EXPORTS_DIR = BASE + '/exports'
+    const EXPORT_FORMAT_VERSION = 1
+    const MAX_GOAL_FILE_BYTES = 20 * 1024 * 1024
+    const MAX_ZIP_BYTES = 400 * 1024 * 1024
+    const MAX_DECODE_BYTES = 60 * 1024 * 1024
+    const SKIP_DIRS = ['.mnemon', '.git', '.idea', '.vscode', 'node_modules', '__pycache__', '.venv', 'venv', '.pytest_cache', '.dsh-tmp']
+    const SKIP_FILE_RE = /(^|[\\/])(Thumbs\.db|desktop\.ini|\.DS_Store)$|[.~](tmp|lock|part|swp|bak)$/i
+
+    async function statOpt(p) { try { return await fsp.stat(p) } catch { return undefined } }
+    const expandHomePath = (p) => {
+      const s = String(p || '').trim()
+      if (s === '~') return os.homedir()
+      if (s.startsWith('~/') || s.startsWith('~\\')) return path.join(os.homedir(), s.slice(2))
+      return s
+    }
+    const safeSeg = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, '_')
+    const stampNow = () => {
+      const d = new Date()
+      return String(d.getFullYear()) + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '-' + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds())
+    }
+
+    /** 目标目录整棵树 → zip 条目（goal/<相对路径>）。 */
+    async function walkGoalDir(absDir, relDir, entries, warnings) {
+      let items
+      try { items = await fsp.readdir(absDir, { withFileTypes: true }) } catch { return }
+      for (const it of items) {
+        const abs = path.join(absDir, it.name)
+        const rel = relDir ? relDir + '/' + it.name : it.name
+        if (it.isDirectory()) {
+          if (SKIP_DIRS.includes(it.name)) { warnings.push('跳过目录 ' + rel + '/（非学习内容）'); continue }
+          await walkGoalDir(abs, rel, entries, warnings)
+          continue
+        }
+        if (!it.isFile()) { warnings.push('跳过非常规文件 ' + rel); continue }
+        if (SKIP_FILE_RE.test(rel)) continue
+        const st = await statOpt(abs)
+        if (!st) continue
+        if (st.size > MAX_GOAL_FILE_BYTES) { warnings.push('跳过大文件 ' + rel + '（' + st.size + ' B > ' + MAX_GOAL_FILE_BYTES + ' B）'); continue }
+        entries.push({ name: 'goal/' + rel, data: await fsp.readFile(abs), mtime: st.mtime })
+      }
+    }
+
+    /** 由目标目录绝对路径 → 宿主会话「项目目录」（不自己复刻 projectKey，走 locate）。 */
+    function projectDirOf(absCwd) {
+      const pp = portableDeps.persistence
+      if (!pp || typeof pp.locate !== 'function') throw new Error('会话持久化服务不可用，无法定位会话目录')
+      const loc = pp.locate({ cwd: absCwd, id: 'study-probe' })
+      return path.dirname(path.dirname(loc.path))
+    }
+    function sessionTargetPath(absCwd, sessionId) {
+      return portableDeps.persistence.locate({ cwd: absCwd, id: sessionId }).path
+    }
+
+    /** 收集该目标工作区项目目录下的全部会话（含 subagent / 孤儿 / 已归档）。 */
+    async function collectSessions(absDir, g, warnings) {
+      const sessions = []
+      let projectDir = ''
+      try { projectDir = projectDirOf(absDir) } catch (e) { warnings.push(errText(e)); return { sessions, projectDir } }
+      let dirs
+      try { dirs = await fsp.readdir(projectDir, { withFileTypes: true }) } catch {
+        warnings.push('该目标还没有会话目录（' + path.basename(projectDir) + ' 不存在）')
+        return { sessions, projectDir }
+      }
+      const archived = (() => { try { return (wsRegistry && Array.isArray(wsRegistry.archivedSessionIds)) ? wsRegistry.archivedSessionIds : [] } catch { return [] } })()
+      const boundOf = (sid) => {
+        if (!sid) return 'unbound'
+        if (g.sessionId && g.sessionId === sid) return 'goal'
+        const ch = (g.chapters || []).find((c) => c.sessionId === sid)
+        return ch ? 'chapter-' + ch.index : 'unbound'
+      }
+      for (const it of dirs) {
+        if (!it.isDirectory()) continue
+        const dirAbs = path.join(projectDir, it.name)
+        let kind = 'zstd', bytes = await fsp.readFile(path.join(dirAbs, 'session.jsonl.zstd')).catch(() => undefined)
+        if (bytes === undefined) { kind = 'jsonl'; bytes = await fsp.readFile(path.join(dirAbs, 'session.jsonl')).catch(() => undefined) }
+        if (bytes === undefined) {
+          // 无 transcript（会话从未 append 过任何事件）——仍带出目录里的其他产物
+          for (const extra of await fsp.readdir(dirAbs).catch(() => [])) {
+            const st = await statOpt(path.join(dirAbs, extra))
+            if (st && st.isFile() && st.size <= MAX_GOAL_FILE_BYTES) {
+              warnings.push('会话目录 ' + it.name + ' 无 transcript，附带产物 ' + extra + ' 已入包')
+            }
+          }
+          warnings.push('跳过无 transcript 的会话目录 ' + it.name)
+          continue
+        }
+        let header
+        try {
+          header = kind === 'zstd' ? P.readSessionHeader(bytes) : JSON.parse(bytes.toString('utf8').split('\n').filter(Boolean)[0])
+        } catch (e) { warnings.push('会话目录 ' + it.name + ' transcript 读不出 header，已跳过: ' + errText(e)); continue }
+        const sid = String(header.id || it.name)
+        // 存活会话先 flush，再重读 —— 否则包里只有上次 flush 的前缀（宿主自带导出同一手法）
+        try {
+          const live = portableDeps.sessions && typeof portableDeps.sessions.get === 'function' ? portableDeps.sessions.get(sid) : undefined
+          if (live && typeof portableDeps.sessions.flush === 'function') { await portableDeps.sessions.flush(live); bytes = await fsp.readFile(path.join(dirAbs, kind === 'zstd' ? 'session.jsonl.zstd' : 'session.jsonl')) }
+        } catch (e) { warnings.push('会话 ' + sid + ' flush 失败，包内可能是上次落盘的前缀: ' + errText(e)) }
+        const rec = {
+          id: sid,
+          dirName: it.name,
+          encoding: kind,
+          entry: 'sessions/' + safeSeg(sid) + '/transcript.' + (kind === 'zstd' ? 'jsonl.zstd' : 'jsonl'),
+          cwd: header.cwd || '',
+          createdAt: header.createdAt,
+          parentSession: header.parentSession,
+          agentPreset: header.agentPreset,
+          delegationDepth: header.delegationDepth,
+          title: '',
+          lines: 0,
+          frames: 0,
+          compressedBytes: bytes.length,
+          logicalBytes: 0,
+          archived: archived.indexOf(sid) >= 0,
+          boundTo: boundOf(sid),
+          sha256: P.sha256Hex(bytes)
+        }
+        if (rec.dirName !== safeSeg(sid)) warnings.push('会话目录名与 header id 不一致（' + rec.dirName + ' vs ' + sid + '），按 header id 入包')
+        if (bytes.length <= MAX_DECODE_BYTES) {
+          try {
+            const d = kind === 'zstd' ? P.decodeTranscript(bytes) : { text: bytes.toString('utf8'), torn: false }
+            if (d.torn) warnings.push('会话 ' + sid + ' 末尾有未完成帧（崩溃残留），已按完整帧导出')
+            const lines = d.text.split('\n').filter(Boolean)
+            rec.lines = lines.length
+            rec.logicalBytes = d.text.length
+            if (kind === 'zstd') rec.frames = P.scanZstdFrames(bytes).frames.length
+            for (const l of lines) { try { const o = JSON.parse(l); if (o.type === 'session/title') rec.title = String((o.data && o.data.title) || o.title || '') } catch {} }
+            rec._refs = P.collectImageRefs(d.text)
+          } catch (e) { warnings.push('会话 ' + sid + ' 正文解码失败（原字节仍照抄入包）: ' + errText(e)) }
+        } else {
+          warnings.push('会话 ' + sid + ' 超过 ' + MAX_DECODE_BYTES + ' B，未解正文（原字节照抄入包，附件引用未收集）')
+        }
+        rec._bytes = bytes
+        sessions.push(rec)
+      }
+      return { sessions, projectDir }
+    }
+
+    /** 组装一个目标的导出包（不落盘）。 */
+    async function buildGoalBundle(goalId) {
+      const warnings = []
+      const g = await loadGoal(goalId)
+      if (!g) throw new Error('目标不存在: ' + goalId)
+      const absDir = await goalDir(g)
+      const idx = await readIndex()
+      const row = (idx.goals || []).find((r) => r.id === goalId)
+      const entries = []
+      await walkGoalDir(absDir, '', entries, warnings)
+      const collected = await collectSessions(absDir, g, warnings)
+      const sessions = collected.sessions
+      // 会话目录内的其他产物（DSH 语义把会话目录留给未来产物）
+      for (const s of sessions) {
+        const dirAbs = path.join(collected.projectDir, s.dirName)
+        for (const extra of await fsp.readdir(dirAbs).catch(() => [])) {
+          if (extra === 'session.jsonl.zstd' || extra === 'session.jsonl') continue
+          const st = await statOpt(path.join(dirAbs, extra))
+          if (st && st.isFile() && st.size <= MAX_GOAL_FILE_BYTES) {
+            entries.push({ name: 'sessions/' + safeSeg(s.id) + '/files/' + extra, data: await fsp.readFile(path.join(dirAbs, extra)), mtime: st.mtime })
+            warnings.push('会话 ' + s.id + ' 的自有产物已入包: ' + extra)
+          }
+        }
+      }
+      // 附件（内容寻址）
+      const attachments = []
+      const refMap = new Map()
+      for (const s of sessions) { for (const [id, ref] of (s._refs || [])) if (!refMap.has(id)) refMap.set(id, ref) }
+      for (const s of sessions) {
+        entries.push({ name: s.entry, data: s._bytes, store: s.encoding === 'zstd' })
+        delete s._bytes
+        delete s._refs
+      }
+      for (const [id, ref] of refMap) {
+        const sha = String(id).startsWith('sha256:') ? String(id).slice(7) : ''
+        const entry = 'attachments/objects/' + (sha.slice(0, 2) || 'xx') + '/' + (sha || safeSeg(id))
+        const svc = portableDeps.attachments
+        if (!svc || typeof svc.readImage !== 'function') { warnings.push('附件服务不可用，图片 ' + id + ' 未入包（导入后会话里的图片引用将悬空）'); continue }
+        try {
+          const stored = await svc.readImage(ref)
+          const data = stored && stored.data ? Buffer.from(stored.data) : undefined
+          if (!data) { warnings.push('附件 ' + id + ' 读不到字节，未入包'); continue }
+          entries.push({ name: entry, data })
+          attachments.push({ attachmentId: id, mediaType: String(ref.mediaType || ''), sha256: sha, bytes: data.length, entry })
+        } catch (e) { warnings.push('附件 ' + id + ' 读取失败: ' + errText(e)) }
+      }
+      // 工作区登记（仅信息；导入走 API 重建）
+      let workspace = undefined
+      try {
+        const ws = (g.workspaceId && wsRegistry && wsRegistry.get) ? wsRegistry.get(String(g.workspaceId)) : undefined
+        const resolved = ws || (wsRegistry && wsRegistry.resolveByPath ? await wsRegistry.resolveByPath(absDir) : undefined)
+        if (resolved) workspace = {
+          id: String(resolved.id),
+          path: String(resolved.path || absDir),
+          title: String(resolved.title || g.title || ''),
+          sessionIds: Array.isArray(resolved.sessionIds) ? resolved.sessionIds.map(String) : [],
+          createdAt: resolved.createdAt,
+          updatedAt: resolved.updatedAt
+        }
+      } catch (e) { warnings.push('工作区登记读取失败（不影响导出）: ' + errText(e)) }
+
+      for (const s of sessions) entries.push({ name: s.entry, data: await fsp.readFile(path.join(collected.projectDir, s.dirName, s.encoding === 'zstd' ? 'session.jsonl.zstd' : 'session.jsonl')), store: s.encoding === 'zstd' })
+      const files = entries.map((e) => ({ name: e.name, bytes: e.data.length, sha256: P.sha256Hex(e.data) }))
+      const goalJson = entries.find((e) => e.name === 'goal/goal.json')
+      const manifest = {
+        formatVersion: EXPORT_FORMAT_VERSION,
+        kind: 'study-goal-export',
+        tool: 'study-plugin',
+        exportedAt: nowISO(),
+        source: {
+          platform: process.platform,
+          dshHome: path.dirname(BASE),
+          studyWorkRoot: BASE,
+          sessionsRoot: collected.projectDir ? path.dirname(collected.projectDir) : '',
+          user: os.userInfo ? (() => { try { return os.userInfo().username } catch { return '' } })() : ''
+        },
+        goal: {
+          id: g.id, dir: g.dir, title: g.title, topic: g.topic, status: g.status,
+          chapterCount: (g.chapters || []).length,
+          goalJsonSha: goalJson ? P.sha256Hex(goalJson.data) : ''
+        },
+        indexRow: row ? { id: row.id, title: row.title, status: row.status, createdAt: row.createdAt, updatedAt: row.updatedAt } : undefined,
+        sessions,
+        attachments,
+        workspace,
+        files,
+        warnings
+      }
+      entries.unshift({ name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8') })
+      return { zip: P.createZip(entries), manifest }
+    }
+
+    handlers['study.exportGoal'] = async (args) => {
+      try {
+        const goalId = String((args && args.goalId) || '')
+        const { zip, manifest } = await buildGoalBundle(goalId)
+        await fsp.mkdir(EXPORTS_DIR, { recursive: true })
+        const file = 'study-goal-' + manifest.goal.dir + '-' + stampNow() + '.zip'
+        await fsp.writeFile(path.join(EXPORTS_DIR, file), zip)
+        return stripUndefined({
+          ok: true,
+          file,
+          path: path.join(EXPORTS_DIR, file),
+          dir: EXPORTS_DIR,
+          downloadUrl: '/study-export?file=' + encodeURIComponent(file),
+          bytes: zip.length,
+          goal: { id: manifest.goal.id, title: manifest.goal.title, status: manifest.goal.status, chapters: manifest.goal.chapterCount },
+          counts: {
+            files: manifest.files.length,
+            sessions: manifest.sessions.length,
+            sessionBytes: manifest.sessions.reduce((a, s) => a + s.compressedBytes, 0),
+            attachments: manifest.attachments.length
+          },
+          warnings: manifest.warnings
+        })
+      } catch (e) { return { ok: false, error: errText(e) } }
+    }
+
+    handlers['study.listExports'] = async () => {
+      try {
+        const names = await fsp.readdir(EXPORTS_DIR).catch(() => [])
+        const out = []
+        for (const name of names) {
+          if (!/\.zip$/i.test(name)) continue
+          const st = await statOpt(path.join(EXPORTS_DIR, name))
+          if (!st || !st.isFile()) continue
+          out.push({ file: name, bytes: st.size, mtime: st.mtime.toISOString(), downloadUrl: '/study-export?file=' + encodeURIComponent(name) })
+        }
+        out.sort((a, b) => String(b.mtime).localeCompare(String(a.mtime)))
+        return stripUndefined({ ok: true, dir: EXPORTS_DIR, exports: out })
+      } catch (e) { return { ok: false, error: errText(e) } }
+    }
+
+    handlers['study.deleteExport'] = async (args) => {
+      try {
+        const name = path.basename(String((args && args.file) || ''))
+        if (!/^[A-Za-z0-9._\u4e00-\u9fff-]+\.zip$/i.test(name)) return { ok: false, error: '非法导出文件名' }
+        const abs = path.join(EXPORTS_DIR, name)
+        if (!(await statOpt(abs))) return { ok: false, error: '文件不存在' }
+        await fsp.unlink(abs)
+        return { ok: true }
+      } catch (e) { return { ok: false, error: errText(e) } }
+    }
+
+    /** 读包 + 校验（格式版本、逐条目 sha256）。 */
+    async function readExport(ref) {
+      let abs = ''
+      if (ref && ref.path) abs = path.resolve(expandHomePath(ref.path))
+      else if (ref && ref.file) {
+        const raw = String(ref.file)
+        const name = path.basename(raw)
+        if (!name || name !== raw || !/^[A-Za-z0-9._\u4e00-\u9fff-]+\.zip$/i.test(name)) throw new Error('非法导出文件名（只接受 exports 目录内的裸文件名）')
+        abs = path.join(EXPORTS_DIR, name)
+      } else throw new Error('缺少 file（exports 目录内文件名）或 path（zip 绝对路径）')
+      const st = await statOpt(abs)
+      if (!st || !st.isFile()) throw new Error('找不到导出包: ' + abs)
+      if (st.size > MAX_ZIP_BYTES) throw new Error('导出包过大（' + st.size + ' B > ' + MAX_ZIP_BYTES + ' B）')
+      const entries = P.readZip(await fsp.readFile(abs))
+      const manifest = P.readJsonEntry(entries, 'manifest.json')
+      if (!manifest || manifest.kind !== 'study-goal-export') throw new Error('不是学习区目标导出包（manifest.json 缺失或 kind 不符）')
+      if (manifest.formatVersion !== EXPORT_FORMAT_VERSION) throw new Error('导出格式版本不支持: ' + manifest.formatVersion + '（本插件认 ' + EXPORT_FORMAT_VERSION + '）')
+      const bad = []
+      for (const f of (manifest.files || [])) {
+        const buf = entries.get(f.name)
+        if (buf === undefined) { bad.push(f.name + '（缺条目）'); continue }
+        if (P.sha256Hex(buf) !== f.sha256) bad.push(f.name + '（sha256 不符）')
+      }
+      if (bad.length) throw new Error('导出包校验失败: ' + bad.slice(0, 5).join('; ') + (bad.length > 5 ? ' 等 ' + bad.length + ' 项' : ''))
+      return { abs, entries, manifest }
+    }
+
+    /** 计算导入落点与冲突（dry-run 与真导入共用）。 */
+    async function planImport(manifest, opts) {
+      const srcId = String(manifest.goal.id)
+      const srcDirName = String(manifest.goal.dir || srcId)
+      const asCopy = opts.mode === 'copy' || opts.mode === 'rename'
+      let goalId = asCopy ? 'goal-' + Date.now().toString(36) + '-' + slug(manifest.goal.title || manifest.goal.topic || 'study', 'study') : srcId
+      if (!asCopy && opts.goalId) goalId = String(opts.goalId)
+      if (!/^[A-Za-z0-9._\u4e00-\u9fff-]+$/.test(goalId)) throw new Error('目标 id 含非法字符: ' + goalId)
+      const absDir = BASE + '/' + goalId
+      const conflicts = []
+      const warnings = []
+      if (await statOpt(absDir)) conflicts.push({ kind: 'goalDir', detail: absDir, hint: '目标目录已存在。用「另存为副本」导入（换一个新 goalId），或先把该目录移走' })
+      const idx = await readIndex()
+      if ((idx.goals || []).some((r) => r.id === goalId)) conflicts.push({ kind: 'goalId', detail: goalId, hint: 'index.json 已有同 id 目标' })
+      const srcCwd = manifest.sessions.length ? String(manifest.sessions[0].cwd || '') : ''
+      const sessionPlan = []
+      for (const s of manifest.sessions) {
+        const target = sessionTargetPath(absDir, s.id)
+        const exists = await statOpt(target)
+        if (exists) conflicts.push({ kind: 'session', detail: s.id, hint: '目标机该会话已存在: ' + target })
+        if (s.encoding === 'jsonl' && portableDeps.persistence && portableDeps.persistence.compression === 'zstd') warnings.push('会话 ' + s.id + ' 源为明文 jsonl，导入时会转成 zstd 帧')
+        if (!s.cwd) warnings.push('会话 ' + s.id + ' header 无 cwd，导入后可能无法挂到工作区')
+        sessionPlan.push({ id: s.id, title: s.title || '', boundTo: s.boundTo || 'unbound', lines: s.lines || 0, bytes: s.compressedBytes, entry: s.entry, encoding: s.encoding, targetPath: target, exists: !!exists, fromCwd: s.cwd || '' })
+      }
+      const rewrite = sessionPlan.some((p) => P.normPath(p.fromCwd) !== P.normPath(absDir))
+      const agentPresets = [...new Set(manifest.sessions.map((s) => s.agentPreset).filter(Boolean))]
+      return {
+        goalId, absDir, conflicts, warnings,
+        plan: {
+          goalId,
+          dir: absDir,
+          srcGoalId: srcId,
+          srcGoalDir: srcDirName,
+          title: manifest.goal.title || '',
+          status: manifest.goal.status || '',
+          chapters: manifest.goal.chapterCount || 0,
+          sessions: sessionPlan,
+          sessionCount: sessionPlan.length,
+          attachments: (manifest.attachments || []).length,
+          files: (manifest.files || []).length,
+          bytesTotal: (manifest.files || []).reduce((a, f) => a + f.bytes, 0),
+          rewriteCwd: rewrite,
+          fromCwd: srcCwd,
+          agentPresets,
+          exportedAt: manifest.exportedAt,
+          source: manifest.source || {},
+          restartNeeded: true
+        }
+      }
+    }
+
+    handlers['study.inspectImport'] = async (args) => {
+      try {
+        const { manifest } = await readExport(args || {})
+        const r = await planImport(manifest, args || {})
+        return stripUndefined({ ok: true, canImport: r.conflicts.length === 0, ...r })
+      } catch (e) { return { ok: false, error: errText(e) } }
+    }
+
+    handlers['study.importGoal'] = async (args) => {
+      const written = { goalDir: '', sessionFiles: [], indexAdded: false, workspaceId: '' }
+      let indexSnapshot = ''
+      try {
+        const a = args || {}
+        const { entries, manifest } = await readExport(a)
+        const planned = await planImport(manifest, a)
+        const { goalId, absDir, conflicts, warnings } = planned
+        if (a.confirm !== true) {
+          return stripUndefined({ ok: false, preview: true, needConfirm: true, canImport: conflicts.length === 0, ...planned })
+        }
+        const skip = new Set((Array.isArray(a.skipSessions) ? a.skipSessions : []).map(String))
+        const blocking = conflicts.filter((c) => !(c.kind === 'session' && skip.has(c.detail)))
+        if (blocking.length) {
+          return { ok: false, error: '导入被冲突挡住: ' + blocking.map((c) => c.kind + '=' + c.detail).join(', '), conflicts, hint: blocking[0] && blocking[0].hint }
+        }
+        indexSnapshot = (await readTextFile(INDEX)) || ''
+        // 1) 目标目录树
+        await fsp.mkdir(absDir, { recursive: true })
+        written.goalDir = absDir
+        for (const f of manifest.files) {
+          if (!f.name.startsWith('goal/')) continue
+          const dest = P.safeJoin(absDir, f.name.slice('goal/'.length))
+          await fsp.mkdir(path.dirname(dest), { recursive: true })
+          await fsp.writeFile(dest, entries.get(f.name))
+        }
+        // 2) 会话 transcript（必要时只重写 header 帧）
+        const restored = []
+        for (const s of manifest.sessions) {
+          if (skip.has(s.id)) { warnings.push('按请求跳过会话 ' + s.id); continue }
+          const raw = entries.get(s.entry)
+          if (raw === undefined) { warnings.push('会话 ' + s.id + ' 条目缺失，跳过'); continue }
+          const target = sessionTargetPath(absDir, s.id)
+          if (await statOpt(target)) { warnings.push('会话 ' + s.id + ' 目标已存在，跳过（不覆盖）'); continue }
+          let data = raw
+          if (s.encoding === 'zstd') {
+            const rw = await P.rewriteTranscriptCwd(raw, absDir)
+            data = rw.bytes
+            if (rw.changed) { /* header cwd 已指向新机目录 */ }
+          } else {
+            const text = raw.toString('utf8')
+            const first = JSON.parse(text.split('\n').filter(Boolean)[0])
+            if (P.normPath(first.cwd || '') !== P.normPath(absDir)) {
+              first.cwd = absDir
+              const rest = text.split('\n').filter(Boolean).slice(1)
+              data = await P.jsonlToZstdFrames(JSON.stringify(first) + '\n' + rest.join('\n') + '\n')
+            }
+          }
+          await fsp.mkdir(path.dirname(target), { recursive: true })
+          await fsp.writeFile(target, data)
+          written.sessionFiles.push(target)
+          restored.push(s.id)
+        }
+        // 3) 附件（内容寻址 ⇒ 重新落盘后 attachmentId 不变，会话引用继续有效）
+        let attachCount = 0
+        const svc = portableDeps.attachments
+        for (const ref of (manifest.attachments || [])) {
+          const buf = entries.get(ref.entry)
+          if (buf === undefined) { warnings.push('附件条目缺失: ' + ref.attachmentId); continue }
+          if (!svc || typeof svc.saveImage !== 'function') { warnings.push('附件服务不可用，图片 ' + ref.attachmentId + ' 未落盘'); continue }
+          try {
+            await svc.saveImage({ data: new Uint8Array(buf), mediaType: ref.mediaType })
+            attachCount++
+          } catch (e) { warnings.push('附件 ' + ref.attachmentId + ' 落盘失败: ' + errText(e)) }
+        }
+        // 4) goal.json 换身份 + index.json 合并
+        const goalPath = path.join(absDir, 'goal.json')
+        const g = await readJson(goalPath)
+        if (!g) throw new Error('包内 goal/goal.json 缺失或不可解析')
+        g.id = goalId
+        g.dir = goalId
+        g.workspaceId = undefined
+        g.updatedAt = nowISO()
+        await writeJson(goalPath, g)
+        const idx = await readIndex()
+        idx.goals = (idx.goals || []).filter((r) => r.id !== goalId)
+        idx.goals.unshift({ id: goalId, title: g.title || manifest.goal.title || '', status: g.status || manifest.goal.status || 'researching', createdAt: g.createdAt || manifest.goal.createdAt, updatedAt: g.updatedAt, path: absDir })
+        await writeIndex(idx)
+        written.indexAdded = true
+        // 5) 工作区登记：公开 API 重建（绝不手改全局 workspace.json）
+        let wsId = ''
+        const attachFail = []
+        if (wsRegistry) {
+          try {
+            const ws = await wsRegistry.create(absDir, g.title || g.topic || goalId)
+            wsId = String(ws && ws.id)
+            if (wsId) {
+              written.workspaceId = wsId
+              for (const sid of restored) {
+                try {
+                  if (ws && typeof ws.attachSession === 'function') await ws.attachSession(sid)
+                } catch (e) { attachFail.push(sid + ': ' + errText(e)) }
+              }
+              g.workspaceId = wsId
+              await writeJson(goalPath, g)
+            }
+          } catch (e) { warnings.push('工作区登记失败（重启后目标文件与会话仍在，可用「重新绑定工作区」再试）: ' + errText(e)) }
+        } else warnings.push('工作区注册表不可用，未登记工作区')
+        for (const m of attachFail) warnings.push('会话挂到工作区失败: ' + m)
+        // 6) 宿主自检：inspect 非修改式读取，读不懂就回滚
+        const verifyFail = []
+        for (const sid of restored) {
+          try {
+            const pp = portableDeps.persistence
+            if (pp && typeof pp.inspect === 'function') { const v = await pp.inspect(sid); if (!v) verifyFail.push(sid + ': inspect 返回空') }
+          } catch (e) { verifyFail.push(sid + ': ' + errText(e)) }
+        }
+        if (verifyFail.length) {
+          for (const f of written.sessionFiles) { await fsp.unlink(f).catch(() => {}) }
+          if (written.goalDir) { await fsp.rm(written.goalDir, { recursive: true, force: true }).catch(() => {}) }
+          const prev = indexSnapshot ? JSON.parse(indexSnapshot) : { goals: [] }
+          await writeIndex(prev)
+          if (written.workspaceId && wsRegistry && typeof wsRegistry.delete === 'function') { try { await wsRegistry.delete(written.workspaceId) } catch {} }
+          return { ok: false, error: '导入自检未通过，已全部回滚: ' + verifyFail.slice(0, 3).join('; '), rolledBack: true, warnings }
+        }
+        return stripUndefined({
+          ok: true,
+          goalId,
+          dir: absDir,
+          title: g.title,
+          sessions: restored.length,
+          skipped: skip.size,
+          attachments: attachCount,
+          workspaceId: wsId || undefined,
+          verified: verifyFail.length === 0 && portableDeps.persistence && typeof portableDeps.persistence.inspect === 'function',
+          warnings
+        })
+      } catch (e) {
+        return { ok: false, error: errText(e) }
+      }
+    }
+
+    /** 重启后/换机后的修复入口：重建工作区登记并把 goal.json 里的会话挂回去。 */
+    handlers['study.reattachGoalSessions'] = async (args) => {
+      try {
+        const g = await loadGoal(String((args && args.goalId) || ''))
+        if (!g) return { ok: false, error: '目标不存在' }
+        if (!wsRegistry) return { ok: false, error: '工作区注册表服务不可用' }
+        const absDir = await goalDir(g)
+        let ws = (g.workspaceId && wsRegistry.get) ? wsRegistry.get(String(g.workspaceId)) : undefined
+        if (!ws) ws = await wsRegistry.resolveByPath(absDir)
+        if (!ws) ws = await wsRegistry.create(absDir, g.title || g.topic)
+        const wsId = String(ws && ws.id)
+        if (!wsId) return { ok: false, error: '工作区创建失败' }
+        const ids = [g.sessionId, ...(g.chapters || []).map((c) => c.sessionId)].filter(Boolean)
+        const failed = []
+        for (const sid of ids) { try { await ws.attachSession(sid) } catch (e) { failed.push(sid + ': ' + errText(e)) } }
+        if (g.workspaceId !== wsId) { g.workspaceId = wsId; g.updatedAt = nowISO(); await saveGoal(g) }
+        return stripUndefined({ ok: true, workspaceId: wsId, attached: ids.length - failed.length, failed })
+      } catch (e) { return { ok: false, error: errText(e) } }
+    }
+
+    // M4 聊天入口：与面板 RPC 同一实现（D8 语义统一）
+    async function chatExport(args) {
+      const goalId = String((args && args.goal_id) || '').trim()
+      if (!goalId) return { ok: false, error: '缺少 goal_id' }
+      const r = await handlers['study.exportGoal']({ goalId })
+      if (r && r.ok) r.next = 'zip 已落盘（path 字段）；面板「📦 导出/导入」里也能下载。给别人前先看一眼 manifest.json：里面有本机绝对路径与用户名'
+      return r
+    }
+    async function chatImport(args) {
+      const a = args || {}
+      const ref = { path: a.path, file: a.file }
+      if (a.confirm === true || String(a.confirm).toLowerCase() === 'true') {
+        return handlers['study.importGoal']({ ...ref, mode: a.mode, confirm: true })
+      }
+      // 未确认 → 走 importGoal 的预览分支（同一实现，语义与面板一致）
+      const r = await handlers['study.importGoal']({ ...ref, mode: a.mode })
+      if (r && r.ok) r.next = r.canImport
+        ? '预览无误。要真正写入请再调一次 study_goal_import 并带 confirm=true（有冲突时用 mode=copy 另存为副本）'
+        : '有冲突，不能直接导入：看 conflicts，必要时用 mode=copy 另存为副本'
+      return r
+    }
+
     // -------------------------------------------------------------- 聊天工具（study_plan_*，M2）
     async function chatStatus() {
       const idx = await readIndex()
@@ -701,6 +1270,52 @@ export function apply(ctx, config) {
       return () => { if (typeof dispose === 'function') dispose() }
     }, 'study-plugin: /study-rpc route')
 
+    // ── /study-export 路由（GET 下载导出的 zip；loopback 守卫，只认 exports 目录内的 .zip）
+    const handleFile = async (req, res) => {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('method not allowed')
+        return
+      }
+      const remote = String((req.socket && req.socket.remoteAddress) || '')
+      if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('forbidden')
+        return
+      }
+      try {
+        const u = new URL(req.url || '', 'http://127.0.0.1')
+        const raw = String(u.searchParams.get('file') || '')
+        const name = path.basename(raw)
+        if (!name || name !== raw || !/^[A-Za-z0-9._\u4e00-\u9fff-]+\.zip$/i.test(name)) {
+          res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end('bad file name')
+          return
+        }
+        const abs = path.join(EXPORTS_DIR, name)
+        const st = await statOpt(abs)
+        if (!st || !st.isFile()) {
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end('not found')
+          return
+        }
+        const buf = await fsp.readFile(abs)
+        res.writeHead(200, {
+          'content-type': 'application/zip',
+          'content-length': String(buf.length),
+          'content-disposition': 'attachment; filename="' + name.replace(/[^\x20-\x7e]/g, '_') + '"; filename*=UTF-8\'\'' + encodeURIComponent(name)
+        })
+        res.end(buf)
+      } catch (e) {
+        try { res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' }); res.end(errText(e)) } catch {}
+      }
+    }
+
+    sctx.effect(() => {
+      const dispose = sctx.webServer.register({ kind: 'prefix', path: '/study-export', handler: handleFile })
+      return () => { if (typeof dispose === 'function') dispose() }
+    }, 'study-plugin: /study-export route')
+
     // ── M2: study_plan_* 聊天工具（全局注册，所有会话可见；defineTool 不可用时仅缺这组工具） ──
     sctx.effect(() => {
       if (typeof defineTool !== 'function') {
@@ -729,7 +1344,18 @@ export function apply(ctx, config) {
           {
             goal_id: { type: 'string', required: true, description: '目标 id' },
             reason: { type: 'string', description: '修改意见，如 章节太多，合并到6章' }
-          }, chatReject]
+          }, chatReject],
+        ['study_goal_export',
+          '把一个学习目标导出为 zip：含该目标目录下全部内容 + 该目标工作区的会话 transcript 与会话引用的附件，落在 ~/.dsh/study-work/exports/。当用户说 导出目标/备份目标/打包这个目标 时调用。',
+          { goal_id: { type: 'string', required: true, description: '要导出的目标 id' } }, chatExport],
+        ['study_goal_import',
+          '从导出的 zip 导入学习目标。不带 confirm 时只返回预览与冲突（先看预览，再带 confirm=true 真导入；有冲突可用 mode=copy 另存为副本）。当用户说 导入目标/恢复备份/从这个 zip 还原 时调用。',
+          {
+            path: { type: 'string', description: 'zip 的绝对路径（与 file 二选一）' },
+            file: { type: 'string', description: '~/.dsh/study-work/exports/ 里的文件名' },
+            mode: { type: 'string', description: 'copy=另存为副本（换新 goalId）；缺省为原位导入（目标 id 已存在则拒绝）' },
+            confirm: { type: 'string', description: 'true 才真正写入' }
+          }, chatImport]
       ]
       const disposers = []
       for (const [toolName, description, parameters, run] of specs) {
@@ -785,10 +1411,20 @@ export function apply(ctx, config) {
       '- 生成讲义: 在目标会话中生成某章讲义 md；讲义文件出现后自动标记「讲义就绪」',
       '- 继续生成: 讲义「生成中」且未产出时点击，重新发送生成任务（会话未激活会退回「待生成」并提示）',
       '- 📖 开始学习: 为该章创建独立会话并进入（每章一个）；AI 每次回答后检查是否值得回写——总结入讲义（带链接），详细内容入 NN-notes/ 目录',
+      '- 📤 导出: 把该目标打成 zip（目标目录全部内容 + 该工作区全部会话 transcript + 会话引用的附件 + manifest.json），落在 exports/ 并可下载',
+      '- 📦 导出/导入（面板顶部）: 看导出包列表、下载、填 zip 路径做「预览」再「确认导入」；导入 = 还原目标 + 会话 + 工作区登记',
       '- 删除: 仅标记 deleted（文件保留）',
       '',
+      '## 导出 / 导入（可携化）',
+      '1. 导出包 = `study-goal-<goalId>-<时间戳>.zip`，内含: `manifest.json`（格式版本/逐文件 sha256/会话 header/源机路径信息）、`goal/**`（目标目录整棵树）、`sessions/<会话id>/transcript.jsonl.zstd`（逐字节原文）、`attachments/objects/**`（内容寻址图片）、`workspace.json`（仅该目标登记信息）。',
+      '2. 不含: 凭据与设置（settings.yaml/.credentials.yaml）、日志、皮肤、profile 插件本体、`storages/session_projcache.json`（23MB 级自愈缓存，冷读自动重建）、`study-work/plugin/`（动态版快照）、本目标 `.mnemon/` 运行时记忆、其它目标数据。',
+      '3. 导入按服务器端 zip 路径进行（面板填路径或 `study_goal_import`）。跨机器/换 DSH_HOME 时**只重写会话 header 的 cwd**，正文里的旧路径作为历史文本保留；goalId 已存在时用「另存为副本」模式换新 id。',
+      '4. 导入写入后会用宿主 `sessionPersistence.inspect()` 自检，任一会话读不懂即整体回滚。工作区登记走 `workspaceRegistry.create` + `ws.attachSession`，**不会覆盖全局 workspace.json**。',
+      '5. 导入/迁移后**重启 DSH** 再看左栏：工作区/会话分组与投影缓存在宿主启动期定型。若会话没挂上，面板该目标行「🔗 重新绑定会话」可调 `study.reattachGoalSessions` 修复。',
+      '6. 隐私: manifest.json 里有源机绝对路径与用户名，公开发布前请先看一遍。',
+      '',
       '## 对话入口（在聊天里直接管理）',
-      '可用工具: study_plan_status(进度总览与下一步) / study_plan_create(创建目标) / study_plan_research(发起调研) / study_plan_approve(批准草案) / study_plan_reject(退回草案)。',
+      '可用工具: study_plan_status(进度总览与下一步) / study_plan_create(创建目标) / study_plan_research(发起调研) / study_plan_approve(批准草案) / study_plan_reject(退回草案) / study_goal_export(导出 zip) / study_goal_import(预览与导入 zip)。',
       '注: 该组工具由本常驻插件直接提供，DSH 启动即全局可用，任何模式无需激活。',
       '示例问法: 「看看我的学习进度」「帮我建一个学 XX 的计划（目标: …）」「开始调研」「草案可以，批准」「草案不行，XX 方向重做」。',
       '注意: 创建后需要先把目标总会话打开过一次（📄 打开会话），chat 工具才能向它注入调研任务。',

@@ -52,6 +52,12 @@ function apply(ctx) {
     const [confirmDel, setConfirmDel] = React.useState(null)
     const [busyKey, setBusyKey] = React.useState(null)
     const [form, setForm] = React.useState({ topic: '', target_level: '', requirements: '' })
+    const [notice, setNotice] = React.useState('')
+    const [ioList, setIoList] = React.useState([])
+    const [ioDir, setIoDir] = React.useState('')
+    const [ioBusy, setIoBusy] = React.useState(false)
+    const [impPath, setImpPath] = React.useState('')
+    const [impPreview, setImpPreview] = React.useState(null)
     const [anchor, setAnchor] = React.useState(undefined)
     const [open, setOpen] = React.useState(ui.open)
     const rootRef = React.useRef(null)
@@ -240,6 +246,117 @@ function apply(ctx) {
       onClick: () => { if (confirmDel === g.id) { setConfirmDel(null); doAction(g.id, () => call('study.deleteGoal', { goalId: g.id })) } else { setConfirmDel(g.id) } }
     }, confirmDel === g.id ? '确认删除?' : '删除')
 
+    // ── M4 导出 / 导入 ────────────────────────────────────────────────────
+    const fmtBytes = (b) => {
+      const x = Number(b) || 0
+      if (x < 1024) return x + ' B'
+      if (x < 1024 * 1024) return (x / 1024).toFixed(1) + ' KB'
+      return (x / 1024 / 1024).toFixed(2) + ' MB'
+    }
+    const loadExports = async () => {
+      const r = await call('study.listExports', {})
+      if (r && r.ok === true) { setIoList(r.exports || []); setIoDir(r.dir || '') }
+      else setError(String((r && r.error) || '读取导出列表失败'))
+    }
+    const doExport = async (g) => {
+      setBusyKey('export:' + g.id)
+      setError('')
+      setNotice('')
+      try {
+        const r = await call('study.exportGoal', { goalId: g.id })
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '导出失败')); return }
+        setNotice('✅ 已导出 ' + r.file + '（' + fmtBytes(r.bytes) + '，会话 ' + r.counts.sessions + ' 个 / 附件 ' + r.counts.attachments + ' 个）')
+        await loadExports()
+        setView('io')
+      } catch (e) {
+        setError('导出失败: ' + String((e && e.message) || e))
+      } finally {
+        setBusyKey(null)
+      }
+    }
+    const doReattach = async (g) => {
+      await doAction('reattach:' + g.id, () => call('study.reattachGoalSessions', { goalId: g.id }))
+    }
+    const doPreviewImport = async (mode) => {
+      const p = impPath.trim()
+      if (!p) { setError('先填导出包的绝对路径（或 exports 目录里的文件名）'); return }
+      setIoBusy(true)
+      setError('')
+      setImpPreview(null)
+      try {
+        const arg = /\.zip$/i.test(p) && /[\\/]/.test(p) ? { path: p } : { file: p }
+        const r = await call('study.inspectImport', mode ? Object.assign({}, arg, { mode: mode }) : arg)
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '预览失败')); return }
+        setImpPreview(Object.assign({}, r, { arg: arg, mode: mode || '' }))
+      } catch (e) {
+        setError('预览失败: ' + String((e && e.message) || e))
+      } finally {
+        setIoBusy(false)
+      }
+    }
+    const doConfirmImport = async () => {
+      if (!impPreview) return
+      setIoBusy(true)
+      setError('')
+      try {
+        const arg = Object.assign({}, impPreview.arg, { confirm: true })
+        if (impPreview.mode) arg.mode = impPreview.mode
+        const r = await call('study.importGoal', arg)
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '导入失败') + (r && r.rolledBack ? '（已回滚）' : '')); return }
+        setNotice('✅ 已导入目标「' + (r.title || r.goalId) + '」：会话 ' + r.sessions + ' 个、附件 ' + r.attachments + ' 个。重启 DSH 后左栏分组与会话列表才会完整刷新。')
+        setImpPreview(null)
+        await refresh()
+      } catch (e) {
+        setError('导入失败: ' + String((e && e.message) || e))
+      } finally {
+        setIoBusy(false)
+      }
+    }
+    const doDeleteExport = async (item) => {
+      await call('study.deleteExport', { file: item.file })
+      await loadExports()
+    }
+
+    const ioView = () => React.createElement('div', { className: 'stuiForm' },
+      React.createElement('div', { className: 'stuiMeta' }, '导出包目录: ' + (ioDir || '（空）')),
+      React.createElement('div', { className: 'stuiRow' },
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, onClick: () => loadExports() }, '⟳ 刷新'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', onClick: () => { setView('list'); setImpPreview(null) } }, '← 返回目标列表')
+      ),
+      ioList.length === 0 ? React.createElement('div', { className: 'stuiEmpty' }, '还没有导出包\n在目标行点「📤 导出」生成') :
+        React.createElement('div', null, ioList.map((it) => React.createElement('div', { key: it.file, className: 'stuiChRow' },
+          React.createElement('span', { className: 'stuiChTitle', title: it.file }, it.file),
+          React.createElement('span', { className: 'stuiChip' }, fmtBytes(it.bytes)),
+          React.createElement('a', { className: 'stuiAct', href: it.downloadUrl, download: it.file, style: { textDecoration: 'none' } }, '⬇ 下载'),
+          React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'danger', disabled: ioBusy, onClick: () => doDeleteExport(it) }, '删')
+        ))),
+      React.createElement('div', { className: 'stuiDraftOv' }, '导入：填导出包路径（zip 绝对路径，或 exports 目录里的文件名）→ 先预览再确认。跨机器导入只重写会话 header 的 cwd；goalId 已存在时用「另存为副本」。'),
+      React.createElement('input', {
+        className: 'stuiInput', value: impPath, placeholder: 'C:\\Users\\me\\Downloads\\study-goal-…-20260909.zip',
+        onChange: (e) => { setImpPath(e.target.value); setImpPreview(null) }
+      }),
+      React.createElement('div', { className: 'stuiRow' },
+        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || !impPath.trim(), onClick: () => doPreviewImport('') }, ioBusy ? '读取中…' : '🔍 预览'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || !impPath.trim(), onClick: () => doPreviewImport('copy') }, '📋 预览副本')
+      ),
+      impPreview && React.createElement('div', { className: 'stuiDetail' },
+        React.createElement('div', { className: 'stuiMeta' }, '目标: ' + (impPreview.plan.title || '(无标题)') + ' · ' + impPreview.plan.chapters + ' 章 · 会话 ' + impPreview.plan.sessionCount + ' 个 · 附件 ' + impPreview.plan.attachments + ' 个 · ' + fmtBytes(impPreview.plan.bytesTotal)),
+        React.createElement('div', { className: 'stuiMeta', style: { wordBreak: 'break-all' } }, '落点: ' + impPreview.plan.dir + (impPreview.plan.rewriteCwd ? '（将重写会话 cwd）' : '（同路径，逐字节还原）')),
+        React.createElement('div', { className: 'stuiMeta' }, '源机导出时间: ' + (impPreview.plan.exportedAt || '?') + ' · 平台 ' + ((impPreview.plan.source || {}).platform || '?')),
+        (impPreview.plan.sessions || []).slice(0, 8).map((s) => React.createElement('div', { key: s.id, className: 'stuiMeta' }, '  · ' + (s.title || s.id) + ' [' + (s.boundTo || '?') + '] ' + (s.lines || 0) + ' 行' + (s.exists ? ' ⚠已存在' : ''))),
+        (impPreview.plan.sessions || []).length > 8 ? React.createElement('div', { className: 'stuiMeta' }, '  …共 ' + impPreview.plan.sessions.length + ' 个会话') : null,
+        (impPreview.conflicts || []).length > 0 && React.createElement('div', { className: 'stuiErr' }, '⚠ 冲突: ' + impPreview.conflicts.map((c) => c.kind + '=' + c.detail).join('; ') + ' — ' + ((impPreview.conflicts[0] || {}).hint || '')),
+        (impPreview.warnings || []).length > 0 && React.createElement('div', { className: 'stuiMeta' }, '提示: ' + impPreview.warnings.slice(0, 4).join(' / ')),
+        React.createElement('div', { className: 'stuiRow' },
+          React.createElement('button', {
+            type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || impPreview.canImport !== true,
+            onClick: () => doConfirmImport()
+          }, ioBusy ? '导入中…' : '✓ 确认导入' + (impPreview.mode === 'copy' ? '（另存为副本）' : '')),
+          React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, onClick: () => setImpPreview(null) }, '取消')
+        )
+      )
+    )
+
     const activeCount = goals.filter((g) => g.status === 'researching' || g.status === 'draft_pending' || g.status === 'active').length
 
     return React.createElement('div', {
@@ -263,12 +380,18 @@ function apply(ctx) {
         React.createElement('div', { className: 'stuiHeader' },
           React.createElement('span', { className: 'stuiTitle' }, '📚 学习区'),
           React.createElement('span', { className: 'stuiRow' },
+            React.createElement('button', {
+              type: 'button', className: 'stuiIconBtn', 'data-active': view === 'io' || undefined,
+              title: '导出包 / 导入', onClick: () => { const next = view === 'io' ? 'list' : 'io'; setView(next); setImpPreview(null); if (next === 'io') loadExports() }
+            }, '📦'),
             React.createElement('button', { type: 'button', className: 'stuiIconBtn', title: '刷新', onClick: () => refresh() }, '⟳'),
             React.createElement('button', { type: 'button', className: 'stuiIconBtn', title: '收起', onClick: () => setOpenBoth(false) }, '✕')
           )
         ),
         React.createElement('div', { className: 'stuiBody' },
           error !== '' && React.createElement('div', { className: 'stuiErr' }, '⚠ ' + error),
+          notice !== '' && React.createElement('div', { className: 'stuiMeta' }, notice),
+          view === 'io' ? ioView() :
           view === 'form' ? React.createElement('div', { className: 'stuiForm' },
             React.createElement('label', null, '学习主题 *', React.createElement('input', { className: 'stuiInput', value: form.topic, placeholder: '如：Transformer 基础', onChange: (e) => setForm({ ...form, topic: e.target.value }) })),
             React.createElement('label', null, '目标水平', React.createElement('input', { className: 'stuiInput', value: form.target_level, placeholder: '如：能读懂论文与实现', onChange: (e) => setForm({ ...form, target_level: e.target.value }) })),
@@ -294,7 +417,12 @@ function apply(ctx) {
                     React.createElement('button', {
                       type: 'button', className: 'stuiOpen', disabled: opening || goalBusy,
                       onClick: () => openGoalSession(g)
-                    }, opening ? '切换中…' : '📄 打开会话')
+                    }, opening ? '切换中…' : '📄 打开会话'),
+                    React.createElement('button', {
+                      type: 'button', className: 'stuiIconBtn', title: '导出为 zip（目标全部内容 + 全部会话）',
+                      disabled: goalBusy || busyKey === 'export:' + g.id,
+                      onClick: () => doExport(g)
+                    }, busyKey === 'export:' + g.id ? '⏳' : '📤')
                   ),
                   exp && React.createElement('div', { className: 'stuiGoalBody' },
                     React.createElement('div', { className: 'stuiDetail' },
@@ -305,12 +433,10 @@ function apply(ctx) {
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiDraftOv' }, '草案: ' + ((g.draft && g.draft.overview) || '')),
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiRow' },
                         React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.approveDraft', { goalId: g.id })) }, '✓ 批准'),
-                        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.rejectDraft', { goalId: g.id, reason: '用户重新考虑' })) }, '重新调研'),
-                        delBtn(g)
+                        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.rejectDraft', { goalId: g.id, reason: '用户重新考虑' })) }, '重新调研')
                       ),
                       g.status === 'research_failed' && React.createElement('div', { className: 'stuiRow' },
-                        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.retryResearch', { goalId: g.id })) }, '重试调研'),
-                        delBtn(g)
+                        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: goalBusy, onClick: () => doAction(g.id, () => call('study.retryResearch', { goalId: g.id })) }, '重试调研')
                       ),
                       g.status === 'researching' && React.createElement('div', { className: 'stuiMeta' }, '⏳ 目标会话 AI 正在联网调研…完成后自动转入待批准'),
                       chapterList.map((c) => {
@@ -326,7 +452,11 @@ function apply(ctx) {
                       }),
                       (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && chapterList.length === 0 && React.createElement('div', { className: 'stuiMeta' }, '章节待生成'),
                       (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && React.createElement('div', { className: 'stuiMeta', style: { wordBreak: 'break-all' } }, '📁 ' + g.path),
-                      (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && React.createElement('div', { className: 'stuiRow' }, delBtn(g))
+                      React.createElement('div', { className: 'stuiRow' },
+                        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: goalBusy, onClick: () => doExport(g) }, busyKey === 'export:' + g.id ? '导出中…' : '📤 导出 zip'),
+                        g.sessionId && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: goalBusy, onClick: () => doReattach(g) }, '🔗 重新绑定会话'),
+                        delBtn(g)
+                      )
                     )
                   )
                 )

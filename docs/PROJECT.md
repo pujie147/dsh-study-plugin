@@ -23,7 +23,8 @@ study_dsh_plugin/
 ├── INSTALL.md           安装 / 重装 / 重启恢复指引
 ├── docs/
 │   ├── PROJECT.md       本文档（架构 / 状态机 / API / 决策记录）
-│   └── USAGE.md         使用手册（面向用户）
+│   ├── USAGE.md         使用手册（面向用户）
+│   └── design/          单特性范围与决策（export-import-scope.md = 导出包文件清单）
 ├── src/
 │   ├── host.js          宿主引擎源码（code.host 的 function body）
 │   └── client.js        面板 UI 源码（code.client 的 function body）
@@ -35,10 +36,11 @@ study_dsh_plugin/
 ├── study-plugin/        ★ 常驻插件包（主形态，可分发）
 │   ├── package.json     双 exports + dsh.bundle.patch + dsh.client 清单
 │   ├── cordis.patch.yml 自注册 row（- insert: study-engine）
-│   ├── lib/index.js     宿主半（/study-rpc + study.* ×13 + study_plan_* ×5 + README）
+│   ├── lib/index.js     宿主半（/study-rpc + /study-export + study.* ×19 + study_plan_* ×5 + study_goal_* ×2 + README）
+│   ├── lib/portable.js  可携化工具（零依赖 ZIP + zstd 会话帧改写 + 附件引用收集 + zip-slip 防御）
 │   ├── lib/client.js    客户端 bundle（构建产物，勿手改）
 │   ├── src/client.mjs   客户端源码 + scripts/（build-client / install-profile / cleanroom-check）
-│   └── test/smoke.mjs   运行时冒烟（33 断言）
+│   └── test/            smoke.mjs(69 断言，含导出→导入往返) · portable.test.mjs(14) · client.test.mjs(13，桩 React 真实渲染点击)
 └── package.json
 ```
 
@@ -62,10 +64,13 @@ study_dsh_plugin/
 study-work/
 ├── README.md                使用说明（插件启动时同步覆盖）
 ├── index.json               目标注册表 { goals: [{id,title,status,path}] }
+├── exports/                 导出包 study-goal-<goalId>-<时间戳>.zip（面板 📦 视图可下载/删除）
 └── <goal>/goal.json         目标状态机（唯一权威文件）
     └── chapters/            NN-<slug>.md 讲义；NN-qa.md 问答写回；NN-notes/ 补充内容目录
     └── draft.json           目标会话 AI 写出的课程草案（JSON），采纳后转待批准
 ```
+
+导出包内容与会话/工作区的宿主侧落盘事实见 §5「可携化用到的宿主事实」与 [docs/design/export-import-scope.md](./design/export-import-scope.md)。
 
 ### goal.json 字段
 
@@ -106,10 +111,22 @@ study-work/
 | study.continueChapter | goalId,chapter_index | 先查文件：已产出→ready；否则会话可用→重发任务；不可用→回退 draft 并提示 |
 | study.recordChapterSession | goalId,chapter_index,sessionId | 记录章节会话 id |
 | study.startChapter | goalId,chapter_index,sessionId | 向章节会话注入「本章学习教练」开场指令（读讲义→讲解→每次回答后检查是否有值得回写的补充内容并询问用户→写回 NN-qa.md） |
+| study.recordGoalSession | goalId,sessionId | 回写目标总会话 id（旧会话被销毁后面板新建会话时使用，配合 D10） |
 | study.deleteGoal | goalId | 移出 index 并标记 deleted（文件保留） |
 | study.ensureGoalWorkspace | goalId | 按需创建/解析目标工作区 |
+| study.exportGoal | goalId | 导出该目标为 zip（目标树 + 全部会话 + 附件 + manifest），落 `exports/` |
+| study.listExports / study.deleteExport | – / file | 导出包列表（大小/时间/下载 URL）/ 删除裸文件名 zip |
+| study.inspectImport | file 或 path[,mode] | 读包 + 逐文件 sha256 校验 + 计算落点/冲突/是否需重写 header（只读预览） |
+| study.importGoal | file 或 path,confirm[,mode,skipSessions] | 无 confirm 返回预览；有 confirm 执行还原（会话 header 重写 → 附件回写 → index 合并 → 工作区登记 → inspect 自检 → 失败整体回滚）；`mode=copy` 换新 goalId |
+| study.reattachGoalSessions | goalId | 修复入口：重建工作区登记并把 goal.json 记录的会话挂回分组（迁移/重启后分组丢失时） |
 
-### 模型工具（聊天，`study_plan_*`）
+### 文件路由（webServer prefix，GET 下载）
+
+| 路由 | 行为 |
+| --- | --- |
+| `/study-export?file=<裸文件名>.zip` | 流式返回 `exports/` 内的导出包；仅 GET、仅 loopback、`path.basename` 后还必须与入参全等（拒路径穿越）、仅 `.zip` |
+
+### 模型工具（聊天，`study_plan_*` / `study_goal_*`）
 
 | 工具 | 何时用 |
 | --- | --- |
@@ -118,6 +135,20 @@ study-work/
 | study_plan_research | 开始/重新调研 |
 | study_plan_approve | 批准草案 |
 | study_plan_reject | 退回草案并记意见 |
+| study_goal_export | 导出/备份某目标为 zip |
+| study_goal_import | 从 zip 导入（无 confirm 只给预览与冲突；有 confirm 才写入；`mode=copy` 另存为副本） |
+
+### 可携化用到的宿主事实（M4）
+
+| 事实 | 说明 |
+| --- | --- |
+| 会话落盘 | `<sessionsRoot>/--<projectKey(cwd)>--/<encodeSegment(sessionId)>/session.jsonl.zstd` |
+| `projectKey` / `encodeSegment` | 分隔符→`-`、不安全字符→`~XXXX`、截断 251、外包 `--…--`；**不可自己复刻**，一律 `ctx.get('sessionPersistence').locate({cwd,id}).path`（无 IO），项目目录 = 该路径的上上级 |
+| transcript 物理形态 | 多帧 zstd 拼接：**第 1 帧只含 header 行**，其后每个 append 批次一帧；帧需 `ZSTD_c_checksumFlag=1` 且非 single-segment（用异步 `zlib.zstdCompress`，同步版会写成 single-segment） |
+| 会话归属 | 子代理会话与父会话同 cwd ⇒ 同项目目录；`archivedSessionIds` 是注册表级全局集合 |
+| 附件 | `attachmentId = "sha256:<内容哈希>"`，内容寻址 ⇒ 重新落盘后 id 不变，会话引用不悬空 |
+| 全局单文件 | `storages/workspace.json`（所有工作区 + 持久顺序 + 归档集合）；`storages/session_projcache.json` 是可再生自愈缓存 ⇒ 都不进导出包 |
+| 存活会话 | 读文件前必须 `sessions.flush(sessions.get(id))`，否则包里只有上次 flush 的前缀 |
 
 ### 会话注入协议
 
@@ -136,15 +167,29 @@ study-work/
 | D7 | 拒绝草案 = 清空 draft.json | 防止 status 回 researching 后旧草案被采纳扫描重新捞起（曾为面板缺陷） |
 | D8 | 聊天工具与面板 RPC 语义统一（合并进单一引擎） | stuh-6/stmc-8 历史分叉合并；一致的数据与错误契约 |
 | D9 | 恢复 = dist 快照 + 会话内重新 define/run | 动态插件重启即失；官方持久化（cordis.patch.yml + dsh.client 包）列为后续路线 |
+| D10 | 「📄 打开会话」= 幂等回到 `goal.sessionId`（目标总会话），仅当它未记录或已被销毁时才新建会话并 `study.recordGoalSession` 回写 | 旧实现走 `workspaces.connectWorkspace`，而它只复用**空白**会话：目标会话一旦产过草案就不再空白，于是每次点击都新建一个会话、把调研上下文丢在脑后。会话存活以客户端 `sessions.list` 镜像为准（镜像可能滞后 → 先 `refresh()` 再判定），因为 `sessions.open()` 只接受已列出的会话。（本条与其代码曾被一次工作区回退吃掉，2026-09-10 从安装副本 + dist 快照逐字节恢复） |
+| D11 | 导出的会话范围 = 目标工作区**项目目录下全部会话**，而非 `goal.json` 登记的那几个 | 「工作区的所有 session」的字面要求；`goal.json` 会漏掉 subagent 会话、面板丢绑定的孤儿会话与已归档会话。按项目目录整体扫描天然包含它们 |
+| D12 | transcript 以**逐字节原文**入包；跨路径导入**只重写 header 帧的 cwd**，正文不改写 | 逐字节 ⇒ 导入零解码零重压缩（宿主一个根只允许一种编码，重压缩反而引入风险）；正文里的旧绝对路径是历史文本，保留即可，全文替换需要解压重压且收益仅是「AI 回看历史时看到的路径更好看」 |
+| D13 | 工作区登记走公开 API（`create` + `attachSession`），**永不覆盖** `storages/workspace.json` | 那是全局单文件且注册表有启动不变量（同会话被两个工作区索引 / 两条记录同路径 / 顺序偏离 ⇒ 拒绝启动）；整包覆盖会摧毁目标机其它工作区甚至让 DSH 起不来 |
+| D14 | 导入 = 预览/确认两段式 + 逐文件 sha256 校验先于写盘 + 写入后宿主 `inspect()` 自检 + 任一步失败整体回滚 | 导入会跨目录写会话与索引，必须可判定、可拒绝、可撤销；`inspect()` 是官方"非修改式检查"，用它证明宿主真读得懂，而不是我们自说自话 |
+| D15 | ZIP 与 zstd 帧工具自己实现（`lib/portable.js`，只用 `node:zlib`/`node:crypto`） | 插件既有的「纯 JS、零 npm 依赖、宿主平面受信」约定；不为了 zip 引入 fflate。外部解压器（Windows Expand-Archive）互操作已入测试 |
 
 ## 7. 已知限制 / 后续路线
 
 - 动态插件会话级生命周期：重启后需按 INSTALL.md 恢复（快照已放 `~/.dsh/study-work/plugin/`）。
 - 面板「重新调研」已与聊天一致（退回即清草案）；研究失败态（research_failed）仅兼容旧数据。
 - 正式持久化插件（profile `cordis.patch.yml` 组合行 + `dsh.client` 客户端模块 + host↔client 远程桥）尚未实施——实施后将不再依赖会话级重装。
+- **导出/导入（M4）只在常驻版实现**（D7 决策）：动态版 `src/host.js` 是路线 A 回退，不追新特性；两版数据契约仍一致，用常驻版导出的包可被任一版本的目标列表读取。
+- 导入后需重启 DSH 才会在左栏分组与会话列表里完整可见（工作区/会话发现与投影缓存在宿主启动期定型）；`study.reattachGoalSessions` 是重启后的修复入口。
+- 导出包目前只在同机 `exports/` 与浏览器下载之间流转；多目标合包、云同步、全文路径替换（D2②）都未做。
+- 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）。
 
 ## 8. 开发约定
 
 - 代码保持纯 JS（无 JSX/TS/import 变换），宿主不用 `process/require/fetch` 等未声明全局。
 - RPC/工具返回值必须是无损 JSON（递归剔除 undefined）。
 - 修改 `src/host.js|client.js` 后执行 `npm run build && npm run install:dsh` 重新打包快照。
+- 改常驻版：`cd study-plugin && node scripts/build-client.mjs`（改过 `src/client.mjs` 必须重建 bundle）→ `node scripts/install-profile.mjs` → 重启 DSH。
+- 提交前跑全套：`cd study-plugin && npm test`（smoke 69 + portable 14 + client 13）与 `node scripts/cleanroom-check.mjs`（净室 tarball 探针）。
+- 触碰宿主落盘格式（会话帧 / 附件 / 注册表）前先读 §5「可携化用到的宿主事实」，路径一律用 `sessionPersistence.locate()` 解析，不要复刻 projectKey/encodeSegment。
+- ⚠️ 未提交的工作在这个仓库被一次 IDE 回退吃掉过（2026-09-09 18:30，`git restore` 类操作不写 reflog）：**能验证过就立刻 commit**，别把成果只留在工作区。
