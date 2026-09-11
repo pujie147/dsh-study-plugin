@@ -44,6 +44,34 @@ function apply(ctx) {
     try { return new Date(String(iso)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) } catch (e) { return String(iso) }
   }
 
+  const errText = (e) => String((e && e.message) || e)
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  // 有界轮询（先判后睡，条件已满足时不留延迟）。不用 list.subscribe()：点击闭包里挂
+  // disposer 容易泄漏，而宿主的 getSnapshot 自带 memoize，轮询几乎免费。
+  const waitFor = async (pred, timeoutMs, stepMs) => {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      try { if (pred()) return true } catch (e) {}
+      if (Date.now() >= deadline) return false
+      await sleep(stepMs || 150)
+    }
+  }
+
+  // 宿主的浏览器侧服务名是其私有演进面：connectWorkspace / openSession 在 dsh 0.1.5-rc.1
+  // 从 workspaces 迁到了 uiWorkspace。ctx.get 是惰性的（未提供返回 undefined 而不抛），所以
+  // 这里在调用时才取。反过来，uiWorkspace 绝不能写进模块级 inject —— 那是硬激活门，一旦某个
+  // 安装没装 dsh-client-ui-workspace，apply() 就永不执行，整个面板消失。
+  // 只缓存成功：瞬时取空（HMR/reload）若被缓存成 undefined，会永久关掉首选路径。
+  let uiWorkspaceCache
+  const getUiWorkspace = () => {
+    if (uiWorkspaceCache) return uiWorkspaceCache
+    let svc
+    try { svc = ctx.get('uiWorkspace') } catch (e) { svc = undefined }
+    if (svc) uiWorkspaceCache = svc
+    return svc
+  }
+
   const StudyApp = (props) => {
     const sessionsHook = props.useSessions
     const workspacesSvc = props.workspaces
@@ -128,12 +156,23 @@ function apply(ctx) {
       return undefined
     }
 
+    const sessionsSnapshot = () => {
+      try {
+        return sessionsSvc && sessionsSvc.list && typeof sessionsSvc.list.getSnapshot === 'function'
+          ? sessionsSvc.list.getSnapshot()
+          : undefined
+      } catch (e) { return undefined }
+    }
     // 会话是否还在客户端镜像里（= 宿主仍存在该会话；open() 只认已列出的会话）
     const sessionIsLive = (sid) => {
-      const snap = sessionsSvc && sessionsSvc.list && typeof sessionsSvc.list.getSnapshot === 'function'
-        ? sessionsSvc.list.getSnapshot()
-        : undefined
+      const snap = sessionsSnapshot()
       return !!(snap && snap.byId && snap.byId[sid])
+    }
+    // 新宿主快照带 phase，只有 ready 才可信；形状不认识（没有 phase 字段）就当已就绪。
+    // 把「镜像还没追上」误读成「会话已销毁」会白建一个新会话，破坏 D10 的幂等。
+    const mirrorSettled = () => {
+      const snap = sessionsSnapshot()
+      return !snap || snap.phase === undefined || snap.phase === 'ready'
     }
 
     // 镜像可能落后于宿主（DSH 刚重启 / 另一端刚建工作区）：拉一次再判定
@@ -141,15 +180,56 @@ function apply(ctx) {
       if (svc && typeof svc.refresh === 'function') { try { await svc.refresh() } catch (e2) {} }
     }
 
-    // 在目标工作区取一个会话（复用空白会话，否则新建）；工作区尚未进镜像时刷新后重试一次
-    const connectGoalWorkspace = async (wsId) => {
-      if (!workspacesSvc) throw new Error('工作区服务不可用')
+    // 客户端镜像是否已认得该工作区。快照形状不认识就当作可见，不阻塞正常路径。
+    const workspaceVisible = (wsId) => {
+      let snap
       try {
-        return unwrapSessionId(await workspacesSvc.connectWorkspace(wsId))
-      } catch (e2) {
-        await refreshMirror(workspacesSvc)
-        return unwrapSessionId(await workspacesSvc.connectWorkspace(wsId))
+        snap = workspacesSvc && workspacesSvc.list && typeof workspacesSvc.list.getSnapshot === 'function'
+          ? workspacesSvc.list.getSnapshot()
+          : undefined
+      } catch (e) { return true }
+      if (!snap || !Array.isArray(snap.items)) return true
+      return snap.items.some((it) => it && (it.workspaceId === wsId || it.id === wsId))
+    }
+    const waitForWorkspaceVisible = (wsId) => workspaceVisible(wsId)
+      ? Promise.resolve(true)
+      : waitFor(() => workspaceVisible(wsId), 1500, 150)
+
+    // 在目标工作区取一个会话（复用空白会话，否则新建）。三段兜底，按「方法是否存在」挑路：
+    //   1) uiWorkspace.connectWorkspace —— 新版宿主（dsh 0.1.5-rc.1 起把它从 workspaces 迁走）
+    //   2) workspaces.connectWorkspace  —— 旧版宿主
+    //   3) sessions.create({workspaceId}) —— 两者都缺席时的最后手段
+    // 任一层都不许把 TypeError 冒到面板上。
+    const connectGoalWorkspace = async (wsId) => {
+      const ui = getUiWorkspace()
+      const attempts = []
+      if (ui && typeof ui.connectWorkspace === 'function') attempts.push((id) => ui.connectWorkspace(id))
+      if (workspacesSvc && typeof workspacesSvc.connectWorkspace === 'function') attempts.push((id) => workspacesSvc.connectWorkspace(id))
+      let lastErr
+      for (const run of attempts) {
+        try {
+          return unwrapSessionId(await run(wsId))
+        } catch (e) {
+          lastErr = e
+          // 新宿主只认已进镜像的工作区：study.ensureGoalWorkspace 刚建好的可能还没推过来
+          if (!/unknown workspace|no such workspace|not found/i.test(errText(e))) continue
+          if (await waitForWorkspaceVisible(wsId)) { try { return unwrapSessionId(await run(wsId)) } catch (e2) { lastErr = e2 } }
+        }
       }
+      if (!sessionsSvc || typeof sessionsSvc.create !== 'function') {
+        throw new Error(attempts.length ? '连接工作区失败: ' + errText(lastErr) : '宿主未提供工作区连接能力')
+      }
+      try { return unwrapSessionId(await sessionsSvc.create({ workspaceId: wsId })) }
+      catch (e3) { throw new Error('在目标工作区新建会话失败: ' + errText(e3)) }
+    }
+
+    // 打开会话：优先宿主的 uiWorkspace.openSession（与点侧栏等价，顺带收起右侧面板），
+    // 退回 sessions.open。都失败只说明宿主不认这套 API —— 返回 false 让调用方决定措辞。
+    const openSessionInUi = (sid) => {
+      const ui = getUiWorkspace()
+      if (ui && typeof ui.openSession === 'function') { try { ui.openSession(sid); return true } catch (e) {} }
+      if (sessionsSvc && typeof sessionsSvc.open === 'function') { try { sessionsSvc.open(sid); return true } catch (e) {} }
+      return false
     }
 
     // 打开该目标的「目标总会话」（= 产出草案的那个会话），返回其会话 id。仅当它已被销毁/从未记录
@@ -160,12 +240,13 @@ function apply(ctx) {
       setError('')
       try {
         const recorded = g.sessionId ? String(g.sessionId) : ''
-        if (recorded) {
-          if (!sessionIsLive(recorded)) await refreshMirror(sessionsSvc)
-          if (sessionIsLive(recorded)) {
-            sessionsSvc.open(recorded)
-            return recorded
-          }
+        if (recorded && !sessionIsLive(recorded)) {
+          await refreshMirror(sessionsSvc)
+          if (!mirrorSettled()) await waitFor(() => sessionIsLive(recorded) || mirrorSettled(), 1500, 150)
+        }
+        if (recorded && sessionIsLive(recorded)) {
+          if (!openSessionInUi(recorded)) setError('宿主未能切换到该会话，请在左侧会话列表手动打开')
+          return recorded
         }
         let wsId = g.workspaceId
         if (!wsId) {
@@ -177,11 +258,12 @@ function apply(ctx) {
         if (!sessionId) { setError('未能取得会话 id'); return undefined }
         const rec = await call('study.recordGoalSession', { goalId: g.id, sessionId: sessionId })
         if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录目标会话失败')); return undefined }
-        sessionsSvc.open(sessionId)
+        // 账已记上，切换失败不该把整个动作判死 —— 降级成提示
+        if (!openSessionInUi(sessionId)) setNotice('目标会话已就绪，但宿主未能自动切换：请在左侧会话列表手动打开')
         await refresh()
         return sessionId
       } catch (e) {
-        setError('打开会话失败: ' + String((e && e.message) || e))
+        setError('打开会话失败: ' + errText(e))
         return undefined
       } finally {
         setBusyKey(null)
@@ -211,17 +293,18 @@ function apply(ctx) {
         })
         if (!r || r.ok !== true) { setError(String((r && r.error) || '创建失败')); return }
         const goalId = r.goalId
-        let sessionId
+        let sessionId, why = ''
         try {
           sessionId = await connectGoalWorkspace(r.workspaceId)
         } catch (e2) {
           sessionId = undefined
+          why = errText(e2)
         }
         if (sessionId) {
-          sessionsSvc.open(sessionId)
+          openSessionInUi(sessionId)
           call('study.startResearch', { goalId: goalId, sessionId: sessionId }).catch(() => {})
         } else {
-          setError('目标已创建，但未能自动打开会话——请点目标行「打开会话」')
+          setError('目标已创建，但未能自动打开会话' + (why ? '：' + why : '') + '——请点目标行「打开会话」')
         }
         setView('list')
         setForm({ topic: '', target_level: '', requirements: '' })
@@ -246,6 +329,8 @@ function apply(ctx) {
             if (!r || r.ok !== true) { setError(String((r && r.error) || '无法建立工作区')); return }
             wsId = r.workspaceId
           }
+          // 章节要的是独立新会话（不是复用空白会话），所以直接 create；宿主不提供就明说
+          if (typeof sessionsSvc.create !== 'function') { setError('宿主未提供会话创建能力'); return }
           const created = await sessionsSvc.create({ workspaceId: wsId })
           sid = unwrapSessionId(created)
           if (!sid) { setError('创建章节会话失败: 未返回会话 id'); return }
@@ -253,7 +338,7 @@ function apply(ctx) {
           if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录章节会话失败')); return }
           call('study.startChapter', { goalId: g.id, chapter_index: c.index, sessionId: sid }).catch(() => {})
         }
-        if (sid) sessionsSvc.open(sid)
+        if (sid && !openSessionInUi(sid)) setError('宿主未能切换到章节会话，请在左侧会话列表手动打开')
         await refresh()
       } catch (e) {
         setError('打开章节会话失败: ' + String((e && e.message) || e))

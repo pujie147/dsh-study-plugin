@@ -201,6 +201,7 @@ study-work/
 | D21 | 目标已存在不再是硬冲突：血缘一致（账本 `remoteGoalId` 相符）⇒ 直接更新；不一致 ⇒ `goalUnrelated` 需 force。工作区按 `resolveByPath→复用（必要时 setTitle）`，否则 `create`；重挂席位并摘除幽灵席位 | 覆盖式同步的日常就是"对同一个目标反复应用"；`create()` 对同一路径本就幂等（宿主 realpath）。幽灵席位（transcript 已不存在的在册会话）与账本被换掉的旧身份会让分组里堆积看不见的条目 |
 | D22 | **不做 prune**：本地比包多的文件、会话、席位一律保留，只报差异计数 | 用户拍板"先不做"。镜像式删除需要可靠 tombstone 与双向账本，风险远大于收益；真上云时再单独决策（见 import-overwrite-sync.md §7） |
 | D23 | 测试底座用**宿主真实实现**（`test/host-fixture.mjs`：真 `JsonlSessionPersistence` + 真 `WorkspaceRegistry`，只假内存 `storageDomain`）；mock 只留给宿主不可得时的降级跳过 | 上一版 mock 照抄我自己的实现（attach 永远成功、列表从盘上现读），96 条断言全绿却漏掉真 bug。身份/归档/投影/seq 这些不变量必须由宿主代码自己执行，我才骗不过去 |
+| D24 | 浏览器侧的**宿主服务名/方法名是私有演进面**：只能按「方法是否存在」探测 + 调用时惰性 `ctx.get`；可选服务**一律不写进模块级 `inject`** | v0.3.0 及以前直接调 `workspaces.connectWorkspace`，dsh 0.1.5-rc.1 把它迁到 `uiWorkspace` ⇒ 用户实机点「打开会话」报"连接会话的方法不存在"。反过来把 `uiWorkspace` 加进 `inject` 更糟：cordis 的 `inject` 是**硬激活门**（`cordis/lib/index.js:1316-1328`，任一注入名无实现 ⇒ `apply()` 永不执行），缺该包的安装会让整个面板消失。`ctx.get` 本身惰性、未提供返回 undefined 不抛（`:762-771`），所以惰性解析 + 三段兜底（`uiWorkspace` → 旧 `workspaces` → `sessions.create`）既修得了漂移又拖不垮面板。**成功才缓存、失败不缓存**（瞬时取空被缓存会永久关掉首选路径） |
 
 ## 7. 已知限制 / 后续路线
 

@@ -2,7 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.1] - 2026-09-11
+
+### fixed
+- **点「📄 打开会话」报「连接会话的方法不存在」**（用户实机报告）。根因是宿主 API 漂移，不是数据问题：dsh 0.1.5-rc.1 把浏览器侧的 `connectWorkspace` 从 `workspaces` 服务迁到了 UI 能力服务 `uiWorkspace`（`workspaces` 只剩纯 controller：`list/create/rename/delete/insertBefore/archiveSession/insertSessionBefore`），旧调用点撞上不存在的方法 ⇒ `TypeError`，被面板 catch 后显示成"打开会话失败: …"。症状时有时无是因为只有**目标会话需要新建**（从未建立 / 已被销毁 / 章节首次打开）才走这条路，复用已记录会话的 `sessions.open` 一直正常。现在按「方法是否存在」三段兜底：
+  1. `uiWorkspace.connectWorkspace`（新宿主）；报 unknown workspace 时说明镜像还没收到该工作区，等它可见（≤1.5s）后**只重试这一层**；
+  2. `workspaces.connectWorkspace`（旧宿主，升级前的安装不受影响）；
+  3. `sessions.create({ workspaceId })`（两者都缺席时的最后手段）。
+  三层能力全无时只显示白话错误「宿主未提供工作区连接能力」，不再冒 `is not a function`。`uiWorkspace` **刻意不写进模块级 `inject`** —— 那个数组是 cordis 的硬激活门，一旦某个安装没有 `dsh-client-ui-workspace`，`apply()` 就永不执行、整个面板消失；改为点击时惰性 `ctx.get`（成功才缓存）。
+- **切换会话失败会把整个动作判死**：`study.recordGoalSession` 已经落盘之后再 `open` 失败，现在降级成提示"请在左侧会话列表手动打开"，不再让账本正确的操作显示成失败。
+- **`workspacesSvc.refresh()` 的空转重试**：新版宿主的工作区服务根本没有 `refresh`，原来那句"刷新后重试一次"实际什么都没刷新。改为读 `list.getSnapshot().items` 判定工作区是否已进镜像。
+- **镜像未就绪被误读成「会话已销毁」**：新宿主快照带 `phase`（只有 `ready` 可信）。原来只看 `byId` 里有没有，DSH 刚重启/刚建目标时会判定失败并**白建一个新会话**（破坏 D10 幂等），还顺带把用户推进上面那条已坏的新建路径。现在先 `refresh()` 并有界等待 `phase === 'ready'` 再判定。
+
+### changed
+- `test/client.test.mjs` 增加宿主形状回归：新宿主（只有 `uiWorkspace`）/ 旧宿主（只有 `workspaces`）/ 两者都无（降级到 `sessions.create`）/ 全缺（白话错误）/ `phase: 'loading'`（不许新建）共 5 个场景，用重新 `apply` 复位服务解析。断言数 24 → 30。
+
 ## [0.3.0] - 2026-09-10
+
 
 ### fixed
 - **导入后工作区文件夹正常、会话却不显示**（用户实机报告）。根因：宿主把 **session id 当作全局身份**，而 0.2.x 的导入照抄源 id（D2/D12）。三条宿主规则被违反：

@@ -378,6 +378,120 @@ assert.ok(seq.indexOf('reject:goal-pending') >= 0 && seq.indexOf('dispatch:goal-
   '应「先 rejectDraft 再 dispatchResearch」: ' + JSON.stringify(seq))
 ok('D16：草案待批准的「重新调研」名副其实——rejectDraft 后紧接 dispatchResearch')
 
+// ── 宿主 API 迁移回归（用户实机报「打开会话失败：连接会话的方法不存在」）────────────
+// dsh 0.1.5-rc.1 把浏览器侧 connectWorkspace/openSession 从 workspaces 迁到了 uiWorkspace，
+// workspaces 只剩纯 controller。客户端半必须按「方法是否存在」挑路：新宿主、旧宿主、两者都无
+// 三种形状都要能落到某条路上，且绝不把 TypeError 的字样冒到面板上。
+// 每换一个宿主形状重新 apply 一次 —— getUiWorkspace() 会缓存成功结果（生产里服务不会中途消失），
+// 不复位就测不到「这个形状下没有 uiWorkspace」。
+const hostShape = { ui: false, legacy: true, phase: undefined }
+const wsCalls = []
+const uiWorkspaceSvc = {
+  connectWorkspace: async (id) => { wsCalls.push('ui:' + id); return { sessionId: 'session-ui' } },
+  openSession: (id) => { opened.push('ui-open:' + id) }
+}
+const legacyConnect = async (id) => { wsCalls.push('legacy:' + id); return { sessionId: 'session-legacy' } }
+const origSnapshot = sessionsSvc.list.getSnapshot
+const origCreate = sessionsSvc.create
+const origOpen = sessionsSvc.open
+const makeCtx = () => ({
+  get: (name) => (name === 'slots' ? slots
+    : name === 'sessions' ? sessionsSvc
+    : name === 'workspaces' ? workspacesSvc
+    : name === 'uiWorkspace' ? (hostShape.ui ? uiWorkspaceSvc : undefined)
+    : undefined),
+  effect: (fn) => fn()
+})
+const useHost = async (shape, rows) => {
+  hostShape.ui = shape.ui === true
+  hostShape.legacy = shape.legacy === true
+  hostShape.phase = shape.phase
+  if (hostShape.legacy) workspacesSvc.connectWorkspace = legacyConnect
+  else delete workspacesSvc.connectWorkspace
+  sessionsSvc.list.getSnapshot = shape.snapshot || origSnapshot
+  sessionsSvc.create = shape.noCreate ? undefined : origCreate
+  sessionsSvc.open = shape.noOpen ? undefined : origOpen
+  sessionsSvc.refresh = shape.onRefresh || (async () => {})
+  factory.apply(makeCtx())
+  opened.length = 0; rpc.length = 0; wsCalls.length = 0
+  listGoals = rows
+  await click(flat.find((e) => e.type === 'button' && e.props.title === '刷新'), 'refresh')
+  await renderAll()
+}
+// 展开是 toggle，跨场景状态会残留，所以只在拿不到按钮时展开一次
+const openBtn = async (title) => {
+  await renderAll()
+  let b = btnIn(title, '📄 打开会话')
+  if (!b) { await expand(title); b = btnIn(title, '📄 打开会话') }
+  assert.ok(b, '目标行缺少「📄 打开会话」按钮')
+  return b
+}
+
+// (a) 新宿主：只有 uiWorkspace 有 connectWorkspace（workspaces 上被宿主删掉了）
+await useHost({ ui: true, legacy: false }, [ghostRow])
+await click(await openBtn('会话已销毁'), 'open session on new host')
+assert.deepEqual(wsCalls, ['ui:ws-1'], '新宿主应走 uiWorkspace.connectWorkspace：' + JSON.stringify(wsCalls))
+assert.ok(rpc.some((c) => c[0] === 'record' && c[1].goalId === 'goal-ghost' && c[1].sessionId === 'session-ui'), '拿到会话后要回写 recordGoalSession')
+assert.deepEqual(opened, ['ui-open:session-ui'], '切换要走 uiWorkspace.openSession')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('打开会话失败') < 0, '新宿主形状下打开会话不该报错')
+assert.ok(bodyText().indexOf('is not a function') < 0, 'TypeError 字样漏到了面板上')
+ok('宿主迁移回归：connectWorkspace 只在 uiWorkspace 上时，「打开会话」仍成功')
+
+// (b) 旧宿主：只有 workspaces.connectWorkspace（升级前的安装不能被打断）
+await useHost({ ui: false, legacy: true }, [ghostRow])
+await click(await openBtn('会话已销毁'), 'open session on legacy host')
+assert.deepEqual(wsCalls, ['legacy:ws-1'], '旧宿主应退回 workspaces.connectWorkspace')
+assert.ok(rpc.some((c) => c[0] === 'record' && c[1].sessionId === 'session-legacy'), '旧宿主路径也要回写 sessionId')
+assert.deepEqual(opened, ['session-legacy'], '没有 uiWorkspace 时退回 sessions.open')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('打开会话失败') < 0, '旧宿主形状下打开会话不该报错')
+ok('向后兼容：只有 workspaces.connectWorkspace 的旧宿主仍能打开会话')
+
+// (c) 两个都没有：降级到 sessions.create({workspaceId})，动作仍算成功
+await useHost({ ui: false, legacy: false }, [ghostRow])
+await click(await openBtn('会话已销毁'), 'open session with no connect at all')
+assert.deepEqual(wsCalls, [], '三层兜底的第 3 层不该调用任何 connectWorkspace')
+assert.ok(rpc.some((c) => c[0] === 'record' && c[1].goalId === 'goal-ghost' && c[1].sessionId === 'session-new'), '应把 create 出来的会话记回 goal.json')
+assert.deepEqual(opened, ['session-new'], 'sessions.create + sessions.open 兜底要能打开')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('打开会话失败') < 0, '降级路径不该报错：' + bodyText().slice(0, 200))
+ok('降级优先：宿主两个连接方法都缺席时落到 sessions.create，不报错')
+
+// (e) 连 sessions.create 也没有：只能给出白话错误，不能是 TypeError
+await useHost({ ui: false, legacy: false, noCreate: true }, [ghostRow])
+await click(await openBtn('会话已销毁'), 'open session with nothing at all')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('宿主未提供工作区连接能力') >= 0, '全缺时应说「宿主未提供工作区连接能力」')
+assert.ok(bodyText().indexOf('is not a function') < 0, '白话错误没兜住，原始 TypeError 漏到面板')
+ok('全部能力缺席时显示白话错误，而不是 is not a function')
+
+// (d) 镜像 phase=loading：会话其实活着，只是镜像没追上 ⇒ 不许新建（D10 幂等）
+let phaseReads = 0
+await useHost({
+  ui: true, legacy: false,
+  snapshot: () => {
+    phaseReads++
+    // 前两次读还是 loading 且看不到会话，第三次起镜像追上
+    if (phaseReads < 3) return { byId: {}, phase: 'loading' }
+    return { byId: { 'session-g': {}, 'session-c1': {} }, phase: 'ready' }
+  },
+  onRefresh: async () => {}
+}, [researchRow])
+phaseReads = 0
+await click(await openBtn('尚未派发'), 'open session while mirror loading')
+assert.deepEqual(wsCalls, [], '镜像未就绪时不该判定为「会话已销毁」去重连工作区：' + JSON.stringify(wsCalls))
+assert.ok(!rpc.some((c) => c[0] === 'record' && c[1].goalId === 'goal-never'), '镜像未就绪时不该新建并回写 sessionId')
+assert.deepEqual(opened, ['ui-open:session-g'], '应复用已记录的目标会话')
+ok('phase 感知：镜像 loading 不误判为已销毁，等到 ready 后复用原会话')
+
+// 复位成基线形状，后面的用例沿用旧有假设
+await useHost({ ui: false, legacy: true }, [goalRow])
+sessionsSvc.list.getSnapshot = origSnapshot
+sessionsSvc.create = origCreate
+sessionsSvc.open = origOpen
+ok('宿主形状复位，避免污染后续断言')
+
 // ── 空列表：提示文案与「＋ 添加学习目标」必须同时在场（回归：按钮曾被关在
 //    goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口）────────
 assert.ok(flat.some((e) => e.type === 'button' && e.props.className === 'stuiAdd'), '非空列表也应有「＋ 添加学习目标」')
