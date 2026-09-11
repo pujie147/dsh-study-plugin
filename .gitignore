@@ -1,6 +1,8 @@
 # 版本控制与编辑器/代理目录
 .git/
 .claude/
+# 本地 Claude Code 指引，刻意不入库（同样内容已在 docs/PROJECT.md §8 留档）
+CLAUDE.md
 
 # 依赖与构建产物
 node_modules/
