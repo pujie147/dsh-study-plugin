@@ -39,6 +39,13 @@ dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.gi
 - 数据根目录 = `~/.dsh/study-work`（自动创建）；更新：`dsh plugin --profile web update study-plugin`；卸载在「已安装」列表或 `dsh plugin --profile web remove study-plugin`。
 - 后续提供 npm 渠道后可直接 `dsh plugin --profile web add study-plugin`。
 
+### 发布通道的事实（2026-09-11 实测）
+- **发布 = 把本仓库 `master` 推上 GitHub + 打 tag**，不需要第二个仓。pnpm 对 git 依赖遵守 `files` 字段，实测落地只有 `lib/`、`cordis.patch.yml`、README、LICENSE、CHANGELOG、package.json —— `src/`、`test/`、`scripts/`、`docs/` 不进包。
+- 不带 committish 时 pnpm 解析**仓库默认分支**，当前为 `master`。所以「装了旧版」基本都是默认分支落后，先 `git push origin master`。
+- 不带 committish 会被 `pnpm-lock.yaml` 钉住首次解析的 commit：升级用 `dsh plugin --profile web update study-plugin`，或直接重跑 `add`。钉 `#v0.3.1` 则永久固定在该 tag，升级需 `remove` + 换新 tag `add`。
+- 无 `prepare` 脚本，pnpm 11 的 `allowBuilds` 与 `minimumReleaseAge` 两道策略拦不到它。
+- ⚠️ tag 必须打在扁平化（`3c2a562`）**之后**的 commit 上。打在之前的 commit 上，根 `package.json` 是旧脚手架（名字都不是 `study-plugin`），装出来没有 `dsh.bundle.patch`，DSH 只当普通依赖、面板永不装载。
+
 ## 本机开发安装（幂等脚本）
 ```powershell
 cd study-plugin
