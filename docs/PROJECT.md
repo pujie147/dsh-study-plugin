@@ -222,7 +222,10 @@ study-work/
 - RPC/工具返回值必须是无损 JSON（递归剔除 undefined）。
 - 修改 `src/host.js|client.js` 后执行 `npm run build && npm run install:dsh` 重新打包快照。
 - 改常驻版：`cd study-plugin && node scripts/build-client.mjs`（改过 `src/client.mjs` 必须重建 bundle）→ `node scripts/install-profile.mjs` → 重启 DSH。
-- 提交前跑全套：`cd study-plugin && npm test`（smoke 79 + portable 14 + client 19）与 `node scripts/cleanroom-check.mjs`（净室 tarball 探针）。
+- 提交前跑全套：`npm test` 与 `node scripts/cleanroom-check.mjs`（净室 tarball 探针）。
+- ⚠️ **`smoke` 与 `portable` 两套目前都是红的，同一个根因**：本机安装的宿主 `JsonlSessionPersistence` 只暴露 `locate/list/stat/append/create`，**没有 `inspect`**，而 `test/smoke.mjs:249`（崩前 25 条已过）与 `test/portable.test.mjs:220`（崩前 23 条已过，这一步是"换 id + 换 cwd 后宿主还认不认账"的验帧）都直接调它。生产侧 `lib/index.js` 用 `typeof pp.inspect === 'function'` 守卫，测试侧没有。这不是待修的插件缺陷，是**测试底座对宿主版本的要求高于安装包**——宿主补上 `inspect` 即自愈。
+- ⚠️ `npm test` = `smoke && portable && client` 串接，smoke 先非零退出 ⇒ **portable 与 client 根本不会执行**。别把 `npm test` 的红当成"只有 smoke 红"，逐套单跑确认：`node test/client.test.mjs`（当前 30 条全绿）/ `node test/portable.test.mjs` / `node test/smoke.mjs`。改客户端半后务必先 `node scripts/build-client.mjs`（测试加载的是 `lib/client.js` 产物）。
+
 - 动了 transcript 帧处理就跑 `node test/transcript-sweep.mjs`：它拿本机全部真实会话日志（本仓所在机器 108 个 / 59.3MB）验「切帧 / header 重写 / 逐行不变 / 帧数不变」，合成数据替代不了这一层。
 - 触碰宿主落盘格式（会话帧 / 附件 / 注册表）前先读 §5「可携化用到的宿主事实」，路径一律用 `sessionPersistence.locate()` 解析，不要复刻 projectKey/encodeSegment。
 - ⚠️ 未提交的工作在这个仓库被一次 IDE 回退吃掉过（2026-09-09 18:30，`git restore` 类操作不写 reflog）：**能验证过就立刻 commit**，别把成果只留在工作区。
