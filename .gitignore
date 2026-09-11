@@ -1,7 +1,13 @@
+# 版本控制与编辑器/代理目录
+.git/
+.claude/
+
+# 依赖与构建产物
 node_modules/
 dist/
 
-.mnemon/
+# 本地缓存与临时目录
 .npmcache/
+.mnemon/
 .publish/
 .tmp-*/

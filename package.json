@@ -1,12 +1,49 @@
 {
-  "name": "study-dsh-plugin",
-  "version": "1.0.0",
-  "description": "学习区（study-work）DSH 插件工程：学习目标管理面板 + 目标/章节独立会话 + 聊天管理工具。源码、打包与安装脚本、文档集中于此仓库。",
-  "private": true,
+  "name": "study-plugin",
+  "version": "0.3.0",
+  "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_*/study_goal_* 聊天工具 + 覆盖式幂等导出导入（zip 可携化，云同步前置）。",
   "type": "module",
-  "scripts": {
-    "build": "node scripts/build.mjs",
-    "install:dsh": "node scripts/install.mjs"
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
-  "license": "MIT"
+  "files": [
+    "lib/index.js",
+    "lib/portable.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "keywords": ["dsh", "dsh-plugin", "cordis", "study", "学习区", "学习规划"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node test/smoke.mjs && node test/portable.test.mjs && node test/client.test.mjs",
+    "sweep": "node test/transcript-sweep.mjs",
+    "cleanroom": "node scripts/cleanroom-check.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pujie147/dsh-study-plugin.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  }
 }
