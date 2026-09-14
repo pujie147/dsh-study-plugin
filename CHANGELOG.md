@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-09-14
+
+### fixed
+- **从另一台机器打开面板，全线报「study RPC HTTP 403」**（用户实机报告，症状是「创建失败: study RPC HTTP 403」）。根因是本插件自己的守卫，不是宿主：`/study-rpc` 与 `/study-export` 各有一处 `req.socket.remoteAddress` 与 `127.0.0.1 / ::1 / ::ffff:127.0.0.1` 三个字面量的硬比对，不相等即 403。而客户端用的是**相对路径** `fetch('/study-rpc')` —— 页面从哪台机器加载、请求就发给那台机器 ⇒ 只要面板不是本机打开，请求必然带远程 IP 进来，远程访问下**必然 403**。守卫在 `handlers['study.*']` 分发之前，所以 20 个 RPC 方法 + zip 下载一起被挡。现已删除（见下）。
+- 顺带排除宿主侧嫌疑：`@deepseek-ai/dsh-host-webserver` 的派发器不做任何来源/Origin/CORS 检查，宿主包里也没有会对插件 prefix 路由返回 403 的中间件；`src/client.mjs` 与 `study.listExports` 的 `downloadUrl` 全程相对路径，因此放开来源判定后不需要改客户端，`lib/client.js` 无 diff。
+
+### removed
+- **`/study-rpc`、`/study-export` 的 loopback 守卫**：本插件不再判断请求的 IP/端口。⚠️ **升级即放开这两条路由到其监听的全部网络**——局域网鉴权由宿主侧的独立插件承担（用户拍板，记 D25）。与来源无关的输入约束**全部保留**：POST-only(405)、1MB body 上限(413)、`/study-export` 的 `path.basename` 全等 + `.zip` 白名单（拒路径穿越，400/404 不变）。
+- 今后若再现「study RPC HTTP 403」，来源只可能是宿主侧鉴权插件或中间代理，不再是本插件；报错文案未改动（`src/client.mjs:39`）。
+
+### changed
+- `test/smoke.mjs`：两条原「非 loopback 被拒(403)」断言反向钉住新行为（`/study-rpc` 非回环来源 200 + `study.list` 正常返回、`/study-export` 非回环下载 200 且 zip 字节一致），成为局域网可达性的回归钉子；路径穿越 400、未知文件 404、GET→405 三条原样保留，用以证明只删了来源判定。
+- 版本号 `0.3.1` → `0.4.0`（删除访问控制属行为变更，非补丁）。
+- 文档同步：`README.md`、`docs/PROJECT.md`（路由表 + 新增决策记录 **D25「来源判定外移到宿主侧插件，本插件不判断 IP/端口」**，注明"别把这条删掉的判定当漏了的守卫加回来"）。
+
 ## [0.3.1] - 2026-09-11
 
 ### fixed

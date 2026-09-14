@@ -1,6 +1,6 @@
 // smoke.mjs — 宿主半运行时冒烟测试（纯 Node）
 // 运行: node study-plugin/test/smoke.mjs
-// 覆盖: 路由守卫(GET/loopback)、study.* 全链路(list→create→草案采纳→批准→讲义采纳→章节会话注入→删除)、
+// 覆盖: 路由守卫(GET；来源不判定 ⇒ 非回环必须可达)、study.* 全链路(list→create→草案采纳→批准→讲义采纳→章节会话注入→删除)、
 //       unknown method、M4 导出/导入、**M4.1 覆盖式同步语义**（身份重发/幂等/快进追加/回退需 force/
 //       归档继承防护/工作区投影自检/回滚不留空目录）。
 //
@@ -130,12 +130,12 @@ function callFile(url, opts = {}) {
   })
 }
 
-// ── 路由守卫 ─────────────────────────────────────────────────────────────────
+// ── 路由守卫（只守方法与 body 大小，不守来源） ──────────────────────────────
 {
   const r = await callRpc('study.list', {}, { method: 'GET' })
   check('GET 被拒(405)', r.code === 405, r.code)
   const r2 = await callRpc('study.list', {}, { remote: '10.0.0.5' })
-  check('非 loopback 被拒(403)', r2.code === 403, r2.code)
+  check('非回环来源放行(局域网可达)', r2.code === 200 && r2.json && Array.isArray(r2.json.goals), r2.code)
   const r3 = await callRpc('study.nope', {})
   check('unknown method → {ok:false}', r3.json && r3.json.ok === false && /unknown method/.test(r3.json.error), r3.json)
 }
@@ -294,7 +294,8 @@ let exportedGoalId = ''
   const d1 = await callFile('/study-export?file=' + encodeURIComponent(exportedFile))
   check('下载 GET 200 + zip 字节一致', d1.code === 200 && Buffer.compare(d1.raw, zipBuf) === 0, d1.code)
   check('下载带 attachment 头', /attachment;/.test((d1.headers || {})['content-disposition'] || ''), d1.headers)
-  check('下载 loopback 守卫', (await callFile('/study-export?file=' + encodeURIComponent(exportedFile), { remote: '10.0.0.9' })).code === 403)
+  const dRemote = await callFile('/study-export?file=' + encodeURIComponent(exportedFile), { remote: '10.0.0.9' })
+  check('非回环来源可下载(局域网可达)', dRemote.code === 200 && Buffer.compare(dRemote.raw, zipBuf) === 0, dRemote.code)
   check('下载拒绝路径穿越', (await callFile('/study-export?file=..%2F..%2Fetc%2Fpasswd.zip')).code === 400)
   check('下载 404 未知文件', (await callFile('/study-export?file=nope.zip')).code === 404)
 
