@@ -2,6 +2,12 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.1] - 2026-09-18
+
+### fixed
+- **一键设备码轮询端点纠正（v0.7.0 真机才暴露的坏路径）**：`syncPollDeviceFlow` 原先打 `POST {web}/login/oauth/device/poll` 换取令牌，但那是 **GitHub App** 的端点；对普通 **OAuth App** 的设备码流程，真 GitHub 会返回 **HTTP 422 + HTML 报错页**（面板显示「⚠ 设备码轮询 失败: HTTP 422 — <!DOCTYPE html>…」）。改为文档规定的正确端点 **`POST {web}/login/oauth/access_token` 带 `grant_type=urn:ietf:params:oauth:grant-type:device_code`**，返回规范 JSON（`authorization_pending` / `access_token`）。顺带把 `slow_down`（轮询过快）也当正常中间态继续等，不误报失败。
+- **根因**：mock GitHub server 照抄了代码里的同一错端点，所以 `sync.test` 一直全绿 ⇒ 只有真机一键才暴露。已在 mock 里复刻真端点语义（缺 `grant_type` 即返回 HTML 422），并加回归断言「轮询必走 access_token + device_code grant_type、绝不再打 device/poll」。`sync.test` 77→**78** / `client.test` **39** 全绿。
+
 ## [0.7.0] - 2026-09-18
 
 ### added

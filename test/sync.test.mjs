@@ -45,16 +45,24 @@ function makeGithubMock() {
     state.requests.push(req.method + ' ' + p)
     const repoOf = (owner, name) => state.repos.get(owner + '/' + name)
     try {
-      if (!login && p !== '/login/device/code' && p !== '/login/oauth/device/poll') return send(401, { message: 'Bad credentials' })
+      if (!login && p !== '/login/device/code' && p !== '/login/oauth/access_token') return send(401, { message: 'Bad credentials' })
       if (req.method === 'GET' && p === '/user') return send(200, { login, id: 7 })
       if (req.method === 'POST' && p === '/login/device/code') {
         state.deviceCodes = true
         return send(200, { device_code: 'dc-1', user_code: 'MOCKCODE', verification_uri: 'http://127.0.0.1/login/device', expires_in: 900, interval: 1 })
       }
-      if (req.method === 'POST' && p === '/login/oauth/device/poll') {
+      if (req.method === 'POST' && p === '/login/oauth/access_token') {
+        // OAuth App 设备码换令牌的正确端点：必须带 device_code 的 grant_type；缺了就复刻真 GitHub 的 HTML 422
+        const form = new URLSearchParams(body)
+        if (form.get('grant_type') !== 'urn:ietf:params:oauth:grant-type:device_code') {
+          res.writeHead(422, { 'content-type': 'text/html; charset=utf-8' })   // 复刻真 GitHub 的 HTML 422（旧端点的症状）
+          return res.end('<!DOCTYPE html><html><head><title>Oh no.</title></head><body>Not Found</body></html>')
+        }
+        state.lastDeviceGrant = form.get('grant_type')
         const nxt = state.pollScript.shift()
         if (nxt === undefined) return send(200, { error: 'unsupported_grant_type' })
         if (nxt === 'pending') return send(200, { error: 'authorization_pending' })
+        if (nxt === 'slow_down') return send(400, { error: 'slow_down' })
         if (nxt === 'denied') return send(400, { error: 'access_denied' })
         return send(200, nxt)
       }
@@ -259,6 +267,9 @@ console.log('\n══ 3. 设备码绑定（B 设备）══')
   check('未授权时轮询返回 pending（不误报失败）', p1.ok === true && p1.status === 'pending', p1)
   const p2 = await B.call('study.syncPollDeviceFlow')
   check('授权后轮询即完成绑定', p2.ok === true && p2.status === 'authorized' && p2.bound === true, p2)
+  // 回归：设备码换令牌必须走正确端点 /login/oauth/access_token + device_code grant_type，
+  // 绝不能再打 /login/oauth/device/poll（真 GitHub 对它会返 422 HTML ⇒ 一键绑定坏）。
+  check('轮询走 access_token 端点且带 device_code grant_type', mock.state.requests.some((r) => r === 'POST /login/oauth/access_token') && mock.state.lastDeviceGrant === 'urn:ietf:params:oauth:grant-type:device_code' && !mock.state.requests.some((r) => /device\/poll/.test(r)), { req: mock.state.requests.filter((r) => /login\/oauth/.test(r)), grant: mock.state.lastDeviceGrant })
   const cfg = await B.call('study.syncGetConfig')
   check('B 采用 A 建好的仓（认领标记通过）', cfg.config.repo && cfg.config.repo.fullName === 'tester/dsh-study-sync' && cfg.config.auth.kind === 'device', cfg)
   const orphan = await B.call('study.syncPollDeviceFlow')
