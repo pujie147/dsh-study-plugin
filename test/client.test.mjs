@@ -89,6 +89,7 @@ const handlers = {
   'study.reattachGoalSessions': (a) => { rpc.push(['reattach', a]); return { ok: true, workspaceId: 'ws-1', attached: 2, failed: [] } },
   // ── M5 GitHub 同步（可控返回，供同步面板用例驱动）──
   'study.syncGetConfig': (a) => { rpc.push(['syncGetConfig', a]); return syncCfg },
+  'study.syncSetConfig': (a) => { rpc.push(['syncSetConfig', a]); return { ok: true, config: Object.assign({}, syncCfg.config, a) } },
   'study.syncListRemote': (a) => { rpc.push(['syncListRemote', a]); return remoteGoals },
   'study.syncBindPat': (a) => { rpc.push(['syncBindPat', a]); return bindResult },
   'study.syncStartDeviceFlow': (a) => { rpc.push(['syncStartDeviceFlow', a]); return deviceStart },
@@ -549,8 +550,13 @@ assert.ok(btnText('设备码授权'), '缺少设备码授权入口')
 assert.ok(btnText('用 PAT 绑定'), '缺少 PAT 绑定入口')
 ok('同步面板未绑定态：设备码 + PAT 两条授权入口并列')
 
-// (2) 设备码：发起 → 显示 userCode → 轮询 pending（仍未绑定）→ 授权成功切到已就绪
+// (2) 设备码：先存 client_id → 发起 → 显示 userCode → 轮询 pending（仍未绑定）→ 授权成功切到已就绪
+const cidBox = findInput((p) => p.type !== 'password' && String(p.placeholder || '').indexOf('client_id') >= 0)
+assert.ok(cidBox, '未绑定态应有 client_id 输入框')
+await input(cidBox, 'Iv1.oauthclientid')
+tree = await renderAll()
 await click(btnText('设备码授权'), 'start device flow')
+assert.ok(rpc.some((c) => c[0] === 'syncSetConfig' && c[1].clientId === 'Iv1.oauthclientid'), '发起设备码前应先落盘 client_id')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncStartDeviceFlow'), '未发起设备码')
 assert.ok(bodyText().indexOf('ABCD-1234') >= 0, '未显示设备码 userCode')

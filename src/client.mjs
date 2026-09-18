@@ -95,6 +95,7 @@ function apply(ctx) {
     const [sync, setSync] = React.useState(null)          // study.syncGetConfig 结果
     const [remoteList, setRemoteList] = React.useState(null) // study.syncListRemote 结果
     const [patInput, setPatInput] = React.useState('')
+    const [clientIdInput, setClientIdInput] = React.useState('')
     const [devFlow, setDevFlow] = React.useState(null)     // { userCode, verificationUri, status }
     const [inspMap, setInspMap] = React.useState({})        // goalId → study.syncInspect 结果
     const [syncBusy, setSyncBusy] = React.useState(null)
@@ -459,7 +460,8 @@ function apply(ctx) {
     }
     const loadSync = async () => {
       const r = await call('study.syncGetConfig')
-      if (r && r.ok === true) { setSync(r); setSyncErr('') } else setSyncErr(String((r && r.error) || '读取同步配置失败'))
+      if (r && r.ok === true) { setSync(r); setSyncErr(''); setClientIdInput((v) => (v || ((r.config || {}).clientId || ''))) }
+      else setSyncErr(String((r && r.error) || '读取同步配置失败'))
     }
     const openSyncView = () => {
       const next = view === 'sync' ? 'list' : 'sync'
@@ -480,6 +482,13 @@ function apply(ctx) {
       else setSyncErr(String((r && r.error) || '绑定失败'))
     })
     const doStartDevice = () => withSyncBusy('dev', async () => {
+      const want = clientIdInput.trim()
+      const have = (sync && sync.config && sync.config.clientId) || ''
+      if (want && want !== have) {
+        const s = await call('study.syncSetConfig', { clientId: want })
+        if (!s || s.ok !== true) { setSyncErr(String((s && s.error) || '保存 client_id 失败')); return }
+        setSync(Object.assign({}, sync, { config: Object.assign({}, (sync && sync.config) || {}, { clientId: want }) }))
+      }
       const r = await call('study.syncStartDeviceFlow', {})
       if (r && r.ok === true) setDevFlow({ userCode: r.userCode, verificationUri: r.verificationUri, status: 'pending' })
       else setSyncErr(String((r && r.error) || '发起设备码失败'))
@@ -578,6 +587,7 @@ function apply(ctx) {
         ),
         (bs === 'unbound' || bs === 'account-only') && React.createElement('div', { className: 'stuiDetail' },
           React.createElement('div', { className: 'stuiDraftOv' }, '用 GitHub 账号绑定固定同步仓 dsh-study-sync。两种授权方式：设备码（OAuth，推荐）或直接粘贴 fine-grained PAT（仅 Contents 读写）。token 只存本机、绝不回显明文。'),
+          React.createElement('input', { className: 'stuiInput', value: clientIdInput, placeholder: 'GitHub OAuth App 的 client_id（设备码方式需要；见 README）', onChange: (e) => setClientIdInput(e.target.value) }),
           React.createElement('div', { className: 'stuiRow' },
             React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doStartDevice() }, syncBusy === 'dev' ? '申请中…' : '🔑 用 GitHub 设备码授权')
           ),
