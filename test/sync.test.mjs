@@ -248,6 +248,7 @@ console.log('\n══ 2. PAT 绑定：固定仓定位/创建 + 认领标记 + to
 
 console.log('\n══ 3. 设备码绑定（B 设备）══')
 {
+  await B.call('study.syncSetConfig', { clientId: '' })          // 内置默认非空，显式清掉才能测「缺 client_id」守卫
   const noId = await B.call('study.syncStartDeviceFlow')
   check('未配 client_id ⇒ 明确报缺失并提示 PAT 出路', noId.ok === false && /client_id/.test(noId.error || ''), noId)
   await B.call('study.syncSetConfig', { clientId: 'IvMock0001' })
