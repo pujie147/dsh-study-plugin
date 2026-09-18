@@ -86,8 +86,29 @@ const handlers = {
       workspaceId: 'ws-new', verified: true, restartNeeded: true, warnings: [],
     }
   },
-  'study.reattachGoalSessions': (a) => { rpc.push(['reattach', a]); return { ok: true, workspaceId: 'ws-1', attached: 2, failed: [] } }
+  'study.reattachGoalSessions': (a) => { rpc.push(['reattach', a]); return { ok: true, workspaceId: 'ws-1', attached: 2, failed: [] } },
+  // ── M5 GitHub 同步（可控返回，供同步面板用例驱动）──
+  'study.syncGetConfig': (a) => { rpc.push(['syncGetConfig', a]); return syncCfg },
+  'study.syncListRemote': (a) => { rpc.push(['syncListRemote', a]); return remoteGoals },
+  'study.syncBindPat': (a) => { rpc.push(['syncBindPat', a]); return bindResult },
+  'study.syncStartDeviceFlow': (a) => { rpc.push(['syncStartDeviceFlow', a]); return deviceStart },
+  'study.syncPollDeviceFlow': (a) => { rpc.push(['syncPollDeviceFlow', a]); return devicePoll },
+  'study.syncRebind': (a) => { rpc.push(['syncRebind', a]); return rebindResult },
+  'study.syncUnbind': (a) => { rpc.push(['syncUnbind', a]); return { ok: true, bound: false } },
+  'study.syncInspect': (a) => { rpc.push(['syncInspect', a]); return inspResults[a.goalId] || { ok: true, status: 'remoteMissing', goalId: a.goalId, remoteGoalId: a.goalId, local: {}, remote: null } },
+  'study.syncPush': (a) => { rpc.push(['syncPush', a]); return pushResult },
+  'study.syncPull': (a) => { rpc.push(['syncPull', a]); return pullResult }
 }
+// 同步面板的可控返回
+let syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
+let remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goals: [] }
+const inspResults = {}
+let pushResult = { ok: true, pushed: true }
+let pullResult = { ok: true, pulled: true }
+let bindResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••0101' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
+let rebindResult = { ok: true, bound: true, config: bindResult.config }
+let deviceStart = { ok: true, userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', interval: 5, expiresIn: 900 }
+let devicePoll = { ok: true, status: 'pending' }
 globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init.body)
   const fn = handlers[body.method]
@@ -508,5 +529,137 @@ await click(addBtn, 'add goal from empty state')
 tree = await renderAll()
 assert.ok(bodyText().indexOf('学习主题') >= 0 && bodyText().indexOf('✓ 创建并调研') >= 0, '空态点添加应进入创建表单')
 ok('空列表仍渲染「＋ 添加学习目标」，点击可进入创建表单')
+
+// ── M5 GitHub 同步面板：绑定 / 五态 / 冲突二选一 / 解绑 / token 不回显 ─────────────
+const hdrBtn = (title) => flat.find((e) => e.type === 'button' && e.props.title === title)
+const btnText = (frag) => flat.find((e) => e.type === 'button' && textOf(e).indexOf(frag) >= 0)
+const findInput = (pred) => flat.find((e) => e.type === 'input' && pred(e.props || {}))
+
+rpc.length = 0
+listGoals = [goalRow]
+await click(hdrBtn('刷新'), 'refresh before sync')
+tree = await renderAll()
+// (1) 未绑定态：设备码 + PAT 两条入口都在
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
+await click(hdrBtn('GitHub 同步'), 'open sync view')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncGetConfig'), '进入同步面板应先读配置')
+assert.ok(bodyText().indexOf('未绑定') >= 0, '未绑定态文案缺失')
+assert.ok(btnText('设备码授权'), '缺少设备码授权入口')
+assert.ok(btnText('用 PAT 绑定'), '缺少 PAT 绑定入口')
+ok('同步面板未绑定态：设备码 + PAT 两条授权入口并列')
+
+// (2) 设备码：发起 → 显示 userCode → 轮询 pending（仍未绑定）→ 授权成功切到已就绪
+await click(btnText('设备码授权'), 'start device flow')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncStartDeviceFlow'), '未发起设备码')
+assert.ok(bodyText().indexOf('ABCD-1234') >= 0, '未显示设备码 userCode')
+devicePoll = { ok: true, status: 'pending' }
+await click(btnText('我已在浏览器授权'), 'poll pending')
+tree = await renderAll()
+assert.ok(rpc.filter((c) => c[0] === 'syncPollDeviceFlow').length >= 1, '未轮询设备码')
+assert.ok(bodyText().indexOf('绑定状态：未绑定') >= 0, 'pending 时不应显示已绑定')
+// 授权成功：面板刷新配置为 ready
+devicePoll = { ok: true, status: 'authorized', bound: true, config: bindResult.config }
+syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, config: bindResult.config }
+await click(btnText('我已在浏览器授权'), 'poll authorized')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('已就绪') >= 0, '授权成功后应显示已就绪')
+assert.ok(!btnText('设备码授权'), '已绑定后不应再有授权入口')
+ok('设备码流程：发起→轮询 pending→授权成功切到已绑定')
+
+// (3) 已绑定：列远端目标 + 检查本机状态 + 推送 localAhead
+remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goals: [{ remoteGoalId: 'goal-demo', title: '软件设计', bytes: 152043, exportedAt: '2026-09-10T02:00:00.000Z' }] }
+inspResults['goal-demo'] = { ok: true, status: 'localAhead', goalId: 'goal-demo', remoteGoalId: 'goal-demo', local: { exportedAt: '2026-09-11T00:00:00.000Z' }, remote: { exportedAt: '2026-09-10T02:00:00.000Z', deviceId: 'dev-x', bytes: 152043 } }
+await click(btnText('☁ 列出仓库里的目标'), 'list remote')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncListRemote'), '未列远端目标')
+assert.ok(bodyText().indexOf('tester/dsh-study-sync') >= 0, '未显示仓库名')
+await click(btnText('检查本机目标同步状态'), 'inspect all')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncInspect' && c[1].goalId === 'goal-demo'), '未对本机目标做 syncInspect')
+assert.ok(bodyText().indexOf('⬆ 本地待推') >= 0, 'localAhead 状态 chip 缺失')
+rpc.length = 0
+pushResult = { ok: true, pushed: true }
+await click(btnText('⬆ 推送到仓库'), 'push')
+tree = await renderAll()
+const pushCall = rpc.filter((c) => c[0] === 'syncPush').map((c) => c[1]).pop()
+assert.deepEqual(pushCall, { goalId: 'goal-demo' }, '普通推送不应带 force')
+ok('已绑定：远端列表 + 本机 localAhead → 推送（普通 push 不带 force）')
+
+// (4) 真分叉：亮出远端时间/设备/体积 + 二选一（覆盖仓库=force push / 放弃本地=discard pull）
+inspResults['goal-demo'] = { ok: true, status: 'conflicted', goalId: 'goal-demo', remoteGoalId: 'goal-demo', local: { exportedAt: '2026-09-11T09:00:00.000Z' }, remote: { exportedAt: '2026-09-10T02:00:00.000Z', deviceId: 'dev-remote', bytes: 152043 } }
+await click(btnText('检查本机目标同步状态'), 'inspect conflict')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('真分叉') >= 0, '冲突 chip 缺失')
+assert.ok(bodyText().indexOf('dev-remote') >= 0, '冲突未亮出远端设备')
+assert.ok(bodyText().indexOf('148.5 KB') >= 0, '冲突未亮出远端体积')
+assert.ok(btnText('覆盖仓库') && btnText('放弃本地'), '冲突缺少二选一按钮')
+rpc.length = 0
+pushResult = { ok: true, pushed: true }
+await click(btnText('覆盖仓库'), 'overwrite repo')
+assert.ok(rpc.some((c) => c[0] === 'syncPush' && c[1].force === true), '「覆盖仓库」必须 force=true')
+rpc.length = 0
+pullResult = { ok: true, pulled: true }
+await click(btnText('放弃本地'), 'discard local')
+const discardPull = rpc.filter((c) => c[0] === 'syncPull').map((c) => c[1]).pop()
+assert.deepEqual(discardPull, { remoteGoalId: 'goal-demo', discardLocal: true }, '「放弃本地」= discardLocal 拉取')
+ok('真分叉：亮远端时间/设备/体积 ⇒ 覆盖仓库(force push) / 放弃本地(discard pull) 各如其分')
+
+// (5) remoteAhead：普通拉取不带 discardLocal
+inspResults['goal-demo'] = { ok: true, status: 'remoteAhead', goalId: 'goal-demo', remoteGoalId: 'goal-demo', local: {}, remote: { exportedAt: '2026-09-12T00:00:00.000Z', deviceId: 'dev-r', bytes: 1000 } }
+await click(btnText('检查本机目标同步状态'), 'inspect remoteAhead')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('⬇ 远端待拉') >= 0, 'remoteAhead chip 缺失')
+rpc.length = 0
+pullResult = { ok: true, pulled: true }
+await click(btnText('⬇ 拉取到本地'), 'plain pull')
+const plainPull = rpc.filter((c) => c[0] === 'syncPull').map((c) => c[1]).pop()
+assert.equal(plainPull.discardLocal, undefined, 'remoteAhead 快进拉取不应带 discardLocal')
+ok('remoteAhead：普通「⬇ 拉取到本地」不带 discardLocal')
+
+// (6) invalid → 重绑
+syncCfg = { ok: true, bound: false, bindState: 'invalid', fetch: true, config: bindResult.config }
+rebindResult = { ok: true, bound: true, config: bindResult.config }
+await click(btnText('⟳ 刷新'), 'reload cfg invalid')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('凭据已失效') >= 0, 'invalid 态文案缺失')
+rpc.length = 0
+await click(btnText('重新绑定'), 'rebind')
+assert.ok(rpc.some((c) => c[0] === 'syncRebind'), '未触发 syncRebind')
+ok('invalid 态：给出「重新绑定（复用已存凭据）」入口并调用 syncRebind')
+
+// (7) 解绑回到未绑定 → PAT 重新绑定；token 明文绝不回显
+syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, config: bindResult.config }
+await click(btnText('⟳ 刷新'), 'back to bound')
+tree = await renderAll()
+assert.ok(btnText('解绑（只清本机）'), '已就绪态应有解绑按钮')
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
+rpc.length = 0
+await click(btnText('解绑（只清本机）'), 'unbind')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncUnbind'), '未触发 syncUnbind')
+assert.ok(bodyText().indexOf('未绑定') >= 0, '解绑后应回到未绑定')
+const patBox = findInput((p) => p.type === 'password')
+assert.ok(patBox, '未绑定态应有 PAT 输入框')
+await input(patBox, 'github_pat_SUPERSECRET_123456')
+tree = await renderAll()
+bindResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••3456' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
+syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, config: bindResult.config }
+await click(btnText('用 PAT 绑定'), 'bind pat')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncBindPat' && c[1].token === 'github_pat_SUPERSECRET_123456'), 'PAT 绑定参数不对')
+assert.ok(bodyText().indexOf('已就绪') >= 0, 'PAT 绑定后应显示已就绪')
+assert.ok(bodyText().indexOf('github_pat_SUPERSECRET_123456') < 0, '红线：token 明文不得出现在面板')
+assert.ok(bodyText().indexOf('••••3456') >= 0, '应只显示 tokenHint 末四位')
+ok('解绑→PAT 重绑成功；token 明文不出现在界面，只显示 ••••末四位')
+
+// (8) 无 fetch 降级：只报同步不可用，不抛
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: false, config: {} }
+await click(btnText('⟳ 刷新'), 'reload cfg nofetch')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('无 fetch') >= 0, '无 fetch 应给出降级提示')
+assert.ok(btnText('设备码授权').props.disabled === true, '无 fetch 时授权按钮应禁用')
+ok('宿主无 fetch：面板降级提示同步不可用，授权按钮禁用而非抛错')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')
