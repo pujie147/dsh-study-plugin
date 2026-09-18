@@ -659,7 +659,8 @@ function apply(ctx) {
               (remoteList.goals || []).map((rg) => React.createElement('div', { key: rg.remoteGoalId, className: 'stuiChRow' },
                 React.createElement('span', { className: 'stuiChTitle', title: rg.title || rg.remoteGoalId }, (rg.title || rg.remoteGoalId)),
                 React.createElement('span', { className: 'stuiChip' }, fmtBytes(rg.bytes || 0)),
-                React.createElement('span', { className: 'stuiMeta' }, rg.exportedAt || '')
+                React.createElement('span', { className: 'stuiMeta' }, rg.exportedAt || ''),
+                React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doSyncPull(rg.remoteGoalId, false) }, syncBusy === 'pull:' + rg.remoteGoalId ? '拉取中…' : '⬇ 拉取到本地')
               ))
           ),
           goals.length === 0 ? React.createElement('div', { className: 'stuiEmpty' }, '本机还没有学习目标') :

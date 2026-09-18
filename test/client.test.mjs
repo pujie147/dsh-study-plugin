@@ -598,6 +598,14 @@ await click(btnText('☁ 列出仓库里的目标'), 'list remote')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncListRemote'), '未列远端目标')
 assert.ok(bodyText().indexOf('tester/dsh-study-sync') >= 0, '未显示仓库名')
+// 远端每一行都要能直接「拉取到本地」——本机还没有该目标时的首次落地入口（旧版缺此按钮 = 空机无法拉取）
+rpc.length = 0
+assert.ok(btnText('⬇ 拉取到本地'), '远端目标行应有「⬇ 拉取到本地」按钮（本机无该目标时可首次拉取）')
+pullResult = { ok: true, pulled: true, goalId: 'goal-demo' }
+await click(btnText('⬇ 拉取到本地'), 'remote-row pull')
+const remoteRowPull = rpc.filter((c) => c[0] === 'syncPull').map((c) => c[1]).pop()
+assert.deepEqual(remoteRowPull, { remoteGoalId: 'goal-demo' }, '远端行拉取应按 remoteGoalId 且不带 discardLocal')
+ok('远端目标行：首次「拉取到本地」走 syncPull{remoteGoalId}（不带 discardLocal）')
 await click(btnText('检查本机目标同步状态'), 'inspect all')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncInspect' && c[1].goalId === 'goal-demo'), '未对本机目标做 syncInspect')
