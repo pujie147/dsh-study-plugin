@@ -95,6 +95,7 @@ const handlers = {
   'study.syncStartDeviceFlow': (a) => { rpc.push(['syncStartDeviceFlow', a]); return deviceStart },
   'study.syncPollDeviceFlow': (a) => { rpc.push(['syncPollDeviceFlow', a]); return devicePoll },
   'study.syncRebind': (a) => { rpc.push(['syncRebind', a]); return rebindResult },
+  'study.syncTakeOver': (a) => { rpc.push(['syncTakeOver', a]); return takeOverResult },
   'study.syncUnbind': (a) => { rpc.push(['syncUnbind', a]); return { ok: true, bound: false } },
   'study.syncInspect': (a) => { rpc.push(['syncInspect', a]); return inspResults[a.goalId] || { ok: true, status: 'remoteMissing', goalId: a.goalId, remoteGoalId: a.goalId, local: {}, remote: null } },
   'study.syncPush': (a) => { rpc.push(['syncPush', a]); return pushResult },
@@ -108,6 +109,7 @@ let pushResult = { ok: true, pushed: true }
 let pullResult = { ok: true, pulled: true }
 let bindResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••0101' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
 let rebindResult = { ok: true, bound: true, config: bindResult.config }
+let takeOverResult = { ok: true, bound: true, config: bindResult.config }
 let deviceStart = { ok: true, userCode: 'ABCD-1234', verificationUri: 'https://github.com/login/device', interval: 5, expiresIn: 900 }
 let devicePoll = { ok: true, status: 'pending' }
 globalThis.fetch = async (url, init) => {
@@ -659,6 +661,41 @@ assert.ok(bodyText().indexOf('已就绪') >= 0, 'PAT 绑定后应显示已就绪
 assert.ok(bodyText().indexOf('github_pat_SUPERSECRET_123456') < 0, '红线：token 明文不得出现在面板')
 assert.ok(bodyText().indexOf('••••3456') >= 0, '应只显示 tokenHint 末四位')
 ok('解绑→PAT 重绑成功；token 明文不出现在界面，只显示 ••••末四位')
+
+// (7b) 固定仓已被本账号占用：不硬拒，面板给「接管 / 放弃」两路（token 只存本机、不明文回显）
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
+await click(btnText('⟳ 刷新'), 'reload unbound for takeover')
+tree = await renderAll()
+rpc.length = 0
+const patBox2 = findInput((p) => p.type === 'password')
+assert.ok(patBox2, '占用场景起点应是未绑定 + PAT 输入框')
+await input(patBox2, 'github_pat_OCCUPIED_9999')
+tree = await renderAll()
+bindResult = { ok: false, needTakeOver: true, bound: false, bindState: 'account-only', error: '账号 tester 下 dsh-study-sync 已存在，但已有内容没有学习区的认领标记。确认这是你自己的仓库后可接管……' }
+syncCfg = { ok: true, bound: false, bindState: 'account-only', fetch: true, config: { auth: { account: 'tester', tokenHint: '••••9999' } } }
+await click(btnText('用 PAT 绑定'), 'bind occupied')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncBindPat'), '占用态应先发起 PAT 绑定')
+const tkBtn = btnText('接管这个已有仓库')
+assert.ok(tkBtn, 'account-only 应给出「接管这个已有仓库」入口')
+assert.ok(bodyText().indexOf('认领标记') >= 0, '占用应显示认领标记相关说明')
+assert.ok(bodyText().indexOf('github_pat_OCCUPIED_9999') < 0, '红线：占用态也不回显 token 明文')
+takeOverResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••9999' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
+syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, config: takeOverResult.config }
+await click(tkBtn, 'take over')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncTakeOver'), '点接管应调用 study.syncTakeOver')
+assert.ok(bodyText().indexOf('已就绪') >= 0 && bodyText().indexOf('tester/dsh-study-sync') >= 0, '接管后应显示已就绪 + 仓库')
+// 放弃 = 清提示并只清本机（换账号/先改名的出路）
+syncCfg = { ok: true, bound: false, bindState: 'account-only', fetch: true, config: { auth: { account: 'tester', tokenHint: '••••9999' } } }
+await click(btnText('⟳ 刷新'), 'reload account-only for cancel')
+tree = await renderAll()
+const cancelBtn = btnText('放弃')
+assert.ok(cancelBtn, 'account-only 也应给「放弃」出口')
+await click(cancelBtn, 'cancel takeover')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'syncUnbind'), '放弃应触发解绑（只清本机）')
+ok('固定仓被本账号占用：面板给「接管/放弃」两路，接管复用已存 token 且不明文回显')
 
 // (8) 无 fetch 降级：只报同步不可用，不抛
 syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: false, config: {} }

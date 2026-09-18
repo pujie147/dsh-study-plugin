@@ -19,8 +19,8 @@
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
 node test/smoke.mjs                 # 宿主半运行时冒烟（101 断言，跑在宿主真实 persistence + registry 上）
-node test/sync.test.mjs             # GitHub 同步宿主半（70 断言，内存 mock GitHub server + 真宿主夹具，双设备）
-npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(38，桩 React 真实渲染点击，含 8 条同步面板) + sync(70，GitHub 同步)
+node test/sync.test.mjs             # GitHub 同步宿主半（73 断言，内存 mock GitHub server + 真宿主夹具，双设备）
+npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(39，桩 React 真实渲染点击，含 9 条同步面板) + sync(73，GitHub 同步)
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
@@ -70,7 +70,7 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - **真分叉不自动合并**：本地与仓库各自都改过时，面板亮出**仓库最新更新时间 / 设备 / 体积**，
   让你二选一——**「🔼 覆盖仓库」**（用本地 force push，仓库那份丢失）或**「🔽 放弃本地」**
   （拉仓库版落地，但不删你本地多出的独占文件）。程序绝不替你吃掉任一侧。
-- **误写他人同名仓被拒**：账号下已有的 `dsh-study-sync` 若没有本插件的认领标记，绑定会拒绝写入并要求改名/换账号。
+- **对他人同名仓绝不静默下手**：账号下已有的 `dsh-study-sync` 若没有本插件的认领标记，绑定**不会自动写入**，而是提示你**明示「接管」**——接管只补写那一个认领标记文件、此后只往 `study-goals/` 前缀同步，**不删除该仓任何已有内容**；不想接管就「放弃」，去给那个仓改名或换一个账号。（红线不变：接管必须是本人确认。）
 
 打开面板点顶栏 **☁ GitHub 同步** 进入。设计细节见 [docs/design/github-sync.md](./docs/design/github-sync.md)。
 

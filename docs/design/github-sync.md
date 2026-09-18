@@ -26,8 +26,7 @@ dsh-study-sync/
 
 - **认领标记是拒绝误写的唯一依据**（红线）。绑定/重绑时读 `.study-sync-owner.json`：
   - 无此仓 ⇒ 建私有仓 + 写标记；
-  - 有仓**有**内容但**无标记** ⇒ 判定"这不是本插件的同步仓"，**拒绝写入且不落绑定**，要求用户改名或换账号；
-  - 标记 `kind` 被改坏 ⇒ 同样拒绝。
+  - 有仓**有**内容但**无标记**（或标记 `kind` 被改坏）⇒ **绝不静默写入**：抛结构化 `repoOccupied`（`needTakeOver:true`）、保留 token 到 `account-only` 态，由用户在面板明示「接管」（`study.syncTakeOver`）——接管只补写/替换**那一个标记文件**（PUT 带 sha），此后只往 `study-goals/` 前缀写，**不删该仓任何已有内容**；不想接管就"放弃"（只清本机，去改名或换账号）。
 - **meta 最后推 = 提交点**：zip 先、meta 后。读方只认 meta，看不到"zip 已换、meta 仍旧"的半状态。
 - 每次 push 在 meta 里记 `digest / exportedAt / deviceId / zipBytes / zipSha256 / zipBlobSha / sessions[]`，
   供冲突判定与展示。
@@ -39,7 +38,7 @@ dsh-study-sync/
 | bindState | 含义 | 面板出口 |
 |---|---|---|
 | `unbound` | 无凭据 | 设备码授权 / 粘贴 PAT 两条入口 |
-| `account-only` | 已识别账号但未定位到仓 | 继续绑定流程 |
+| `account-only` | 已识别账号、token 已留，但固定仓未定位成功（多为被本账号自己占用） | 「接管这个已有仓库」`syncTakeOver` / 「放弃」改名或换账号；也可继续用另一凭据绑定 |
 | `ready` | 凭据 + 仓库指向齐全 | 列远端、逐目标同步 |
 | `invalid` | 凭据曾有效但被远端撤销（401 过） | 「重新绑定（复用已存凭据）」`syncRebind` |
 

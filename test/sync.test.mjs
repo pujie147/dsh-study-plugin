@@ -384,21 +384,29 @@ console.log('\n══ 8. CAS 与并发语义（直打 mock 校验 sha 前置条�
   check('force push 修复回 upToDate', fix.ok === true && (fix.pushed === true || fix.noop === true), fix)
 }
 
-console.log('\n══ 9. 固定仓名的占用与竞态 ══')
+console.log('\n══ 9. 固定仓名的占用、受控接管与竞态 ══')
 {
   const C = await makeDevice('C')
   await C.call('study.syncSetConfig', { apiBase: base, webBase: base })
-  // 占用：同名仓、有内容、无认领标记（用独立账号 ghost，避免踩坏 A 的 tester 仓）
-  mock.state.repos.set('ghost/dsh-study-sync', { id: 999, default_branch: 'main', files: new Map([['README.md', Buffer.from('# 别人的仓')]]) })
   mock.state.tokens.set('github_pat_mockCCCtester03', 'ghost')
+  // 占用：同名仓、有内容、无认领标记（用独立账号 ghost，避免踩坏 A 的 tester 仓）
+  const ghostFiles = () => mock.state.repos.get('ghost/dsh-study-sync').files
+  mock.state.repos.set('ghost/dsh-study-sync', { id: 999, default_branch: 'main', files: new Map([['README.md', Buffer.from('# 别人的仓')]]) })
   const occ = await C.call('study.syncBindPat', { token: 'github_pat_mockCCCtester03' })
-  check('同名非学习区仓 ⇒ 拒绝写入且不落绑定', occ.ok === false && /不是|没有.*认领标记/.test(occ.error || ''), occ)
-  check('拒绝后本机仍未绑定（旧配置不被污染）', (await C.call('study.syncGetConfig')).bound === false, null)
-  // 标记不符（kind 被人改）也算占用
-  mock.state.repos.set('ghost/dsh-study-sync', { id: 998, default_branch: 'main', files: new Map([['.study-sync-owner.json', Buffer.from(JSON.stringify({ kind: 'someone-else' }))]]) })
+  check('同名非学习区仓 ⇒ 不硬拒，给 needTakeOver 且不落绑定', occ.ok === false && occ.needTakeOver === true && occ.bound === false && /认领标记/.test(occ.error || ''), occ)
+  check('占用后本机是 account-only（token 已留，供接管复用）', (await C.call('study.syncGetConfig')).bindState === 'account-only', null)
+  const to1 = await C.call('study.syncTakeOver')
+  check('明示接管 ⇒ 补写标记并绑定就绪', to1.ok === true && to1.bound === true, to1)
+  check('接管只补标记、绝不删已有内容（README 仍在 + 标记 kind 正确）', ghostFiles().has('README.md') && JSON.parse(ghostFiles().get('.study-sync-owner.json').toString('utf8')).kind === 'dsh-study-sync', null)
+  // 标记不符（kind 被人改）也算占用；接管只替换那一个标记文件
+  await C.call('study.syncUnbind')
+  mock.state.repos.set('ghost/dsh-study-sync', { id: 998, default_branch: 'main', files: new Map([['README.md', Buffer.from('# keep')], ['.study-sync-owner.json', Buffer.from(JSON.stringify({ kind: 'someone-else' }))]]) })
   const bad1 = await C.call('study.syncBindPat', { token: 'github_pat_mockCCCtester03' })
-  check('认领标记 kind 不符 ⇒ 同样拒绝', bad1.ok === false && /认领标记不符/.test(bad1.error || ''), bad1)
+  check('认领标记 kind 不符 ⇒ 同样 needTakeOver', bad1.ok === false && bad1.needTakeOver === true && /认领标记/.test(bad1.error || ''), bad1)
+  const to2 = await C.call('study.syncTakeOver')
+  check('不符态接管成功且只替换标记（README 保留）', to2.ok === true && ghostFiles().has('README.md') && JSON.parse(ghostFiles().get('.study-sync-owner.json').toString('utf8')).kind === 'dsh-study-sync', to2)
   // 422 竞态：两设备同时首建 ⇒ 输家采用赢家
+  await C.call('study.syncUnbind')
   mock.state.repos.delete('ghost/dsh-study-sync')
   mock.state.createRace422 = true
   const race = await C.call('study.syncBindPat', { token: 'github_pat_mockCCCtester03' })

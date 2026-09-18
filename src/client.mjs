@@ -100,6 +100,7 @@ function apply(ctx) {
     const [inspMap, setInspMap] = React.useState({})        // goalId → study.syncInspect 结果
     const [syncBusy, setSyncBusy] = React.useState(null)
     const [syncErr, setSyncErr] = React.useState('')
+    const [takeOverHint, setTakeOverHint] = React.useState('')   // 绑定命中「固定仓已被本账号占用」时的提示文案
     const [anchor, setAnchor] = React.useState(undefined)
     const [open, setOpen] = React.useState(ui.open)
     const rootRef = React.useRef(null)
@@ -466,7 +467,7 @@ function apply(ctx) {
     const openSyncView = () => {
       const next = view === 'sync' ? 'list' : 'sync'
       setView(next)
-      if (next === 'sync') { loadSync(); setInspMap({}) }
+      if (next === 'sync') { loadSync(); setInspMap({}); setTakeOverHint('') }
     }
     const loadRemote = async () => {
       const r = await withSyncBusy('remote', () => call('study.syncListRemote', {}))
@@ -478,7 +479,8 @@ function apply(ctx) {
       const token = patInput.trim()
       if (!token) { setSyncErr('先粘贴 GitHub token'); return }
       const r = await call('study.syncBindPat', { token: token })
-      if (r && r.ok === true) { setPatInput(''); setSync(r); setSyncErr(''); await loadRemote() }
+      if (r && r.ok === true) { setPatInput(''); setTakeOverHint(''); setSync(r); setSyncErr(''); await loadRemote() }
+      else if (r && r.needTakeOver) { setTakeOverHint(String(r.error || '')); setSyncErr(''); await loadSync() }
       else setSyncErr(String((r && r.error) || '绑定失败'))
     })
     const doStartDevice = () => withSyncBusy('dev', async () => {
@@ -495,9 +497,15 @@ function apply(ctx) {
     })
     const doPollDevice = () => withSyncBusy('devpoll', async () => {
       const r = await call('study.syncPollDeviceFlow', {})
+      if (r && r.needTakeOver) { setDevFlow(null); setTakeOverHint(String(r.error || '')); setSyncErr(''); await loadSync(); return }
       if (!r || r.ok !== true) { setSyncErr(String((r && r.error) || '轮询失败')); if (r && r.error) setDevFlow(null); return }
       if (r.status === 'pending') { setDevFlow((d) => (d ? Object.assign({}, d, { status: 'pending' }) : d)); return }
-      if (r.status === 'authorized') { setDevFlow(null); setSync(Object.assign({}, sync, { bound: true, bindState: 'ready', config: r.config })); await loadSync(); await loadRemote() }
+      if (r.status === 'authorized') { setDevFlow(null); setTakeOverHint(''); setSync(Object.assign({}, sync, { bound: true, bindState: 'ready', config: r.config })); await loadSync(); await loadRemote() }
+    })
+    const doTakeOver = () => withSyncBusy('takeover', async () => {
+      const r = await call('study.syncTakeOver', {})
+      if (r && r.ok === true) { setTakeOverHint(''); setSyncErr(''); await loadSync(); await loadRemote() }
+      else setSyncErr(String((r && r.error) || '接管失败'))
     })
     const doRebind = () => withSyncBusy('rebind', async () => {
       const r = await call('study.syncRebind', {})
@@ -584,6 +592,13 @@ function apply(ctx) {
         React.createElement('div', { className: 'stuiMeta' }, '绑定状态：' + (BIND_LABEL[bs] || bs) + (cfg.repo && cfg.repo.fullName ? ' · 仓库 ' + cfg.repo.fullName : '') + (cfg.auth && cfg.auth.account ? ' · 账号 ' + cfg.auth.account : '') + (cfg.auth && cfg.auth.tokenHint ? ' · token ' + cfg.auth.tokenHint : '')),
         bs === 'invalid' && React.createElement('div', { className: 'stuiRow' },
           React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doRebind() }, syncBusy === 'rebind' ? '重绑中…' : '🔗 重新绑定（复用已存凭据）')
+        ),
+        bs === 'account-only' && React.createElement('div', { className: 'stuiDetail' },
+          React.createElement('div', { className: 'stuiDraftOv' }, takeOverHint || ('已授权账号' + (cfg.auth && cfg.auth.account ? ' ' + cfg.auth.account : '') + '，但固定同步仓 dsh-study-sync 尚未定位成功。若它已在你的账号下存在且没有学习区的认领标记，可在下方明示「接管」——本插件只会补写认领标记并在 study-goals/ 前缀下同步，绝不删除该仓现有的任何内容。')),
+          React.createElement('div', { className: 'stuiRow' },
+            React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doTakeOver() }, syncBusy === 'takeover' ? '接管中…' : '✅ 接管这个已有仓库（只补标记，不删内容）'),
+            React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null, onClick: () => { setTakeOverHint(''); doUnbind() } }, '↩ 放弃（换账号或先给那个仓改名）')
+          )
         ),
         (bs === 'unbound' || bs === 'account-only') && React.createElement('div', { className: 'stuiDetail' },
           React.createElement('div', { className: 'stuiDraftOv' }, '用 GitHub 账号绑定固定同步仓 dsh-study-sync。两种授权方式：设备码（OAuth，推荐）或直接粘贴 fine-grained PAT（仅 Contents 读写）。token 只存本机、绝不回显明文。'),

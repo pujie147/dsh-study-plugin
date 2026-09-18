@@ -2,6 +2,14 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-09-18
+
+### changed
+- **固定仓被本账号自己占用时不再硬拒，改为明示「接管」**（D28 修订）。0.5.0 遇 `dsh-study-sync` 已存在且无有效认领标记（或 `kind` 被改坏）会直接拒绝写入并要求改名/换账号，误伤"同一个仓本来就是我自己的、只是想重新认领"这一常见场景。现在绑定遇到占用会抛结构化的 `repoOccupied`（RPC 带 `needTakeOver:true`），并把已验证的 token 保留在 **account-only** 态；面板据此给出两路：**「✅ 接管这个已有仓库」** 与 **「↩ 放弃」**。
+
+### added
+- **`study.syncTakeOver` RPC + 面板接管入口**：点「接管」复用 account-only 里已存的 token 重跑 `locateOrCreateRepo({takeOver:true})`，**只补写/替换 `.study-sync-owner.json` 这一个标记文件**（对已存在的标记文件 PUT 带 sha），此后一切同步只落在 `study-goals/` 前缀下。**绝不删除该仓任何已有内容**（承 D22 no-prune）；「放弃」只清本机凭据（去改名或换账号）。红线不变——对他人同名仓永不自动下手，接管必须本人明示确认。`sync.test` 73 / `client.test` 39 断言（新增占用→接管/放弃两条链路与"token 明文不明文回显"回归）。
+
 ## [0.5.0] - 2026-09-18
 
 ### added
