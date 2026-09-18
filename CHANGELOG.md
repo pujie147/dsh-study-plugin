@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-09-18
+
+### added
+- **GitHub 绑定「一键登录」主路（设备码 OAuth + 内置 public client_id，D32）**。发布版在 `lib/index.js` 内置一个官方 OAuth App 的 **public `client_id`**（`DEFAULT_CLIENT_ID`，公开值、**绝不含 client_secret**，设备码流程本就不需要 secret），`loadSyncCfg` 首次读取即种子化进配置。面板未绑定态据此露出 **🔗 一键登录 GitHub 授权**：点一下 → 自动 `window.open` 验证页 + 自动复制一次性代码 → **`setInterval` 自动轮询**（`authorization_pending` 静默继续，成功即落地并刷远端，**不再需要手动点"确认"**）。`syncGetConfig` 回 `oneClick` 标志，客户端据此切换一键/手填 UI。
+- **「▸ 高级选项」折叠**：自构建/内置 App 被撤销时仍可手填 client_id「发起设备码」，或用 **fine-grained PAT**（逃生舱，逐机独立、单仓 Contents、最小权限）绑定。文档明确 **A vs C 的撤销耦合与 scope 差异**（撤 OAuth App = 一次作废所有机器的设备令牌；撤 PAT 只影响单机）。
+- **多主机绑同一账号 = adopt**：同一 GitHub 账号下多台机器各自授权、各拿独立令牌、共同认领 `dsh-study-sync`；`locateOrCreateRepo` 见已有本插件认领标记即**直接采用**（`ready`，不触发 0.6.0 的接管流程），导出包各带 `deviceId` 供冲突面板区分来源。`sync.test` §9b 回归（第三台 adopt 后 `ready` 非 `account-only`、不清 A 已推目标、跨机 `deviceId` 独立）。
+
+### changed
+- `sync.test` 73→**77**、`client.test` 保持 **39**（一键/自动轮询/高级折叠/PAT 逃生舱/占用→接管/多主机 adopt 全链路）；`syncGetConfig` 增 `oneClick` 字段。红线不变：token 明文只 `••••末四位`、endpoint 强制 https 仅回环放行 http、认领标记仍是拒写他人同名仓的唯一凭据、接管/adopt 均不删已有内容。
+
 ## [0.6.0] - 2026-09-18
 
 ### changed

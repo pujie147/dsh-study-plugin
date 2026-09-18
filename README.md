@@ -19,8 +19,8 @@
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
 node test/smoke.mjs                 # 宿主半运行时冒烟（101 断言，跑在宿主真实 persistence + registry 上）
-node test/sync.test.mjs             # GitHub 同步宿主半（73 断言，内存 mock GitHub server + 真宿主夹具，双设备）
-npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(39，桩 React 真实渲染点击，含 9 条同步面板) + sync(73，GitHub 同步)
+node test/sync.test.mjs             # GitHub 同步宿主半（77 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt）
+npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(39，桩 React 真实渲染点击，含同步面板) + sync(77，GitHub 同步)
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
@@ -60,7 +60,7 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - `curl -X POST http://127.0.0.1:3080/study-rpc -d '{"method":"study.list","args":{}}'` 返回 `{goals:[…]}`
 - `~/.dsh/study-work/README.md` 被刷新为常驻版文案
 
-## GitHub 同步（跨机器 · v0.5.0）
+## GitHub 同步（跨机器 · v0.7.0）
 
 在「📤 导出 / 导入」之上叠一条**只经 GitHub 一个固定私有仓 `dsh-study-sync` 流转**的双向同步通道：
 不搭自建服务、不加运行时依赖，机器之间**只通过仓库**通信。
@@ -71,24 +71,36 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
   让你二选一——**「🔼 覆盖仓库」**（用本地 force push，仓库那份丢失）或**「🔽 放弃本地」**
   （拉仓库版落地，但不删你本地多出的独占文件）。程序绝不替你吃掉任一侧。
 - **对他人同名仓绝不静默下手**：账号下已有的 `dsh-study-sync` 若没有本插件的认领标记，绑定**不会自动写入**，而是提示你**明示「接管」**——接管只补写那一个认领标记文件、此后只往 `study-goals/` 前缀同步，**不删除该仓任何已有内容**；不想接管就「放弃」，去给那个仓改名或换一个账号。（红线不变：接管必须是本人确认。）
+- **多台机器绑同一个 GitHub 账号是预期用法**：每台机器各自跑一遍授权、各拿一份独立令牌，共同认领并读写同一个 `dsh-study-sync`；后来者若发现仓里已有本插件的认领标记，直接**采用（adopt）**而不触发接管。导出包各带自己的 `deviceId`，冲突面板据此区分"是哪台机器推的"。**唯一的耦合点**是账号级"撤销这个 OAuth App"——见下方方式一与方式二的差别。
 
 打开面板点顶栏 **☁ GitHub 同步** 进入。设计细节见 [docs/design/github-sync.md](./docs/design/github-sync.md)。
 
-### 授权方式一：GitHub OAuth App + 设备码（推荐）
+### 授权方式一：一键登录 GitHub（设备码 OAuth，推荐）
 
-1. 到 GitHub → Settings → **Developer settings → OAuth Apps → New OAuth App**；
-   Application name / Homepage 随意，**回调 URL 可填 `http://127.0.0.1`**（设备码流程不真正回跳）。
-2. 创建后进该 App → **Generate a new client secret**（记下备用）；拿到 **Client ID**。
-3. 在 App 设置里启用 **Device Flow**（Device settings → 允许设备码授权）。
-4. 把 Client ID 告诉插件：面板里调用 `study.syncSetConfig { clientId }`（或按面板提示填一次），
-   之后点 **🔑 用 GitHub 设备码授权** → 浏览器打开给出的地址、输入面板显示的一次性代码 →
-   回面板点**确认**即可。授权成功后插件会在你账号下定位/创建 `dsh-study-sync`。
+发布版插件已内置一个官方 OAuth App 的 **public client_id**（公开值、**不含任何 secret**，可安全写进仓库），
+所以你**不需要自己去建 App**。绑定只需一步：
 
-### 授权方式二：fine-grained PAT（兜底）
+1. 面板里点 **🔗 一键登录 GitHub 授权**；
+2. 浏览器自动打开 GitHub 的验证页、面板显示一次性代码（并自动复制到剪贴板）——在浏览器里确认授权；
+3. 面板**自动轮询**，授权成功后就在你账号下定位/创建 `dsh-study-sync` 并进入就绪态，无需手动点确认。
 
-不想建 OAuth App，就直接粘一个 **fine-grained Personal Access Token**：
-只授予目标仓 `dsh-study-sync` 的 **Contents: Read and write** 权限，**务必设过期时间**。
-在面板 PAT 输入框粘贴后点 **🔗 用 PAT 绑定**。
+> 若你从源码自构建、或这个内置 App 被撤销：点 **▸ 高级选项**，自己填一个 OAuth App 的 client_id（启用 Device Flow，
+> 回调 URL 填 `http://127.0.0.1` 即可，设备码流程不真正回跳）后「发起设备码」；或直接改用方式二。
+
+**维护方登记内置 App 的步骤**（仅发布方需要，普通用户跳过）：GitHub → Developer settings → New OAuth App
+（Homepage 随意、回调填 `http://127.0.0.1`）→ Device settings 里启用 **Device Flow** → 把 **Client ID**（只此公开值）
+填进 `lib/index.js` 的 `DEFAULT_CLIENT_ID` 常量。**切勿把 client_secret 写进仓库或分发给用户**——设备码流程不需要它。
+
+### 授权方式二：fine-grained PAT（逃生舱 · 逐机隔离）
+
+不想依赖内置 OAuth App（或想给每台机器完全独立的凭据），点 **▸ 高级选项**，粘一个 **fine-grained Personal Access Token**：
+只授予目标仓 `dsh-study-sync` 的 **Contents: Read and write** 权限、**只针对那一个仓**、**务必设过期时间**。
+粘贴后点 **🔗 用 PAT 绑定**。
+
+> **方式一 vs 方式二（撤销耦合与权限面）**：设备码走的是**同一个内置 OAuth App**，好处是零配置一键授权，
+> 代价是**账号级撤销该 App 会一次性作废你所有机器上的设备令牌**（需逐机重授），且 OAuth App 权限面按授权范围可能宽于单仓；
+> fine-grained PAT **逐机独立**——撤掉某台的 PAT 只影响那台，且 scope 锁死到单仓 Contents，权限面最小。
+> 多台长期共存、跨信任域（如公司机 + 家用机）优先用 PAT；嫌逐机建 token 麻烦、且接受"撤 App = 全部重授"用一键。
 
 > ⚠️ **令牌明文风险（务必读）**：无论设备码拿到的 `access_token` 还是 PAT，插件都**以明文**存在该机器的
 > `~/.dsh/study-work` 同步配置里（面板/任何 RPC 返回值只会显示 `••••末四位`，绝不回显全文；

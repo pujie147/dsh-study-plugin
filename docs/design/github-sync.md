@@ -31,24 +31,30 @@ dsh-study-sync/
 - 每次 push 在 meta 里记 `digest / exportedAt / deviceId / zipBytes / zipSha256 / zipBlobSha / sessions[]`，
   供冲突判定与展示。
 
-## 2. 绑定：两条授权路 + 状态机
+## 2. 绑定：一键设备码主路 + PAT 逃生舱 + 状态机
 
-`study.syncGetConfig` 返回一个 `bindState`（**永不含 token 明文**，只给 `tokenHint = ••••末四位`）：
+`study.syncGetConfig` 返回一个 `bindState`（**永不含 token 明文**，只给 `tokenHint = ••••末四位`）与 `oneClick`（是否已配 client_id、能否一键）：
 
 | bindState | 含义 | 面板出口 |
 |---|---|---|
-| `unbound` | 无凭据 | 设备码授权 / 粘贴 PAT 两条入口 |
+| `unbound` | 无凭据 | 有 `oneClick` ⇒ 「🔗 一键登录 GitHub 授权」；否则「▸ 高级选项」里手填 client_id 发起设备码 / 粘贴 PAT |
 | `account-only` | 已识别账号、token 已留，但固定仓未定位成功（多为被本账号自己占用） | 「接管这个已有仓库」`syncTakeOver` / 「放弃」改名或换账号；也可继续用另一凭据绑定 |
 | `ready` | 凭据 + 仓库指向齐全 | 列远端、逐目标同步 |
 | `invalid` | 凭据曾有效但被远端撤销（401 过） | 「重新绑定（复用已存凭据）」`syncRebind` |
 
-- **设备码 OAuth（主路）**：`syncStartDeviceFlow` 向 `{web}/login/device/code` 申请一次性 code，
-  面板显示 `user_code` + `verification_uri`；用户浏览器授权后 `syncPollDeviceFlow` 轮询。
-  `authorization_pending` 是**正常中间态**（返回 `{ok:true,status:'pending'}`），
-  `access_denied / expired_token` 才终止。拿到 `access_token` 后走同一 `bindWithToken` 尾段。
-  需要本机先配好 OAuth App 的 `client_id`（见 README「注册 GitHub OAuth App」）。
-- **PAT（兜底）**：`syncBindPat` 收 fine-grained PAT（`github_pat_…`）或 classic（`ghp_…`），
+- **设备码 OAuth（主路 · 一键）**：发布版在 `lib/index.js` 内置官方 OAuth App 的 **public `client_id`**
+  （`DEFAULT_CLIENT_ID`，公开值、**绝不含 client_secret**；设备码流程不需要 secret，可安全入仓分发），
+  `loadSyncCfg` 首次读取即种子化。`syncStartDeviceFlow` 向 `{web}/login/device/code` 申请一次性 code，
+  面板 `window.open` 打开 `verification_uri` + 自动复制 `user_code`，再用 `setInterval` 按 `interval`
+  **自动轮询** `syncPollDeviceFlow`。`authorization_pending` 是**正常中间态**（`{ok:true,status:'pending'}`，静默继续），
+  `access_denied / expired_token` 才终止；拿到 `access_token` 后走同一 `bindWithToken` 尾段，成功即落地并刷远端，**无需用户手点确认**。
+  client_id 为空（自构建/App 被撤）⇒ `oneClick=false`，高级选项手填后「发起设备码」。
+- **PAT（逃生舱 · 逐机隔离）**：`syncBindPat` 收 fine-grained PAT（`github_pat_…`）或 classic（`ghp_…`），
   仅要求 **Contents: Read and write**。形状校验后 `GET /user` 认账号 → 定位/建仓 → 落盘。
+- **多主机绑同一账号 = adopt**：同一账号下多台机器各自授权、各拿独立令牌、共认领同一 `dsh-study-sync`。
+  `locateOrCreateRepo` 见仓里**已有本插件有效认领标记**即**直接采用为 `ready`**（不触发 D28 的接管流程，
+  因为标记已证明这仓归本插件/本账号所有）；各导出包带独立 `deviceId`，冲突面板据此区分来源。
+  唯一耦合：账号级「撤销该 OAuth App」会一次作废所有机器的设备令牌需逐机重授；PAT 逐机独立、撤一台不影响他机。
 - **失败不落盘**：PAT 场景任一步失败（401/建仓被拒）**不改现有配置**；设备码场景保留 auth 待续。
 - **endpoint 红线**：`apiBase/webBase` 只接受 `https://host`，明文 `http` 仅放行回环
   （`127.0.0.1|localhost:port`，为本地 mock 测试）。防止 token 走明文外泄。
@@ -124,14 +130,15 @@ dsh-study-sync/
 
 ## 7. 测试
 
-`test/sync.test.mjs`（70 断言）跑在**真实宿主 fixture** + **内存 mock GitHub server**（回环 endpoint）上：
-两台设备 A/B 各持独立 `sessionPersistence` 根。覆盖：
+`test/sync.test.mjs`（77 断言）跑在**真实宿主 fixture** + **内存 mock GitHub server**（回环 endpoint）上：
+两台设备 A/B 各持独立 `sessionPersistence` 根（另加 C/D 覆盖占用接管与多主机 adopt）。覆盖：
 
 - 绑定状态机（设备码 pending→authorized、PAT、失败不落盘、invalid→rebind、unbind）；
-- 固定仓名的**占用拒绝**与**建仓 422 竞态**（输家重 GET + 标记校验后采用赢家）；
+- 固定仓名的**占用 → 明示接管/放弃**（D28）与**建仓 422 竞态**（输家重 GET + 标记校验后采用赢家）；
+- **多主机绑同一账号 = adopt**（D32，§9b）：第三台直接 `ready` 非 `account-only`、不清他机已推目标、跨机 `deviceId` 独立；
 - 五态与快进链（B 追加帧 → localAhead 推 → A remoteAhead 拉 → 内容随 remoteId 旅行）；
 - 真分叉二选一（覆盖仓库=force push / 放弃本地=discard pull，且不 prune）；
 - **CAS**：正确 sha ⇒ 200、过期 sha ⇒ 409；塞坏 zip ⇒ pull 时 sha256 拦下；
 - 降级红线：宿主无 fetch 只报不可用不抛、解绑只清本机、其它功能（list/导出）不受牵连。
 
-客户端面板见 `test/client.test.mjs` 的同步段（token 不回显、二选一按钮、force/discard 参数、降级禁用）。
+客户端面板见 `test/client.test.mjs` 的同步段（39 断言：一键 `oneClick` + 自动轮询、高级折叠、PAT 不回显、占用→接管/放弃、二选一按钮、force/discard 参数、降级禁用）。

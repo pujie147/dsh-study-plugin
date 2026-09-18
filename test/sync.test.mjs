@@ -413,6 +413,30 @@ console.log('\n══ 9. 固定仓名的占用、受控接管与竞态 ══')
   check('建仓 422（输家）⇒ 重 GET + 标记校验 ⇒ 采用成功', race.ok === true && race.bound === true, race)
 }
 
+console.log('\n══ 9b. 多台主机绑同一账号：后来者直接 adopt，不误触接管 ══')
+{
+  const D = await makeDevice('D')
+  await D.call('study.syncSetConfig', { apiBase: base, webBase: base })
+  mock.state.tokens.set('github_pat_mockDDDtester04', 'tester')   // 同一 GitHub 账号，第三台机器
+  const bind = await D.call('study.syncBindPat', { token: 'github_pat_mockDDDtester04' })
+  check('第三台直接绑定就绪（A 已建标记 ⇒ 采用）', bind.ok === true && bind.bound === true && bind.config.repo.fullName === 'tester/dsh-study-sync', bind)
+  check('adopt 不触发接管：绑定后直接 ready，非 account-only', (await D.call('study.syncGetConfig')).bindState === 'ready', null)
+  check('adopt 不清共享仓：A 之前推的目标仍在', mock.state.repos.get('tester/dsh-study-sync').files.has('study-goals/' + goalId + '/bundle.meta.json'), [...mock.state.repos.get('tester/dsh-study-sync').files.keys()].slice(0, 4))
+  // deviceId 不在 sync 配置里（它住在 device.json），只在导出包 meta 上旅行。
+  // 用真通道验证「各主机来源可区分」：D 推自己的新目标，远端两份 meta 的 deviceId 必须不同。
+  const dg = await D.call('study.createGoal', { topic: 'D 独家', target_level: '入门', requirements: '中文' })
+  await makeSession(D, 'sess-d-1', goalDirOf(D, dg.goalId), [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('session/title', 1, { title: 'D 的会话' }),
+    ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ])
+  const dp = await D.call('study.syncPush', { goalId: dg.goalId })
+  const shared = mock.state.repos.get('tester/dsh-study-sync').files
+  const devA = JSON.parse(shared.get('study-goals/' + goalId + '/bundle.meta.json').toString('utf8')).deviceId
+  const devD = JSON.parse(shared.get('study-goals/' + dg.goalId + '/bundle.meta.json').toString('utf8')).deviceId
+  check('各主机 deviceId 独立（冲突展示能区分来源）', dp.ok === true && /^dev-/.test(devA) && /^dev-/.test(devD) && devA !== devD, { devA, devD })
+}
+
 console.log('\n══ 10. 失效 → 重绑恢复；降级面 ══')
 {
   mock.state.tokens.delete('github_pat_mockAAAtester01')            // 远端撤销了 token

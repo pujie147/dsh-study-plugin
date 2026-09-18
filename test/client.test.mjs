@@ -186,10 +186,12 @@ const input = async (node, value) => { await node.props.onChange({ target: { val
 // ── 执行 bundle ──────────────────────────────────────────────────────────────
 const bundle = readFileSync(bundlePath, 'utf8')
 let mod = null
-globalThis.window = { __ModuleLoader__: { load: (m) => { mod = m } }, innerHeight: 900, addEventListener() {}, removeEventListener() {} }
+globalThis.window = { __ModuleLoader__: { load: (m) => { mod = m } }, innerHeight: 900, addEventListener() {}, removeEventListener() {}, open: (u) => { openedUrls.push(u); return null } }
 globalThis.document = { createElement: () => ({ dataset: {} }), head: { appendChild() {} }, querySelector: () => null }
-// 把 setInterval/clearInterval 换成桩：否则面板的 2.5s 轮询会留下真实 timer 句柄，测试跑完进程也不退出
-new Function('window', 'document', 'setInterval', 'clearInterval', bundle)(globalThis.window, globalThis.document, () => 0, () => {})
+// setInterval 桩：记录每个回调（面板 2.5s 刷新 + 设备码自动轮询都用它），测试里按需手动触发；不留真实句柄避免进程不退出
+const intervals = []
+const openedUrls = []
+new Function('window', 'document', 'setInterval', 'clearInterval', bundle)(globalThis.window, globalThis.document, (fn) => { intervals.push(fn); return intervals.length }, () => {})
 assert.ok(mod && mod.id === 'study-plugin', 'bundle 未注册模块')
 const factory = mod.factory((name) => { if (name === 'react') return React; throw new Error('unexpected require: ' + name) })
 assert.equal(typeof factory.apply, 'function')
@@ -542,39 +544,52 @@ rpc.length = 0
 listGoals = [goalRow]
 await click(hdrBtn('刷新'), 'refresh before sync')
 tree = await renderAll()
-// (1) 未绑定态：设备码 + PAT 两条入口都在
-syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
+// 高级选项（client_id / PAT）默认收起；需要时展开并取回 PAT 输入框
+const openAdv = async () => { const b = btnText('高级选项'); if (b) await click(b, 'adv'); return await renderAll() }
+const getPatBox = async () => { let b = findInput((p) => p.type === 'password'); if (!b) { await openAdv(); b = findInput((p) => p.type === 'password') } return b }
+
+// (1) 未绑定 + 无内置 client_id（oneClick=false）：主按钮「配置并绑定」，client_id/PAT 收进高级选项
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, oneClick: false, config: {} }
 await click(hdrBtn('GitHub 同步'), 'open sync view')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncGetConfig'), '进入同步面板应先读配置')
 assert.ok(bodyText().indexOf('未绑定') >= 0, '未绑定态文案缺失')
-assert.ok(btnText('设备码授权'), '缺少设备码授权入口')
-assert.ok(btnText('用 PAT 绑定'), '缺少 PAT 绑定入口')
-ok('同步面板未绑定态：设备码 + PAT 两条授权入口并列')
+assert.ok(btnText('配置并绑定'), '无内置 client_id 时主按钮应是「配置并绑定」')
+assert.ok(!btnText('一键登录'), '无内置 client_id 不该出现一键按钮')
+assert.ok(!findInput((p) => p.type === 'password'), '高级选项收起时不该直接暴露 PAT 输入')
+await openAdv()
+assert.ok(findInput((p) => p.type === 'password'), '展开高级应出现 PAT 输入框')
+assert.ok(findInput((p) => p.type !== 'password' && String(p.placeholder || '').indexOf('client_id') >= 0), '展开高级应出现 client_id 输入框')
+ok('未绑定态：有内置 client_id 才给一键；否则「配置并绑定」，client_id/PAT 藏在高级选项')
 
-// (2) 设备码：先存 client_id → 发起 → 显示 userCode → 轮询 pending（仍未绑定）→ 授权成功切到已就绪
-const cidBox = findInput((p) => p.type !== 'password' && String(p.placeholder || '').indexOf('client_id') >= 0)
-assert.ok(cidBox, '未绑定态应有 client_id 输入框')
-await input(cidBox, 'Iv1.oauthclientid')
+// (2) 一键设备码（oneClick=true，官方 App 内置）：主按钮 → window.open + 展示代码 + 自动轮询（无手动确认）
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, oneClick: true, config: { clientId: 'Iv1.officialapp' } }
+await click(btnText('⟳ 刷新'), 'reload oneClick')
 tree = await renderAll()
-await click(btnText('设备码授权'), 'start device flow')
-assert.ok(rpc.some((c) => c[0] === 'syncSetConfig' && c[1].clientId === 'Iv1.oauthclientid'), '发起设备码前应先落盘 client_id')
+rpc.length = 0
+const beforeInt = intervals.length
+await click(btnText('一键登录 GitHub 授权'), 'one click bind')
 tree = await renderAll()
-assert.ok(rpc.some((c) => c[0] === 'syncStartDeviceFlow'), '未发起设备码')
-assert.ok(bodyText().indexOf('ABCD-1234') >= 0, '未显示设备码 userCode')
+assert.ok(rpc.some((c) => c[0] === 'syncStartDeviceFlow'), '一键应直接发起设备码')
+assert.ok(!rpc.some((c) => c[0] === 'syncSetConfig'), '内置 client_id 时一键不该再存 client_id')
+assert.deepEqual(openedUrls.slice(-1), ['https://github.com/login/device'], '一键应 window.open 授权页')
+assert.ok(bodyText().indexOf('ABCD-1234') >= 0, '应展示 user_code')
+assert.ok(!btnText('我已在浏览器授权') && !btnText('确认授权'), '一键流程不该再有手动确认按钮')
+assert.equal(intervals.length, beforeInt + 1, 'pending 应新注册一个自动轮询定时器')
+const devCb = intervals[intervals.length - 1]
 devicePoll = { ok: true, status: 'pending' }
-await click(btnText('我已在浏览器授权'), 'poll pending')
+await devCb(); await tick()
 tree = await renderAll()
-assert.ok(rpc.filter((c) => c[0] === 'syncPollDeviceFlow').length >= 1, '未轮询设备码')
-assert.ok(bodyText().indexOf('绑定状态：未绑定') >= 0, 'pending 时不应显示已绑定')
-// 授权成功：面板刷新配置为 ready
+assert.ok(rpc.some((c) => c[0] === 'syncPollDeviceFlow'), '自动轮询应调用 syncPollDeviceFlow')
+assert.ok(bodyText().indexOf('绑定状态：未绑定') >= 0, 'pending 时仍是未绑定')
+assert.equal(intervals.length, beforeInt + 1, 'pending 不该重启/新增定时器')
 devicePoll = { ok: true, status: 'authorized', bound: true, config: bindResult.config }
-syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, config: bindResult.config }
-await click(btnText('我已在浏览器授权'), 'poll authorized')
+syncCfg = { ok: true, bound: true, bindState: 'ready', fetch: true, oneClick: true, config: bindResult.config }
+await devCb(); await tick()
 tree = await renderAll()
-assert.ok(bodyText().indexOf('已就绪') >= 0, '授权成功后应显示已就绪')
-assert.ok(!btnText('设备码授权'), '已绑定后不应再有授权入口')
-ok('设备码流程：发起→轮询 pending→授权成功切到已绑定')
+assert.ok(bodyText().indexOf('已就绪') >= 0, '授权成功自动切到已就绪')
+assert.ok(!btnText('一键登录'), '已绑定后不应再有一键入口')
+ok('一键设备码：主按钮→window.open+展示代码+自动轮询→authorized 自动绑定（无手动确认）')
 
 // (3) 已绑定：列远端目标 + 检查本机状态 + 推送 localAhead
 remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goals: [{ remoteGoalId: 'goal-demo', title: '软件设计', bytes: 152043, exportedAt: '2026-09-10T02:00:00.000Z' }] }
@@ -648,8 +663,8 @@ await click(btnText('解绑（只清本机）'), 'unbind')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncUnbind'), '未触发 syncUnbind')
 assert.ok(bodyText().indexOf('未绑定') >= 0, '解绑后应回到未绑定')
-const patBox = findInput((p) => p.type === 'password')
-assert.ok(patBox, '未绑定态应有 PAT 输入框')
+const patBox = await getPatBox()
+assert.ok(patBox, '未绑定态展开高级后应有 PAT 输入框')
 await input(patBox, 'github_pat_SUPERSECRET_123456')
 tree = await renderAll()
 bindResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••3456' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
@@ -667,7 +682,7 @@ syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {
 await click(btnText('⟳ 刷新'), 'reload unbound for takeover')
 tree = await renderAll()
 rpc.length = 0
-const patBox2 = findInput((p) => p.type === 'password')
+const patBox2 = await getPatBox()
 assert.ok(patBox2, '占用场景起点应是未绑定 + PAT 输入框')
 await input(patBox2, 'github_pat_OCCUPIED_9999')
 tree = await renderAll()
@@ -698,11 +713,11 @@ assert.ok(rpc.some((c) => c[0] === 'syncUnbind'), '放弃应触发解绑（只�
 ok('固定仓被本账号占用：面板给「接管/放弃」两路，接管复用已存 token 且不明文回显')
 
 // (8) 无 fetch 降级：只报同步不可用，不抛
-syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: false, config: {} }
+syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: false, oneClick: true, config: {} }
 await click(btnText('⟳ 刷新'), 'reload cfg nofetch')
 tree = await renderAll()
 assert.ok(bodyText().indexOf('无 fetch') >= 0, '无 fetch 应给出降级提示')
-assert.ok(btnText('设备码授权').props.disabled === true, '无 fetch 时授权按钮应禁用')
+assert.ok(btnText('一键登录').props.disabled === true, '无 fetch 时一键授权按钮应禁用')
 ok('宿主无 fetch：面板降级提示同步不可用，授权按钮禁用而非抛错')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')

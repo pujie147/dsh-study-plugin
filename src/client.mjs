@@ -101,6 +101,7 @@ function apply(ctx) {
     const [syncBusy, setSyncBusy] = React.useState(null)
     const [syncErr, setSyncErr] = React.useState('')
     const [takeOverHint, setTakeOverHint] = React.useState('')   // 绑定命中「固定仓已被本账号占用」时的提示文案
+    const [adv, setAdv] = React.useState(false)                   // 未绑定态的「高级选项」是否展开（手填 client_id / PAT）
     const [anchor, setAnchor] = React.useState(undefined)
     const [open, setOpen] = React.useState(ui.open)
     const rootRef = React.useRef(null)
@@ -492,16 +493,27 @@ function apply(ctx) {
         setSync(Object.assign({}, sync, { config: Object.assign({}, (sync && sync.config) || {}, { clientId: want }) }))
       }
       const r = await call('study.syncStartDeviceFlow', {})
-      if (r && r.ok === true) setDevFlow({ userCode: r.userCode, verificationUri: r.verificationUri, status: 'pending' })
-      else setSyncErr(String((r && r.error) || '发起设备码失败'))
+      if (r && r.ok === true) {
+        setSyncErr('')
+        setDevFlow({ userCode: r.userCode, verificationUri: r.verificationUri, interval: Number(r.interval) || 5, expiresAt: Date.now() + (Number(r.expiresIn) || 900) * 1000, status: 'pending' })
+        try { if (typeof window !== 'undefined' && typeof window.open === 'function') window.open(r.verificationUri, '_blank', 'noopener') } catch (e) {}
+        try { if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(String(r.userCode || '')) } catch (e) {}
+      } else setSyncErr(String((r && r.error) || '发起设备码失败'))
     })
     const doPollDevice = () => withSyncBusy('devpoll', async () => {
       const r = await call('study.syncPollDeviceFlow', {})
       if (r && r.needTakeOver) { setDevFlow(null); setTakeOverHint(String(r.error || '')); setSyncErr(''); await loadSync(); return }
-      if (!r || r.ok !== true) { setSyncErr(String((r && r.error) || '轮询失败')); if (r && r.error) setDevFlow(null); return }
-      if (r.status === 'pending') { setDevFlow((d) => (d ? Object.assign({}, d, { status: 'pending' }) : d)); return }
-      if (r.status === 'authorized') { setDevFlow(null); setTakeOverHint(''); setSync(Object.assign({}, sync, { bound: true, bindState: 'ready', config: r.config })); await loadSync(); await loadRemote() }
+      if (r && r.ok === true && r.status === 'pending') return   // 保持等待：不动 devFlow，定时器节奏不变
+      if (!r || r.ok !== true) { setDevFlow(null); setSyncErr(String((r && r.error) || '授权未完成')); return }
+      if (r.status === 'authorized') { setDevFlow(null); setTakeOverHint(''); setSyncErr(''); await loadSync(); await loadRemote() }
     })
+    // 一键设备码：devFlow 处于 pending 时按 GitHub 给的 interval 自动轮询，授权成功即停（取消/过期靠 setDevFlow(null) 触发 cleanup）
+    React.useEffect(() => {
+      if (!devFlow || devFlow.status !== 'pending') return
+      const ms = Math.max(1000, (devFlow.interval || 5) * 1000)
+      const id = setInterval(() => { doPollDevice() }, ms)
+      return () => clearInterval(id)
+    }, [devFlow])
     const doTakeOver = () => withSyncBusy('takeover', async () => {
       const r = await call('study.syncTakeOver', {})
       if (r && r.ok === true) { setTakeOverHint(''); setSyncErr(''); await loadSync(); await loadRemote() }
@@ -583,6 +595,7 @@ function apply(ctx) {
       const cfg = sync.config || {}
       const bs = sync.bindState || (sync.bound ? 'ready' : 'unbound')
       const noFetch = sync.fetch === false
+      const oneClick = sync.oneClick === true
       return React.createElement('div', { className: 'stuiForm' },
         React.createElement('div', { className: 'stuiRow' },
           React.createElement('button', { type: 'button', className: 'stuiAct', onClick: () => setView('list') }, '← 返回目标列表'),
@@ -601,21 +614,37 @@ function apply(ctx) {
           )
         ),
         (bs === 'unbound' || bs === 'account-only') && React.createElement('div', { className: 'stuiDetail' },
-          React.createElement('div', { className: 'stuiDraftOv' }, '用 GitHub 账号绑定固定同步仓 dsh-study-sync。两种授权方式：设备码（OAuth，推荐）或直接粘贴 fine-grained PAT（仅 Contents 读写）。token 只存本机、绝不回显明文。'),
-          React.createElement('input', { className: 'stuiInput', value: clientIdInput, placeholder: 'GitHub OAuth App 的 client_id（设备码方式需要；见 README）', onChange: (e) => setClientIdInput(e.target.value) }),
-          React.createElement('div', { className: 'stuiRow' },
-            React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doStartDevice() }, syncBusy === 'dev' ? '申请中…' : '🔑 用 GitHub 设备码授权')
+          React.createElement('div', { className: 'stuiDraftOv' }, '点下面的按钮登录 GitHub 并授权，即可绑定固定同步仓 dsh-study-sync。走 GitHub 官方设备码流程，token 只存本机、绝不回显明文。'),
+          !devFlow && React.createElement('div', { className: 'stuiRow' },
+            oneClick
+              ? React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: syncBusy !== null || noFetch, onClick: () => doStartDevice() }, syncBusy === 'dev' ? '正在打开授权页…' : '🔗 一键登录 GitHub 授权')
+              : React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null, onClick: () => setAdv(true) }, '⚙ 配置并绑定（自备 client_id 或用 PAT）')
           ),
-          devFlow && React.createElement('div', { className: 'stuiMeta' },
-            '请在浏览器打开 ', React.createElement('a', { href: devFlow.verificationUri, target: '_blank', rel: 'noreferrer' }, devFlow.verificationUri),
-            ' 并输入代码 ', React.createElement('strong', null, devFlow.userCode), ' 完成授权后点下方按钮确认。'),
-          devFlow && React.createElement('div', { className: 'stuiRow' },
-            React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null, onClick: () => doPollDevice() }, syncBusy === 'devpoll' ? '查询中…' : (devFlow.status === 'pending' ? '✅ 我已在浏览器授权，确认' : '✅ 确认授权')),
-            React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null, onClick: () => setDevFlow(null) }, '取消')
+          devFlow && React.createElement('div', null,
+            React.createElement('div', { className: 'stuiMeta' }, '已尝试在新标签打开授权页。若没自动弹出，请手动打开 '),
+            React.createElement('a', { href: devFlow.verificationUri, target: '_blank', rel: 'noreferrer' }, devFlow.verificationUri),
+            React.createElement('div', { className: 'stuiMeta' }, '在 GitHub 页面里输入下面这串代码完成授权，本面板会自动检测并继续：'),
+            React.createElement('div', { className: 'stuiRow' },
+              React.createElement('strong', { className: 'stuiChip' }, devFlow.userCode),
+              React.createElement('button', { type: 'button', className: 'stuiAct', onClick: () => { try { if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(String(devFlow.userCode || '')) } catch (e) {} } }, '📋 复制代码'),
+              React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null, onClick: () => setDevFlow(null) }, '取消')
+            ),
+            React.createElement('div', { className: 'stuiMeta' }, syncBusy === 'devpoll' ? '正在确认授权…' : '⏳ 等待你在浏览器完成授权，会自动继续…')
           ),
-          React.createElement('input', { className: 'stuiInput', type: 'password', value: patInput, placeholder: '或粘贴 fine-grained PAT（github_pat_…）', onChange: (e) => setPatInput(e.target.value) }),
           React.createElement('div', { className: 'stuiRow' },
-            React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null || noFetch || !patInput.trim(), onClick: () => doBindPat() }, syncBusy === 'pat' ? '绑定中…' : '🔗 用 PAT 绑定')
+            React.createElement('button', { type: 'button', className: 'stuiAct', onClick: () => setAdv(!adv) }, adv ? '▾ 收起高级选项' : '▸ 高级选项（自备 client_id / fine-grained PAT）')
+          ),
+          adv && React.createElement('div', { className: 'stuiDetail' },
+            React.createElement('div', { className: 'stuiMeta' }, oneClick ? ('设备码 OAuth App 的 client_id（默认已内置官方 App，一般无需改）：' + (cfg.clientId ? '当前 ' + cfg.clientId : '')) : '设备码需要一个 GitHub OAuth App 的 client_id（官方 App 未内置时请自备，见 README）：'),
+            React.createElement('input', { className: 'stuiInput', value: clientIdInput, placeholder: 'client_id（如 Iv1.xxx…）', onChange: (e) => setClientIdInput(e.target.value) }),
+            React.createElement('div', { className: 'stuiRow' },
+              React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null || noFetch, onClick: () => doStartDevice() }, syncBusy === 'dev' ? '申请中…' : '🔑 用该 client_id 发起设备码')
+            ),
+            React.createElement('div', { className: 'stuiMeta' }, '或改用 fine-grained PAT（只勾 Contents 读写；各主机独立 token、可单独撤销）：'),
+            React.createElement('input', { className: 'stuiInput', type: 'password', value: patInput, placeholder: '粘贴 fine-grained PAT（github_pat_…）', onChange: (e) => setPatInput(e.target.value) }),
+            React.createElement('div', { className: 'stuiRow' },
+              React.createElement('button', { type: 'button', className: 'stuiAct', disabled: syncBusy !== null || noFetch || !patInput.trim(), onClick: () => doBindPat() }, syncBusy === 'pat' ? '绑定中…' : '🔗 用 PAT 绑定')
+            )
           )
         ),
         sync.bound === true && React.createElement(React.Fragment, null,

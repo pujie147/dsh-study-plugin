@@ -209,6 +209,7 @@ study-work/
 | D29 | 冲突判定用 **contentDigest**（sha256：排序文件指纹 + 会话向量）+ **账本双基线**，得**五态**；**严格超集才快进**（`localAhead`/`remoteAhead`），否则 `conflicted` | 单纯 digest 相等能判 upToDate，但"会话各自往前追加"与"真分叉"必须区分：`vecCovers` 单向成立才是快进链（A→B→A 内容随 remoteId 旅行），双向都不覆盖才是分叉。pull 后本地被换身份重写 ⇒ 基线必须现算重取，不能沿用 pull 前 digest（防换 id 假阳性） |
 | D30 | 真分叉**程序绝不自动吃掉任一侧**：push 无 force、pull 无 discardLocal 一律返回 `needChoice`，亮出远端 `exportedAt/deviceId/bytes` 后由用户二选一（覆盖仓库 / 放弃本地） | 用户的原始诉求。`syncPull` 在下载**前**先反查本机对应目标并 `syncAssess`，已 conflicted 就直接挡，而不是拉下来靠导入侧再报错。放弃本地 = 导入 force，但**不 prune 本地独占文件**（D22），"放弃"≠"删除" |
 | D31 | 同步 endpoint **只接受 `https://host`，明文 `http` 仅放行回环**（`127.0.0.1|localhost:port`，为本地 mock 测试）；token 明文**永不进任何 RPC 返回值**，只回 `tokenHint=••••末四位` | 绑定把长期凭据（PAT / OAuth access_token）发给 endpoint，走明文 http 会外泄。回环例外只为测试；生产恒 https。config 出面板前一律 `redactSyncCfg` 抹掉 token 与 clientSecret |
+| D32 | GitHub 绑定主路 = **一键设备码**：发布版内置官方 OAuth App 的 **public `client_id`（`DEFAULT_CLIENT_ID`，绝不含 client_secret）**；`syncGetConfig` 回 `oneClick`，面板据此给「🔗 一键登录 GitHub 授权」（自动 `window.open` + 自动复制一次性代码 + `setInterval` 自动轮询，成功即落地不手动确认）。client_id 空/App 被撤 ⇒ 折叠「▸ 高级选项」手填 client_id 或走 fine-grained PAT 逃生舱。**多主机绑同一账号是预期用法**：各机各自授权、各拿独立令牌、共认领同一 `dsh-study-sync`，后来者见有效标记即 **adopt（直接采用为 ready）** 而非触发 D28 接管；导出包各带 `deviceId` 供冲突面板区分来源 | 用户诉求"绑定 git 太复杂，给个一键连接"。**Web redirect（PKCE + 本地回调）被否**：多主机/局域网下 `redirect_uri` 拓扑无解（承 D25 无 IP 守卫、D31 只回环明文），设备码天然多主机友好。**A（设备码）vs C（PAT）的取舍**：一键零配置，代价是账号级"撤销该 OAuth App"一次性作废所有机器的设备令牌需逐机重授、且 App 授权面可能宽于单仓；PAT 逐机独立、单仓 Contents 最小权限、撤一台不影响他机——长期/跨信任域优先 PAT。设备码流程不需要 secret，内置公开 client_id 可安全入仓分发（红线：secret 绝不进仓库）。`sync.test` §9b 回归 adopt 不误触接管、不清他机已推目标、跨机 deviceId 独立（77 断言） |
 
 ## 7. 已知限制 / 后续路线
 
@@ -220,7 +221,7 @@ study-work/
 - 导入后仍建议重启 DSH 再看左栏（宿主分组与投影缓存在启动期定型）；但**可见性已在写入时按宿主投影自检**（D14 加强）：`ws.sessionIds` 不认账就整体回滚，不会再出现"导入成功却看不见"。`study.reattachGoalSessions` 是重启后的修复入口，同样按投影判定成败。
 - 覆盖式导入的已知边界：① 换发新 id 后，会话**正文文本**里提到的旧 id 不会改写（D12 保留正文原样）；② `force` 覆盖 = 吃掉本地更完整的历史，无本地快照可回退（导入前想留就自己备份 zip）；③ 被换下的旧 transcript 留在盘上转 Ungrouped（宿主无删除会话 API，本插件不越权删）；④ 不做 prune（D22）。
 - 归档集里的 id 会被自动避开（D18），但**已存在的旧归档会话本插件无法解档**（宿主这个版本没有解档 API）——只能在导入时换身份绕开。
-- **GitHub 同步通道（M5 / v0.5.0）已实现**：跨机器经固定私有仓 `dsh-study-sync` 双向同步，乐观 CAS 保证正确性、无锁（见 [design/github-sync.md](./design/github-sync.md)、D26–D31）。仍未做的是：① 帧级**增量传输**（每次仍整包，>50MB 拒绝同步）；② **删除同步 / tombstone**（不 prune，D22）；③ 多目标合包。手动「📤 导出 / 导入」通道不变，二者共栈互不依赖。
+- **GitHub 同步通道（M5 / v0.5.0）已实现**：跨机器经固定私有仓 `dsh-study-sync` 双向同步，乐观 CAS 保证正确性、无锁（见 [design/github-sync.md](./design/github-sync.md)、D26–D31）。绑定主路已升级为**一键设备码 + 内置 public client_id（D32）**，PAT 降为高级选项里的逃生舱；多主机绑同一账号走 adopt。仍未做的是：① 帧级**增量传输**（每次仍整包，>50MB 拒绝同步）；② **删除同步 / tombstone**（不 prune，D22）；③ 多目标合包。手动「📤 导出 / 导入」通道不变，二者共栈互不依赖。
 - 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）；超过 60MB 的 transcript 不解正文 ⇒ 无法按行比对，落盘动作降级为需要 force 的 `replace`。
 
 ## 8. 开发约定
