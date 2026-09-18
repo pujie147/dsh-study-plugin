@@ -19,7 +19,8 @@
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
 node test/smoke.mjs                 # 宿主半运行时冒烟（101 断言，跑在宿主真实 persistence + registry 上）
-npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(24，桩 React 真实渲染点击)
+node test/sync.test.mjs             # GitHub 同步宿主半（70 断言，内存 mock GitHub server + 真宿主夹具，双设备）
+npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(38，桩 React 真实渲染点击，含 8 条同步面板) + sync(70，GitHub 同步)
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
@@ -58,6 +59,42 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - 左栏出现「📚 学习区」（任何模式）
 - `curl -X POST http://127.0.0.1:3080/study-rpc -d '{"method":"study.list","args":{}}'` 返回 `{goals:[…]}`
 - `~/.dsh/study-work/README.md` 被刷新为常驻版文案
+
+## GitHub 同步（跨机器 · v0.5.0）
+
+在「📤 导出 / 导入」之上叠一条**只经 GitHub 一个固定私有仓 `dsh-study-sync` 流转**的双向同步通道：
+不搭自建服务、不加运行时依赖，机器之间**只通过仓库**通信。
+
+- **正确性靠乐观 CAS，不用锁**：每次写带"我读到的当前文件 sha"作前置条件，抢先提交者让对方撞 409 →
+  重读重判。**无锁因此无死锁**；面板上的任何"某设备在场"提示（若将来出现）只能是提示，绝不阻塞读写。
+- **真分叉不自动合并**：本地与仓库各自都改过时，面板亮出**仓库最新更新时间 / 设备 / 体积**，
+  让你二选一——**「🔼 覆盖仓库」**（用本地 force push，仓库那份丢失）或**「🔽 放弃本地」**
+  （拉仓库版落地，但不删你本地多出的独占文件）。程序绝不替你吃掉任一侧。
+- **误写他人同名仓被拒**：账号下已有的 `dsh-study-sync` 若没有本插件的认领标记，绑定会拒绝写入并要求改名/换账号。
+
+打开面板点顶栏 **☁ GitHub 同步** 进入。设计细节见 [docs/design/github-sync.md](./docs/design/github-sync.md)。
+
+### 授权方式一：GitHub OAuth App + 设备码（推荐）
+
+1. 到 GitHub → Settings → **Developer settings → OAuth Apps → New OAuth App**；
+   Application name / Homepage 随意，**回调 URL 可填 `http://127.0.0.1`**（设备码流程不真正回跳）。
+2. 创建后进该 App → **Generate a new client secret**（记下备用）；拿到 **Client ID**。
+3. 在 App 设置里启用 **Device Flow**（Device settings → 允许设备码授权）。
+4. 把 Client ID 告诉插件：面板里调用 `study.syncSetConfig { clientId }`（或按面板提示填一次），
+   之后点 **🔑 用 GitHub 设备码授权** → 浏览器打开给出的地址、输入面板显示的一次性代码 →
+   回面板点**确认**即可。授权成功后插件会在你账号下定位/创建 `dsh-study-sync`。
+
+### 授权方式二：fine-grained PAT（兜底）
+
+不想建 OAuth App，就直接粘一个 **fine-grained Personal Access Token**：
+只授予目标仓 `dsh-study-sync` 的 **Contents: Read and write** 权限，**务必设过期时间**。
+在面板 PAT 输入框粘贴后点 **🔗 用 PAT 绑定**。
+
+> ⚠️ **令牌明文风险（务必读）**：无论设备码拿到的 `access_token` 还是 PAT，插件都**以明文**存在该机器的
+> `~/.dsh/study-work` 同步配置里（面板/任何 RPC 返回值只会显示 `••••末四位`，绝不回显全文；
+> 除发往 https 的 GitHub endpoint 外不外传）。**能读到那台机器磁盘的人 = 能拿到这个令牌。**
+> 因此：优先用**只针对单仓、带过期**的 fine-grained PAT；设备令牌同理；共享/受管机器上用完就点**解绑**
+> （解绑只清本机凭据与仓库指向，GitHub 上的数据与各目标同步基线都不动）。
 
 ## 卸载
 删除 `node_modules/study-plugin`（及符号链接）+ 重启 DSH。

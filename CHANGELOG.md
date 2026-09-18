@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-09-18
+
+### added
+- **GitHub 同步（M5）：跨机器经一个固定私有仓双向同步学习区**。在「📤 导出 / 导入」之上叠一层，机器之间**只通过 GitHub 固定仓 `dsh-study-sync` 流转**，不搭自建服务、不加运行时依赖。正确性靠 **Contents API 的 sha 前置条件做乐观 CAS**，**无锁 ⇒ 无死锁**（记 D26）。仓库布局：`.study-sync-owner.json`（认领标记）+ `study-goals/<remoteGoalId>/bundle.zip` + `bundle.meta.json`（**meta 最后提交 = 提交点**）。
+- **绑定状态机（4 态：unbound / account-only / ready / invalid）**，两条授权路：**设备码 OAuth（主路）** `syncStartDeviceFlow` + `syncPollDeviceFlow`（`authorization_pending` 是正常中间态），**fine-grained PAT（兜底）** `syncBindPat`。固定仓"定位或自建"；**认领标记 kind 是拒绝误写他人同名仓的唯一凭据**——已有同名仓无标记 / 标记被改坏 ⇒ 拒绝写入且不落绑定（D28）。`syncRebind` 走失效恢复，`syncUnbind` 只清本机凭据与仓库指向（远端数据与各目标基线不动）。
+- **五态冲突判定 + contentDigest**：`syncInspect`（push/pull 内部复用）现算本地包指纹，比对远端 meta 与账本双基线，得 `remoteMissing / upToDate / localAhead / remoteAhead / conflicted`；**会话向量严格超集才快进**，否则判真分叉（D29）。
+- **真分叉绝不自动吃掉任一侧**：push 无 force、pull 无 discardLocal 一律返回 `needChoice`，亮出仓库最新的 `exportedAt / deviceId / bytes`，交用户二选一——**「覆盖仓库」= force push** / **「放弃本地」= discardLocal 拉取（不 prune）**（D30，放弃≠删除）。
+- **拉取完整性双校验**：`/git/blobs/{sha}` 下载校验 git blob sha，落地前再按 `meta.zipSha256` 校验整包，脏包不入库。
+- **客户端 ☁ GitHub 同步面板**：未绑定态给 client_id 输入 + 设备码/PAT 两条入口；已绑定态列远端目标、逐目标检查五态并推送/拉取；冲突行亮远端时间/设备/体积 + 二选一按钮；invalid 态给重绑入口；无 fetch 降级提示且禁用授权。**token 明文永不出现在面板/任何 RPC 返回**，只显示 `••••末四位`。
+- **安全边界**：同步 endpoint 强制 `https`，明文 `http` 仅放行回环（`127.0.0.1|localhost`，为本地 mock 测试）（D31）。
+- **测试**：新增 `test/sync.test.mjs`（**70 断言**，真宿主 fixture + 内存 mock GitHub server + 双设备）覆盖绑定状态机、占用/建仓 422 竞态、快进链、真分叉二选一、CAS(200/409) 与坏包 sha256 拦截、降级红线；`test/client.test.mjs` 增 8 条同步面板断言（30 → 38）。
+- **文档**：新增 [docs/design/github-sync.md](./docs/design/github-sync.md)，README 增「GitHub 同步」章（含 OAuth App 注册步骤与 **token 明文风险**），PROJECT.md 记 **D26–D31**。
+
+### changed
+- 版本号 `0.4.0` → `0.5.0`（新增同步能力，向后兼容：手动导出/导入通道与数据契约不变，同步层缺席任何服务只降级自身）。
+- 适配宿主 transcript 的生成版本文件名（`session.v3.jsonl.zstd` 等）：会话收集/索引/查双改走统一的文件名候选解析器，修复在新宿主上导出取不到会话正文的问题。
+- 已知限制更新：云同步通道已实现；增量传输、删除同步（tombstone）、多目标合包仍未做（>50MB 拒绝同步）。
+
 ## [0.4.0] - 2026-09-14
 
 ### fixed

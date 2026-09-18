@@ -203,6 +203,12 @@ study-work/
 | D23 | 测试底座用**宿主真实实现**（`test/host-fixture.mjs`：真 `JsonlSessionPersistence` + 真 `WorkspaceRegistry`，只假内存 `storageDomain`）；mock 只留给宿主不可得时的降级跳过 | 上一版 mock 照抄我自己的实现（attach 永远成功、列表从盘上现读），96 条断言全绿却漏掉真 bug。身份/归档/投影/seq 这些不变量必须由宿主代码自己执行，我才骗不过去 |
 | D24 | 浏览器侧的**宿主服务名/方法名是私有演进面**：只能按「方法是否存在」探测 + 调用时惰性 `ctx.get`；可选服务**一律不写进模块级 `inject`** | v0.3.0 及以前直接调 `workspaces.connectWorkspace`，dsh 0.1.5-rc.1 把它迁到 `uiWorkspace` ⇒ 用户实机点「打开会话」报"连接会话的方法不存在"。反过来把 `uiWorkspace` 加进 `inject` 更糟：cordis 的 `inject` 是**硬激活门**（`cordis/lib/index.js:1316-1328`，任一注入名无实现 ⇒ `apply()` 永不执行），缺该包的安装会让整个面板消失。`ctx.get` 本身惰性、未提供返回 undefined 不抛（`:762-771`），所以惰性解析 + 三段兜底（`uiWorkspace` → 旧 `workspaces` → `sessions.create`）既修得了漂移又拖不垮面板。**成功才缓存、失败不缓存**（瞬时取空被缓存会永久关掉首选路径） |
 | D25 | 两条 HTTP 路由（`/study-rpc`、`/study-export`）**不判定来源 IP/端口**：局域网鉴权外移到宿主侧的鉴权插件，本插件不重复实现 | v0.3.1 及以前两处都用 `req.socket.remoteAddress` 硬比三个回环字面量，而客户端是相对路径 `fetch('/study-rpc')` —— 页面从哪台机器加载、请求就发给那台机器 ⇒ 只要不是本机开面板，远程 IP 必被判死，用户实机表现为「study RPC HTTP 403」。用户拍板：鉴权已由独立插件在宿主层承担，本插件再判一次 IP 不提供真实安全，只是把功能挡掉。保留的是**与来源无关的输入约束**：POST-only(405)、1MB body(413)、`path.basename` 全等 + `.zip`(400)。**别把这条删掉的判定当"漏了的守卫"加回来**；要恢复必须先确认宿主侧鉴权的边界。 |
+| D26 | 跨机器同步**只通过 GitHub 固定仓流转**，不搭自建服务、不加运行时依赖；写冲突交给 **Contents API 的 sha 前置条件做乐观 CAS**，**不引入任何锁** | 目标是零运维、可审计（每次同步是一个 commit）。乐观 CAS：PUT 带"我读到的当前 blob sha"，抢先提交者让对方得到 409 → 后写者必被弹回重判。无锁因此**无死锁**；push 撞 409/422 只重试一轮，再撞就交回用户，不无限循环。见 docs/design/github-sync.md §5 |
+| D27 | **软锁 / presence 只能是提示，绝不阻塞读写**（红线） | 用户明确要求"机器间只经仓库通信、正确性靠 CAS、不要锁"。若将来展示"某目标正被别的设备编辑"的 badge，也只能是 advisory：看到在场照常 push/pull，由 CAS 而非软锁裁决并发。把在场信号变成"占用即拒绝"会重新引入死锁与孤儿锁，违背 D26 |
+| D28 | 固定仓名 `dsh-study-sync` + **认领标记 `.study-sync-owner.json`（kind:'dsh-study-sync'）是拒绝误写他人仓的唯一凭据** | 账号下 `dsh-study-sync` 若已存在且有内容但无标记（或 kind 被改坏）⇒ 判定不是本插件的同步仓，**拒绝写入且不落绑定**，要求改名或换账号。建仓并发（首建撞 422）时输家重 GET + 标记校验后采用赢家。绝不对"别人的同名仓"下写入手 |
+| D29 | 冲突判定用 **contentDigest**（sha256：排序文件指纹 + 会话向量）+ **账本双基线**，得**五态**；**严格超集才快进**（`localAhead`/`remoteAhead`），否则 `conflicted` | 单纯 digest 相等能判 upToDate，但"会话各自往前追加"与"真分叉"必须区分：`vecCovers` 单向成立才是快进链（A→B→A 内容随 remoteId 旅行），双向都不覆盖才是分叉。pull 后本地被换身份重写 ⇒ 基线必须现算重取，不能沿用 pull 前 digest（防换 id 假阳性） |
+| D30 | 真分叉**程序绝不自动吃掉任一侧**：push 无 force、pull 无 discardLocal 一律返回 `needChoice`，亮出远端 `exportedAt/deviceId/bytes` 后由用户二选一（覆盖仓库 / 放弃本地） | 用户的原始诉求。`syncPull` 在下载**前**先反查本机对应目标并 `syncAssess`，已 conflicted 就直接挡，而不是拉下来靠导入侧再报错。放弃本地 = 导入 force，但**不 prune 本地独占文件**（D22），"放弃"≠"删除" |
+| D31 | 同步 endpoint **只接受 `https://host`，明文 `http` 仅放行回环**（`127.0.0.1|localhost:port`，为本地 mock 测试）；token 明文**永不进任何 RPC 返回值**，只回 `tokenHint=••••末四位` | 绑定把长期凭据（PAT / OAuth access_token）发给 endpoint，走明文 http 会外泄。回环例外只为测试；生产恒 https。config 出面板前一律 `redactSyncCfg` 抹掉 token 与 clientSecret |
 
 ## 7. 已知限制 / 后续路线
 
@@ -214,7 +220,7 @@ study-work/
 - 导入后仍建议重启 DSH 再看左栏（宿主分组与投影缓存在启动期定型）；但**可见性已在写入时按宿主投影自检**（D14 加强）：`ws.sessionIds` 不认账就整体回滚，不会再出现"导入成功却看不见"。`study.reattachGoalSessions` 是重启后的修复入口，同样按投影判定成败。
 - 覆盖式导入的已知边界：① 换发新 id 后，会话**正文文本**里提到的旧 id 不会改写（D12 保留正文原样）；② `force` 覆盖 = 吃掉本地更完整的历史，无本地快照可回退（导入前想留就自己备份 zip）；③ 被换下的旧 transcript 留在盘上转 Ungrouped（宿主无删除会话 API，本插件不越权删）；④ 不做 prune（D22）。
 - 归档集里的 id 会被自动避开（D18），但**已存在的旧归档会话本插件无法解档**（宿主这个版本没有解档 API）——只能在导入时换身份绕开。
-- 导出包目前只在同机 `exports/` 与浏览器下载之间流转；云通道、增量帧传输、删除同步（tombstone）、多目标合包未做（路径已留好，见 [design/import-overwrite-sync.md](./design/import-overwrite-sync.md) §7）。
+- **GitHub 同步通道（M5 / v0.5.0）已实现**：跨机器经固定私有仓 `dsh-study-sync` 双向同步，乐观 CAS 保证正确性、无锁（见 [design/github-sync.md](./design/github-sync.md)、D26–D31）。仍未做的是：① 帧级**增量传输**（每次仍整包，>50MB 拒绝同步）；② **删除同步 / tombstone**（不 prune，D22）；③ 多目标合包。手动「📤 导出 / 导入」通道不变，二者共栈互不依赖。
 - 目标工作区里的二进制/大文件超过 20MB 会被跳过并在 manifest 里记 warning（防包体积失控）；超过 60MB 的 transcript 不解正文 ⇒ 无法按行比对，落盘动作降级为需要 force 的 `replace`。
 
 ## 8. 开发约定
