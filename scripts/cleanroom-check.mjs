@@ -158,7 +158,7 @@ function call(method, args) {
 const names = tools.map((t) => t.name).sort().join(',')
 const expect = 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status'
 const paths = routes.map((r) => r.path).sort().join(',')
-if (paths !== '/study-export,/study-rpc') { console.error('✗ 路由不符: ' + paths); process.exit(1) }
+if (paths !== '/study-export,/study-file,/study-rpc') { console.error('✗ 路由不符: ' + paths); process.exit(1) }
 if (names !== expect) { console.error('✗ 工具不符: ' + names); process.exit(1) }
 const st = await tools.find((t) => t.name === 'study_plan_status').execute({})
 if (!st || st.ok !== true || !Array.isArray(st.goals)) { console.error('✗ study_plan_status 执行异常'); process.exit(1) }

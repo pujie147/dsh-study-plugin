@@ -72,6 +72,18 @@ function apply(ctx) {
     return svc
   }
 
+  // DSH-better-sidebar（页签式右侧面板底座）在 **client 侧** `ctx.provide('betterSidebar', …)`。
+  // 与 uiWorkspace 同理：绝不写进模块级 inject（那是硬激活门，没装它的机器面板会整体消失），
+  // 只在调用时惰性取、且只缓存成功。
+  let betterSidebarCache
+  const getBetterSidebar = () => {
+    if (betterSidebarCache) return betterSidebarCache
+    let svc
+    try { svc = ctx.get('betterSidebar') } catch (e) { svc = undefined }
+    if (svc) betterSidebarCache = svc
+    return svc
+  }
+
   const StudyApp = (props) => {
     const sessionsHook = props.useSessions
     const workspacesSvc = props.workspaces
@@ -357,8 +369,48 @@ function apply(ctx) {
         }
         if (sid && !openSessionInUi(sid)) setError('宿主未能切换到章节会话，请在左侧会话列表手动打开')
         await refresh()
+        // 会话就绪后自动打开本章讲义（best-effort：失败只提示，不推翻已成功的会话打开）
+        await openChapterNotes(g, c, sid)
       } catch (e) {
         setError('打开章节会话失败: ' + String((e && e.message) || e))
+      } finally {
+        setBusyKey(null)
+      }
+    }
+
+    // 把讲义交给 DSH-better-sidebar 开成右侧页签（.md 由它内置的 markdown viewer 渲染）。
+    // 官方口径：能力面 `features` 是单调列表（只增不减），新 API 一律按成员判定门控；
+    // scope 决定页签落在**哪个会话**的面板里，所以优先用本章会话，让用户看到的讲义就在他刚进的那章旁边。
+    // 返回 false = 没装该插件/没有该能力/调用抛错 ⇒ 调用方降级。openFile 是 fire-and-forget（用户把
+    // editor 页签类型在设置里关掉时它会静默 no-op），故"true"只代表"已受理"，不等于页签必然出现。
+    const openInSidebar = (filePath, sessionId, title) => {
+      const bs = getBetterSidebar()
+      if (!bs || typeof bs.openFile !== 'function') return false
+      if (Array.isArray(bs.features) && bs.features.indexOf('openFile') < 0) return false
+      try {
+        bs.openFile(sessionId ? { sessionId: sessionId } : undefined, filePath, title)
+        return true
+      } catch (e) {
+        return false
+      }
+    }
+
+    // 打开章节讲义：先经 study.readChapter 校验文件确实存在并拿到绝对路径；
+    // better-sidebar 在就把路径交给它，否则 window.open 本插件的 /study-file 页（浏览器新标签）。
+    const openChapterNotes = async (g, c, sessionId) => {
+      setBusyKey('notes:' + g.id + ':' + c.index)
+      try {
+        const r = await call('study.readChapter', { goalId: g.id, chapter_index: c.index })
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '读取讲义失败')); return }
+        if (openInSidebar(r.filePath, sessionId || c.sessionId || g.sessionId, c.title)) return
+        const url = '/study-file?goalId=' + encodeURIComponent(g.id) + '&chapter=' + encodeURIComponent(c.index)
+        let openedWin = null
+        try {
+          if (typeof window !== 'undefined' && typeof window.open === 'function') openedWin = window.open(url, '_blank')
+        } catch (e) {}
+        if (!openedWin) setNotice('讲义页已就绪，但浏览器拦住了新标签：' + url)
+      } catch (e) {
+        setError('打开讲义失败: ' + errText(e))
       } finally {
         setBusyKey(null)
       }
@@ -812,7 +864,7 @@ function apply(ctx) {
                   exp && React.createElement('div', { className: 'stuiGoalBody' },
                     React.createElement('div', { className: 'stuiDetail' },
                       React.createElement('div', { className: 'stuiMeta' }, '目标: ' + (g.target_level || '未说明')),
-                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；章节讲义就绪后点「开始学习」进该章会话')
+                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；章节讲义就绪后点「开始学习」进该章会话并自动打开本章讲义，也可随时单点「📖 讲义」查看')
                     ),
                     React.createElement('div', { className: 'stuiDetail' },
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiDraftOv' }, '草案: ' + ((g.draft && g.draft.overview) || '')),
@@ -848,7 +900,8 @@ function apply(ctx) {
                           React.createElement('span', { className: 'stuiChip', 'data-tone': toneOf(c.status) }, labelOf(c.status)),
                           c.status === 'draft' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.generateChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '生成中…' : '生成讲义'),
                           c.status === 'generating' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.continueChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '继续中…' : '继续生成'),
-                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: chBusy, onClick: () => openChapterSession(g, c) }, chBusy ? '打开中…' : '📖 开始学习')
+                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: chBusy, onClick: () => openChapterSession(g, c) }, chBusy ? '打开中…' : '📖 开始学习'),
+                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: busyKey === 'notes:' + g.id + ':' + c.index, title: '打开本章讲义（DSH-better-sidebar 页签优先，未装则浏览器新标签）', onClick: () => openChapterNotes(g, c) }, busyKey === 'notes:' + g.id + ':' + c.index ? '打开中…' : '📖 讲义')
                         )
                       }),
                       (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && chapterList.length === 0 && React.createElement('div', { className: 'stuiMeta' }, '章节待生成'),

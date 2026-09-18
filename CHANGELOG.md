@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.2] - 2026-09-18
+
+### added
+- **章节「打开讲义」（D33）**：点「📖 开始学习」在切换到章节会话后**自动打开本章讲义**；章节行另给独立「📖 讲义」按钮随时可开。落点分层，**不在左侧本面板内渲染**：
+  1. 新 RPC **`study.readChapter`**（goalId + chapter_index → 绝对路径/正文/标题）先确认讲义确实已生成——`ch.file` 过 `path.basename` 全等校验，绝不借道读 `study-work` 之外的文件；
+  2. 交给 **[DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)**（页签式右侧面板底座）开成页签：`ctx.get('betterSidebar').openFile({ sessionId: 本章会话 }, 绝对路径, 章标题)`，能力按其官方 `features` 单调列表含 `'openFile'` 门控，`.md` 由它内置 markdown viewer 渲染；服务只在 **client 侧**存在 ⇒ 与 `uiWorkspace` 同样**惰性取、绝不写进 inject**（没装它的机器不能因此启不来），两个插件互不依赖；
+  3. 取不到服务 / 无该能力 → **`window.open('/study-file?goalId=…&chapter=…','_blank')`** 浏览器新标签；
+  4. 新标签被浏览器拦下 → 白话提示里带上完整地址，用户手动开。
+- **新 HTTP 路由 `/study-file`**（GET 章节讲义页）：入参**不含任何路径**（缺 `chapter` 或非整数 → 400、未知目标/章节、讲义未生成 → 404、非 GET → 405），默认出自包含 HTML —— 正文**全量转义**（注入载荷只会以 `&lt;script&gt;` 出现）、CSP `default-src 'none'; style-src 'unsafe-inline'` + `nosniff`、深色模式适配；`format=raw` 出 Markdown 原文。来源 IP 依旧不判定（承 D25）。
+- 测试：`client.test` 40→**46**（未装插件时新标签 / 弹窗被拦降级提示 / `openFile` 收到 `{sessionId}`+绝对路径+**章**标题且不再开新标签 / `features` 缺 `openFile` 时不硬调 / 缺讲义白话报错 / 开始学习以本章会话为 scope 联动），`smoke` 新增 readChapter **3** 条 + `/study-file` **11** 条（注册、200+content-type、CSP、注入不执行、`format=raw` 原文、400×2、404×2、405）。净室探针的路由集合断言改为三条路由。
+- ⚠ **真机验收未做**：`openFile` 的签名/字段核对自 better-sidebar 源码（0.19.1），但"装了这个插件的 DSH 上点一下真能出现右侧页签"仍需实机跑一次；其 `openTab` 在用户关掉 `editor` 页签类型时静默 no-op，本插件无法感知（见 D33 残留边界）。
+
+### 备注（与本功能无关）
+- 本机宿主升级到 **dsh 0.1.5-rc.2** 后其 `JsonlSessionPersistence` 不再暴露 `inspect()` ⇒ `smoke`（249 行起）与 `portable`（220 行）在**未改动的 master 上同样失败**，属夹具待跟进宿主漂移，与本功能无关、未改代码；`client.test` 46 / `sync.test` 78 全绿。
+
 ## [0.7.1] - 2026-09-18
 
 ### fixed

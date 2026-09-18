@@ -120,6 +120,7 @@ study-work/
 | study.continueChapter | goalId,chapter_index | 先查文件：已产出→ready；否则会话可用→重发任务；不可用→回退 draft 并提示 |
 | study.recordChapterSession | goalId,chapter_index,sessionId | 记录章节会话 id |
 | study.startChapter | goalId,chapter_index,sessionId | 向章节会话注入「本章学习教练」开场指令（读讲义→讲解→每次回答后检查是否有值得回写的补充内容并询问用户→写回 NN-qa.md） |
+| study.readChapter | goalId,chapter_index | 确认本章讲义已生成并回出**绝对路径** + 正文 + 标题（面板「打开讲义」数据口：路径交给 client 侧 `betterSidebar` 服务的 `openFile` 开成右侧页签，取不到则 `window.open` `/study-file`；ch.file 过 basename 全等校验防穿越） |
 | study.recordGoalSession | goalId,sessionId | 回写目标总会话 id（旧会话被销毁后面板新建会话时使用，配合 D10） |
 | study.dispatchResearch | goalId | 面板「▶ 开始调研 / 🔁 重新调研」的派发口：宿主内委托 `chatResearch`（解析目标会话 → 按 reject_reason 选首次/重试指令 → 注入 → 记 `research.dispatchedAt`），派发调研的唯一 owner |
 | study.deleteGoal | goalId | 移出 index 并标记 deleted（文件保留） |
@@ -131,11 +132,12 @@ study-work/
 | study.reattachGoalSessions | goalId | 修复入口：重建工作区登记并把 goal.json 记录的会话挂回分组；**以宿主投影判定成败**（`ok:false` + `notShown[]`），并报出哪些 id 在归档集里 |
 | `mode` 语义 | `overwrite`（面板默认，包为准；分叉/回退需 `force`）/ `merge`（聊天缺省：只新增与快进，分叉项 `skippedDiverged`）/ `copy`（新 goalId + 会话全部换身份，绝不碰现有目标） | |
 
-### 文件路由（webServer prefix，GET 下载）
+### 文件路由（webServer prefix，GET 下载 / 读文件）
 
 | 路由 | 行为 |
 | --- | --- |
 | `/study-export?file=<裸文件名>.zip` | 流式返回 `exports/` 内的导出包；仅 GET、`path.basename` 后还必须与入参全等（拒路径穿越）、仅 `.zip`；**不判定来源 IP**（见 D25） |
+| `/study-file?goalId=&chapter=[&format=raw]` | 章节讲义页：仅 GET；**入参不含路径**，落点经 `goal.json` 反查 + `ch.file` basename 全等校验（缺/非整数 chapter→400，未知目标或章节、讲义未生成→404）；默认出自包含 HTML（正文全量转义、CSP `default-src 'none'; style-src 'unsafe-inline'`、`nosniff`、深色适配），`format=raw` 出 Markdown 原文；同样**不判定来源 IP**（见 D25、D33） |
 
 ### 模型工具（聊天，`study_plan_*` / `study_goal_*`）
 
@@ -210,6 +212,7 @@ study-work/
 | D30 | 真分叉**程序绝不自动吃掉任一侧**：push 无 force、pull 无 discardLocal 一律返回 `needChoice`，亮出远端 `exportedAt/deviceId/bytes` 后由用户二选一（覆盖仓库 / 放弃本地） | 用户的原始诉求。`syncPull` 在下载**前**先反查本机对应目标并 `syncAssess`，已 conflicted 就直接挡，而不是拉下来靠导入侧再报错。放弃本地 = 导入 force，但**不 prune 本地独占文件**（D22），"放弃"≠"删除" |
 | D31 | 同步 endpoint **只接受 `https://host`，明文 `http` 仅放行回环**（`127.0.0.1|localhost:port`，为本地 mock 测试）；token 明文**永不进任何 RPC 返回值**，只回 `tokenHint=••••末四位` | 绑定把长期凭据（PAT / OAuth access_token）发给 endpoint，走明文 http 会外泄。回环例外只为测试；生产恒 https。config 出面板前一律 `redactSyncCfg` 抹掉 token 与 clientSecret |
 | D32 | GitHub 绑定主路 = **一键设备码**：发布版内置官方 OAuth App 的 **public `client_id`（`DEFAULT_CLIENT_ID`，绝不含 client_secret）**；`syncGetConfig` 回 `oneClick`，面板据此给「🔗 一键登录 GitHub 授权」（自动 `window.open` + 自动复制一次性代码 + `setInterval` 自动轮询，成功即落地不手动确认）。client_id 空/App 被撤 ⇒ 折叠「▸ 高级选项」手填 client_id 或走 fine-grained PAT 逃生舱。**多主机绑同一账号是预期用法**：各机各自授权、各拿独立令牌、共认领同一 `dsh-study-sync`，后来者见有效标记即 **adopt（直接采用为 ready）** 而非触发 D28 接管；导出包各带 `deviceId` 供冲突面板区分来源 | 用户诉求"绑定 git 太复杂，给个一键连接"。**Web redirect（PKCE + 本地回调）被否**：多主机/局域网下 `redirect_uri` 拓扑无解（承 D25 无 IP 守卫、D31 只回环明文），设备码天然多主机友好。**A（设备码）vs C（PAT）的取舍**：一键零配置，代价是账号级"撤销该 OAuth App"一次性作废所有机器的设备令牌需逐机重授、且 App 授权面可能宽于单仓；PAT 逐机独立、单仓 Contents 最小权限、撤一台不影响他机——长期/跨信任域优先 PAT。设备码流程不需要 secret，内置公开 client_id 可安全入仓分发（红线：secret 绝不进仓库）。`sync.test` §9b 回归 adopt 不误触接管、不清他机已推目标、跨机 deviceId 独立（77 断言） |
+| D33 | 「打开讲义」= **交给 DSH-better-sidebar 开右侧页签，探不到才浏览器新标签**，绝不在左侧本面板内渲染：① `study.readChapter` 确认讲义已生成并拿绝对路径 → ② `ctx.get('betterSidebar').openFile({sessionId: 本章会话}, 绝对路径, 章标题)`（按 `features` 含 `'openFile'` 门控；抛错/缺席/无能力一律返回 false） → ③ 降级 `window.open('/study-file?goalId=…&chapter=…','_blank')` → ④ 新标签被拦才 `setNotice` 摆出地址。「📖 开始学习」在会话切换成功后自动跑 ②③④，且把**刚切过去的章节会话 id 当 scope** 传下去；章节行另有独立「📖 讲义」按钮 | 用户诉求原话是"在 DSH-better-sidebar 插件中打开讲义，如果没有插件可以打开一个页签" ⇒ 讲义该跟会话并排在**右侧页签**里，**占用左侧面板自身**的方案被当场否决。**API 已核到源码**（`omdsh-dev/DSH-better-sidebar` main @ 0.19.1，`docs/external-plugin-guide.md`）：`betterSidebar` 由 **client 半** `ctx.provide`（guide §10 明示"host 半无此服务"）⇒ 与 `uiWorkspace` 同理**绝不写进模块级 inject**（硬激活门：没装它的机器面板会整体消失），只惰性 `ctx.get` + 只缓存成功；`openFile(scope, path, title?)` 是 `openTab({type:'editor', id:'editor:'+path}, scope)` 的薄包装，`.md` 命中其**内置 markdown viewer**（`builtins/viewers.tsx` 注册 `exts:['md','markdown']`, `fetchStrategy:'fsRead'`）⇒ 本插件不需要 `registerTab`/`registerFileViewer`，也不引它的任何代码（无 peerDependency，纯服务名协作）。`scope.sessionId` 决定页签落在**哪个会话**的面板，所以必须跟着会话走。`features` 是官方承诺"只增不减"的单调能力列表 ⇒ 门控按成员判定，不比版本串。**残留边界**：`openTab` 在用户于 side card 设置里关掉 `editor` 类型时**静默 no-op**（只 `console.warn`），我们无从感知 ⇒ ② 的"成功"只代表"已受理"，不等于页签必然出现；真出现该情形时用户会看到什么都没发生（不会报错也不会自动补开新标签）。③ 必须有服务端渲染页，故**撤销**本决策早期"刻意不加 `/study-file` 第三条路由"的判断：新标签兜底绕不开它。其安全口径按 D25（不判来源 IP）另立三道硬约束：入参只有 `goalId`+整数 `chapter`（**不含路径**，缺参/非整数即 400，落点一律经 `goal.json` 反查 + `ch.file` basename 全等）、正文全量转义、CSP `default-src 'none'; style-src 'unsafe-inline'` + `nosniff`。测试：`client.test` 46 断言（未装插件→新标签 / 弹窗被拦→提示 / `openFile` 收到 `{sessionId}`+绝对路径+**章**标题且不开新标签 / `features` 缺 `openFile` 时不硬调 / 缺文件白话报错 / 开始学习以本章会话为 scope 联动）、`smoke` 新增 readChapter 3 + `/study-file` 11 断言（注册/200/CSP/注入不执行/raw/400×2/404×2/405）、净室路由集合断言改为三条路由。**真机验收仍未做**：需要一台装了 `dsh-better-sidebar@0.19.1` 的 DSH 实跑一次 |
 
 ## 7. 已知限制 / 后续路线
 

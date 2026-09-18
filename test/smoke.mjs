@@ -91,9 +91,11 @@ const ctx = {
 apply(ctx, { workRoot: tmpRoot })
 const rpcRoute = routes['/study-rpc']
 const fileRoute = routes['/study-export']
+const pageRoute = routes['/study-file']
 if (!rpcRoute) { console.error('FAIL: /study-rpc 路由未注册'); process.exit(1) }
 check('路由已注册', rpcRoute.kind === 'prefix' && rpcRoute.path === '/study-rpc')
 check('下载路由已注册', !!fileRoute && fileRoute.path === '/study-export' && fileRoute.kind === 'prefix')
+check('讲义页路由已注册', !!pageRoute && pageRoute.path === '/study-file' && pageRoute.kind === 'prefix')
 
 function callRpc(method, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -127,6 +129,18 @@ function callFile(url, opts = {}) {
     }
     const req = { method: opts.method || 'GET', url, socket: { remoteAddress: opts.remote || '127.0.0.1' } }
     try { fileRoute.handler(req, res) } catch (e) { reject(e) }
+  })
+}
+
+function callPage(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const res = {
+      code: 0, body: '', headers: null,
+      writeHead(code, h) { this.code = code; this.headers = h || null },
+      end(b) { resolve({ code: this.code, headers: this.headers, text: b == null ? '' : String(b) }) }
+    }
+    const req = { method: opts.method || 'GET', url, socket: { remoteAddress: opts.remote || '127.0.0.1' } }
+    try { pageRoute.handler(req, res) } catch (e) { reject(e) }
   })
 }
 
@@ -216,6 +230,33 @@ let exportedGoalId = ''
   // continueChapter 对已就绪章节 → ready 短路
   const r9 = await callRpc('study.continueChapter', { goalId, chapter_index: 1 })
   check('continueChapter(已就绪) → ready 短路', r9.json && r9.json.ok === true && r9.json.result === 'ready', r9.json)
+
+  // readChapter：面板「打开讲义」的数据口（正文 + 绝对路径）
+  const rc1 = await callRpc('study.readChapter', { goalId, chapter_index: 1 })
+  check('readChapter ok(正文+路径+标题)', rc1.json && rc1.json.ok === true && /注意力机制/.test(rc1.json.content) && String(rc1.json.filePath).indexOf('chapters/' + gj.chapters[0].file) > 0 && rc1.json.title === gj.chapters[0].title, rc1.json && { ok: rc1.json.ok, len: (rc1.json.content || '').length })
+  check('readChapter 目标不存在 → error', (await callRpc('study.readChapter', { goalId: 'goal-none', chapter_index: 1 })).json.ok === false)
+  check('readChapter 章节不存在 → error', (await callRpc('study.readChapter', { goalId, chapter_index: 99 })).json.ok === false)
+
+  // /study-file：面板新标签兜底页（只认 goalId+chapter，路径由 goal.json 反查）
+  const pageUrl = '/study-file?goalId=' + encodeURIComponent(goalId) + '&chapter=1'
+  const original = await fsp.readFile(chAbs)
+  try {
+    await fsp.appendFile(chAbs, '\n<script>alert(1)</script> & "quoted"\n')
+    const p1 = await callPage(pageUrl)
+    check('讲义页 200 + html content-type', p1.code === 200 && /text\/html/.test(String(p1.headers && p1.headers['content-type'])), { code: p1.code, headers: p1.headers })
+    check('讲义页 CSP 锁死外部资源', String(p1.headers && p1.headers['content-security-policy']).indexOf("default-src 'none'") === 0 && String(p1.headers && p1.headers['x-content-type-options']) === 'nosniff', p1.headers)
+    check('讲义页把正文转义后渲染（不执行注入）', p1.text.indexOf('<script>alert(1)</script>') < 0 && p1.text.indexOf('&lt;script&gt;') >= 0 && p1.text.indexOf('&amp; &quot;quoted&quot;') >= 0, p1.text.slice(-260))
+    check('讲义页渲染出标题与路径回显', p1.text.indexOf('<h1>注意力机制</h1>') >= 0 && p1.text.indexOf(gj.chapters[0].file) > 0, p1.text.slice(0, 300))
+    const praw = await callPage(pageUrl + '&format=raw')
+    check('讲义页 format=raw 原样返回 markdown', praw.code === 200 && /text\/markdown/.test(String(praw.headers && praw.headers['content-type'])) && praw.text === original.toString('utf8') + '\n<script>alert(1)</script> & "quoted"\n', { code: praw.code, len: praw.text.length })
+  } finally {
+    await fsp.writeFile(chAbs, original)
+  }
+  check('讲义页缺 chapter 参数 → 400', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId))).code === 400)
+  check('讲义页 chapter 非数字 → 400', (await callPage('/study-file?goalId=x&chapter=../../etc/passwd')).code === 400)
+  check('讲义页未知目标 → 404', (await callPage('/study-file?goalId=nope&chapter=1')).code === 404)
+  check('讲义页讲义未生成 → 404', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&chapter=2')).code === 404)
+  check('讲义页拒绝非 GET', (await callPage(pageUrl, { method: 'POST' })).code === 405)
 
   // ── M4 前置：用真 locate 造出该目标的会话 transcript（目标会话 + 章节会话 + 空 subagent 会话）
   const goalAbsDir = path.join(tmpRoot, goalId)

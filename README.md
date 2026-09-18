@@ -6,7 +6,7 @@
 ## 形态（与 dsh-free-search / @xmanrui/dsh-im 等同构）
 - **宿主半** `lib/index.js`：ESM 模块，`export function apply(ctx, config)`。
   - `ctx.inject(['webServer','agents','workspaceRegistry','tools'], …)` 注入服务；导出/导入另用一条 inject 取 `sessionPersistence / sessions / attachments`（缺席只降级该功能，面板与聊天工具不受影响）
-  - `/study-rpc` webServer prefix 路由（POST only + 1MB 上限；**不判定来源 IP**，局域网可达）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip
+  - `/study-rpc` webServer prefix 路由（POST only + 1MB 上限；**不判定来源 IP**，局域网可达）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip；`/study-file` GET 路由出章节讲义页（入参只有 goalId+chapter，落点经 goal.json 反查，正文转义 + CSP `default-src 'none'`）；`study.readChapter` 供面板「打开讲义」—— 路径优先交给 client 侧的 `betterSidebar` 服务（DSH-better-sidebar）开成右侧页签，取不到才 `window.open` `/study-file` 新标签
   - `study_plan_*` 聊天工具 ×5 + `study_goal_export`/`study_goal_import` ×2：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
 - **可携化** `lib/portable.js`：零依赖 ZIP（store + deflate，已与 Windows 自带解压器互操作验证）+ zstd 会话帧工具（复刻宿主帧切分、帧级 header 重写〔可换 id/cwd/parentSession〕、只追加尾帧、行级前缀关系判定、zip-slip 防御、附件引用收集）
 - **客户端半** `lib/client.js`（构建产物，勿手改）：`window.__ModuleLoader__.load({id, factory:(require)=>…})` 形态；
@@ -18,9 +18,10 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-node test/smoke.mjs                 # 宿主半运行时冒烟（101 断言，跑在宿主真实 persistence + registry 上）
-node test/sync.test.mjs             # GitHub 同步宿主半（77 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt）
-npm test                            # smoke(101) + portable(29，含真后端交叉验证) + client(39，桩 React 真实渲染点击，含同步面板) + sync(77，GitHub 同步)
+node test/smoke.mjs                 # 宿主半运行时冒烟（含 readChapter + /study-file 讲义页；跑在宿主真实 persistence + registry 上）
+node test/sync.test.mjs             # GitHub 同步宿主半（78 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt）
+npm test                            # smoke + portable + client(45，桩 React 真实渲染点击，含同步面板与「打开讲义」) + sync(78)
+                                    # ⚠ 本机宿主升到 dsh 0.1.5-rc.2 后 JsonlSessionPersistence 无 inspect() ⇒ smoke(M4 起)/portable 崩，属夹具待跟进宿主漂移（见 CHANGELOG 0.7.2 备注），未改代码
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
@@ -52,13 +53,25 @@ dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.gi
 cd study-plugin
 node scripts/build-client.mjs        # 改过 src/ 后重建客户端 bundle（--sync-css 从动态版同步 CSS）
 node scripts/install-profile.mjs     # 默认 $DSH_HOME/profiles/web；支持 --profile <dir> / --uninstall
-node test/smoke.mjs                  # 冒烟 101 断言（含覆盖式同步回归）
+node test/smoke.mjs                  # 宿主半冒烟（含覆盖式同步回归、readChapter + /study-file 讲义页）
 node scripts/cleanroom-check.mjs     # 净室安装验证（离线）
 ```
 Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - 左栏出现「📚 学习区」（任何模式）
 - `curl -X POST http://127.0.0.1:3080/study-rpc -d '{"method":"study.list","args":{}}'` 返回 `{goals:[…]}`
 - `~/.dsh/study-work/README.md` 被刷新为常驻版文案
+- `curl "http://127.0.0.1:3080/study-file?goalId=<目标id>&chapter=1"` 返回该章讲义的 HTML 页（`&format=raw` 出 Markdown 原文）
+
+## 章节讲义怎么打开（v0.7.2）
+
+章节讲义就绪后，点「📖 开始学习」= 进该章会话 **并自动打开本章讲义**；也可随时单点「📖 讲义」。讲义**不在左侧学习区面板里渲染**，落点按优先级：
+
+1. **交给 [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)**（页签式右侧面板底座）：`ctx.get('betterSidebar').openFile({ sessionId: 本章会话 }, 讲义绝对路径, 章标题)` —— 页签直接开在**你刚进入的那章会话**旁边，`.md` 由它内置的 markdown viewer 渲染。能力按其官方 `features` 列表（含 `'openFile'`）门控；两个插件**互不依赖**，纯靠服务名协作，本插件不引它的任何代码。
+   装它：`dsh plugin --profile web add dsh-better-sidebar@latest`（装完浏览器硬刷新一次）。
+2. 没装 / 取不到服务 / 能力面没有 `openFile` → **浏览器新标签**打开本插件自带的 `/study-file` 讲义页（自包含 HTML，正文全量转义、CSP 锁死外部资源、深色模式适配）；
+3. 新标签也被拦 → 面板把完整地址白话显示出来，手动粘帖即可。
+
+> ⚠ 两点边界：① better-sidebar 的 `openFile` 是 fire-and-forget —— 用户在它的 side card 设置里关掉 `editor` 页签类型时它会**静默不响应**，本插件感知不到，于是要么看到页签、要么什么都没发生（不会报错）。② 本功能在装了 better-sidebar 的**真机上尚未跑过**，上面的签名/字段核对自其源码（0.19.1），落地效果待实机验收。
 
 ## GitHub 同步（跨机器 · v0.7.0）
 
