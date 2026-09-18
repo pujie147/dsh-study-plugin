@@ -204,9 +204,10 @@ const slots = {
   inject: (name, setup) => { capturedSlot.push(name); setup() },
   register: (spec, renderFn) => { slotSpec = spec; slotRender = renderFn; return renderFn }
 }
+let mirrorRefreshes = 0
 const sessionsSvc = {
   list: { getSnapshot: () => ({ byId: { 'session-g': {}, 'session-c1': {} } }) },
-  refresh: async () => {},
+  refresh: async () => { mirrorRefreshes++ },
   open: (id) => { opened.push(id) },
   create: async () => ({ sessionId: 'session-new' })
 }
@@ -295,6 +296,7 @@ ok('「允许覆盖分叉/更旧的本地会话」勾选会带 force 重新预�
 const confirmBtn = flat.find((e) => e.type === 'button' && textOf(e).indexOf('确认覆盖导入') >= 0)
 assert.ok(confirmBtn, '确认按钮缺失: ' + flat.filter((e) => e.type === 'button').map(textOf).join('|'))
 assert.notEqual(confirmBtn.props.disabled, true, '无冲突时确认按钮不该禁用')
+const mrBefore = mirrorRefreshes
 await click(confirmBtn, 'confirm import')
 const impArgs = rpc.filter((c) => c[0] === 'import').map((c) => c[1]).pop()
 assert.equal(impArgs.confirm, true)
@@ -304,7 +306,8 @@ tree = await renderAll()
 assert.ok(bodyText().indexOf('已导入/更新目标「软件设计」') >= 0, '导入成功提示缺失')
 assert.ok(bodyText().indexOf('追加 1') >= 0 && bodyText().indexOf('换身份 1') >= 0, '成功提示未带分类计数')
 assert.ok(bodyText().indexOf('重启 DSH') >= 0, '缺重启提示')
-ok('「✓ 确认覆盖导入」带 confirm+mode 调用并汇报分类与重启')
+assert.ok(mirrorRefreshes > mrBefore, '导入成功后应主动刷新左栏镜像（免重启尝试）')
+ok('「✓ 确认覆盖导入」带 confirm+mode 调用、汇报分类与重启、并刷新左栏镜像')
 
 // 全 no-op 时的说法不同（幂等）
 importIdempotent = true
