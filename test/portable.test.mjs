@@ -151,8 +151,20 @@ try {
   ok('normPath 让源/目标绝对路径可比（分隔符 + 尾斜杠 + 盘符）')
 
   // ── 6. header 帧通用重写：换 id / 换 cwd / 删 parentSession ────────────────
+  // seed 的 header 形状跟随**宿主当前代际**（v3 起要求 version:3 + isSeeded），
+  // 否则第 8 节的真后端交叉验证会被宿主以"格式代际不支持"拒读；老宿主（v0）同样工作。
+  const probeHost = await createHostServices({ sessionsRoot: path.join(tmp, 'probe-sessions') })
+  const HOST_GEN = (() => {
+    try {
+      const m = /session(?:\.v(\d+))?\.jsonl/.exec(path.basename(probeHost.persistence.locate({ cwd: tmp, id: 'probe' }).path))
+      return m && m[1] !== undefined ? Number(m[1]) : 0
+    } catch { return 0 }
+  })()
+  const seedHeader = (id, cwd, extra) => JSON.stringify(Object.assign(
+    { type: 'session', version: HOST_GEN, id, createdAt: 1, cwd, delegationDepth: 0, agentPreset: 'standard' },
+    HOST_GEN >= 3 ? { isSeeded: false } : {}, extra || {}))
   const seed = await P.jsonlToZstdFrames([
-    JSON.stringify({ type: 'session', version: 0, id: 'session-a', createdAt: 1, cwd: 'C:/old/goal', delegationDepth: 0, agentPreset: 'standard' }),
+    seedHeader('session-a', 'C:/old/goal'),
     JSON.stringify({ type: 'turn/start', seq: 0, time: 9, data: { turn: 1 } }),
     JSON.stringify({ type: 'user/message', seq: 1, time: 9, data: { id: 'm1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '看这张图' }] }, surfaceOp: 'append' }),
     JSON.stringify({ type: 'turn/end', seq: 2, time: 9, data: { turn: 1, reason: { kind: 'completed' } } }),
@@ -166,7 +178,7 @@ try {
       P.scanZstdFrames(rw2.bytes).frames.length === P.scanZstdFrames(seed).frames.length && bodySame)
     const noChange = await P.rewriteTranscriptHeader(seed, { cwd: 'C:/old/goal' })
     ok('目标值与原文一致时 changed=false 且字节不变', noChange.changed === false && Buffer.compare(noChange.bytes, seed) === 0)
-    const withParent = await P.jsonlToZstdFrames(JSON.stringify({ type: 'session', version: 0, id: 'session-c', createdAt: 1, cwd: 'C:/old', parentSession: 'session-p', delegationDepth: 0 }) + '\n' + JSON.stringify({ type: 'turn/start', seq: 0, time: 9, data: { turn: 1 } }) + '\n', 1)
+    const withParent = await P.jsonlToZstdFrames(seedHeader('session-c', 'C:/old', { parentSession: 'session-p' }) + '\n' + JSON.stringify({ type: 'turn/start', seq: 0, time: 9, data: { turn: 1 } }) + '\n', 1)
     ok('parentSession 传 null 删除该字段、传值改写该字段',
       !('parentSession' in P.readSessionHeader((await P.rewriteTranscriptHeader(withParent, { parentSession: null })).bytes)) &&
       P.readSessionHeader((await P.rewriteTranscriptHeader(withParent, { parentSession: 'session-q' })).bytes).parentSession === 'session-q')

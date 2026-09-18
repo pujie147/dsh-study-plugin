@@ -151,6 +151,24 @@ export async function createHostServices({ sessionsRoot, sessions }) {
     } catch { hostSessions = fallbackSessions }
   }
   const persistence = new host.JsonlSessionPersistence(makeStubCtx({ storageDomain, sessions: hostSessions }), { root: sessionsRoot, compression: 'zstd' })
+  // 本机安装的宿主 JsonlSessionPersistence 只暴露 locate/list/stat/create/open/append/flush，
+  // **没有 inspect()**（插件生产侧用 typeof 守卫跳过自检，测试侧的验帧断言却直接调它 ⇒ 红）。
+  // 这里用真实的 open(id,'read') + handle.read(0) 补一个只读 shim，形状对齐调用方期望的
+  // { meta, events }；宿主原生有 inspect 时绝不覆盖。这是"造缺失的 API"，不是"放宽断言"——
+  // 读不出来的字节照样抛（open/read 会跑宿主的 header 校验、seq 连续性与 surface 折叠）。
+  if (typeof persistence.inspect !== 'function') {
+    persistence.inspect = async (id) => {
+      let handle
+      try { handle = await persistence.open(id, 'read') } catch { return undefined }
+      try {
+        const header = handle.header || {}
+        const r = typeof handle.read === 'function' ? await handle.read(0) : { events: [] }
+        return { meta: { id: header.id || id, cwd: header.cwd }, events: (r && r.events) || [] }
+      } finally {
+        try { if (handle && typeof handle.close === 'function') await handle.close() } catch {}
+      }
+    }
+  }
   const registry = new host.WorkspaceRegistry(makeStubCtx({ storageDomain, sessions: hostSessions, sessionPersistence: persistence }))
   await registry[host.Service.init]()
   return { host, persistence, registry, storageDomain, sessions: hostSessions, usingRealSessionStore, fallbackSessions }

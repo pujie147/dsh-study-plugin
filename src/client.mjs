@@ -92,6 +92,10 @@ function apply(ctx) {
     const [impPreview, setImpPreview] = React.useState(null)
     const [impMode, setImpMode] = React.useState('overwrite')
     const [impForce, setImpForce] = React.useState(false)
+    const [uploads, setUploads] = React.useState([])
+    const [uploading, setUploading] = React.useState(false)
+    const [dragOver, setDragOver] = React.useState(false)
+    const fileRef = React.useRef(null)
     const [anchor, setAnchor] = React.useState(undefined)
     const [open, setOpen] = React.useState(ui.open)
     const rootRef = React.useRef(null)
@@ -373,6 +377,7 @@ function apply(ctx) {
         if (!r || r.ok !== true) { setError(String((r && r.error) || '导出失败')); return }
         setNotice('✅ 已导出 ' + r.file + '（' + fmtBytes(r.bytes) + '，会话 ' + r.counts.sessions + ' 个 / 附件 ' + r.counts.attachments + ' 个）')
         await loadExports()
+        await loadUploads()
         setView('io')
       } catch (e) {
         setError('导出失败: ' + String((e && e.message) || e))
@@ -389,14 +394,14 @@ function apply(ctx) {
       skippedByRequest: '按选择跳过', skippedDiverged: '分叉·本次不动',
     }
     const IDENTITY_LABEL = { fresh: '沿用原 id', update: '原地更新', adopt: '续用上次映射', reissue: '换发新身份' }
-    const previewWith = async (mode, force) => {
+    const previewWith = async (mode, force, ref) => {
       const p = impPath.trim()
-      if (!p) { setError('先填导出包的绝对路径（或 exports 目录里的文件名）'); return }
+      const arg = ref || (/\.zip$/i.test(p) && /[\\/]/.test(p) ? { path: p } : (p ? { file: p } : null))
+      if (!arg) { setError('先填导出包的绝对路径（或 exports 目录里的文件名），或直接上传本机的 zip'); return }
       setIoBusy(true)
       setError('')
       setImpPreview(null)
       try {
-        const arg = /\.zip$/i.test(p) && /[\\/]/.test(p) ? { path: p } : { file: p }
         const r = await call('study.inspectImport', Object.assign({}, arg, { mode: mode, force: !!force }))
         if (!r || r.ok !== true) { setError(String((r && r.error) || '预览失败')); return }
         setImpPreview(Object.assign({}, r, { arg: arg, mode: mode, force: !!force }))
@@ -409,12 +414,13 @@ function apply(ctx) {
     const doPreviewImport = () => previewWith(impMode, impForce)
     const pickMode = (m) => {
       setImpMode(m)
-      if (impPath.trim()) previewWith(m, impForce)
+      if (impPreview && impPreview.arg) previewWith(m, impForce, impPreview.arg)
+      else if (impPath.trim()) previewWith(m, impForce)
     }
     const toggleForce = () => {
       const f = !impForce
       setImpForce(f)
-      if (impPreview) previewWith(impMode, f)
+      if (impPreview) previewWith(impPreview.mode, f, impPreview.arg)
     }
     const doConfirmImport = async () => {
       if (!impPreview) return
@@ -436,9 +442,85 @@ function apply(ctx) {
         setIoBusy(false)
       }
     }
+    // 取消预览时顺手清掉它引用的临时上传包（服务器路径/exports 引用不动）
+    const clearPreview = async () => {
+      const arg = impPreview && impPreview.arg
+      setImpPreview(null)
+      if (arg && arg.upload) { await call('study.deleteUpload', { upload: arg.upload }).catch(() => {}) ; loadUploads() }
+    }
     const doDeleteExport = async (item) => {
       await call('study.deleteExport', { file: item.file })
       await loadExports()
+    }
+    const loadUploads = async () => {
+      const r = await call('study.listUploads', {})
+      if (r && r.ok === true) setUploads(r.uploads || [])
+      else setError(String((r && r.error) || '读取上传列表失败'))
+    }
+    const doUploadFile = async (file) => {
+      if (!file) return
+      setUploading(true)
+      setError('')
+      setNotice('')
+      try {
+        const fd = new FormData()
+        fd.append('file', file, file.name || 'upload.zip')
+        const resp = await fetch('/study-upload', { method: 'POST', body: fd })
+        const r = await resp.json().catch(() => null)
+        if (!resp.ok || !r || r.ok !== true) { setError('上传失败: ' + String((r && r.error) || ('HTTP ' + resp.status))); return }
+        if (r.duplicate) setNotice('ℹ️ 这个包（按内容）之前已上传过，直接复用列表里那份：' + r.file)
+        else setNotice('✅ 已上传 ' + r.file + '（' + fmtBytes(r.bytes) + '）')
+        await loadUploads()
+        if (r.uploadId) previewWith(impMode, impForce, { upload: r.uploadId })
+      } catch (e) {
+        setError('上传失败: ' + String((e && e.message) || e))
+      } finally {
+        setUploading(false)
+        if (fileRef.current) fileRef.current.value = ''
+      }
+    }
+    const onPickFile = (e) => { const f = e.target.files && e.target.files[0]; doUploadFile(f) }
+    const onDrop = (e) => {
+      e.preventDefault(); setDragOver(false)
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]
+      if (f) doUploadFile(f)
+    }
+    const doDeleteUpload = async (row) => {
+      const r = await call('study.deleteUpload', { upload: row.uploadId })
+      if (!r || r.ok !== true) setError(String((r && r.error) || '删除失败'))
+      if (impPreview && impPreview.arg && impPreview.arg.upload === row.uploadId) setImpPreview(null)
+      await loadUploads()
+    }
+    const doRenameUpload = async (row) => {
+      const name = window.prompt('新的显示名（仅影响列表展示）', row.name)
+      if (name == null || !name.trim()) return
+      await call('study.renameUpload', { upload: row.uploadId, name: name.trim() })
+      await loadUploads()
+    }
+    const importUploadWith = async (row, mode) => {
+      setError('')
+      setIoBusy(true)
+      try {
+        const arg = { upload: row.uploadId, mode: mode, force: !!impForce }
+        const pv = await call('study.inspectImport', arg)
+        if (!pv || pv.ok !== true) { setError(String((pv && pv.error) || '预览失败')); return }
+        if (pv.canImport !== true) {
+          setImpPreview(Object.assign({}, pv, { arg, mode, force: !!impForce }))
+          setError('该包按「' + (mode === 'overwrite' ? '覆盖' : mode === 'copy' ? '另存副本' : '合并') + '」不能直接导入：看下方预览的冲突说明。')
+          return
+        }
+        const r = await call('study.importGoal', Object.assign({}, arg, { confirm: true }))
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '导入失败') + (r && r.rolledBack ? '（已回滚，未留下半成品）' : '')); return }
+        const ap = r.applied || {}
+        const bits = ['新增 ' + (ap.create || 0), '追加 ' + (ap.append || 0), '替换 ' + (ap.replace || 0), '不变 ' + (ap.noop || 0)]
+        if (r.remap && r.remap.length) bits.push('换身份 ' + r.remap.length)
+        setNotice('✅ ' + (r.idempotent ? '已是最新（无改动）：' : '已导入/更新目标「') + (r.title || r.goalId) + '」' + bits.join(' · ') + '，附件 ' + r.attachments + ' 个。源包保留在上传列表，可重复使用。重启 DSH 后左栏分组与会话列表才会完整刷新。')
+        await refresh()
+      } catch (e) {
+        setError('导入失败: ' + String((e && e.message) || e))
+      } finally {
+        setIoBusy(false)
+      }
     }
 
     const ioView = () => React.createElement('div', { className: 'stuiForm' },
@@ -454,9 +536,35 @@ function apply(ctx) {
           React.createElement('a', { className: 'stuiAct', href: it.downloadUrl, download: it.file, style: { textDecoration: 'none' } }, '⬇ 下载'),
           React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'danger', disabled: ioBusy, onClick: () => doDeleteExport(it) }, '删')
         ))),
+      // ── Web 上传：本机浏览器的 zip → 服务器临时 uploads/ ─────────────────────
+      React.createElement('div', { className: 'stuiDraftOv' }, '📤 从本机浏览器上传导出包（zip）。上传后可预览，并按 覆盖 / 合并 / 另存副本 三种方式导入；同一个包重复导入是「更新」而不是复制。'),
+      React.createElement('div', {
+        className: 'stuiDrop' + (dragOver ? ' stuiDropOn' : ''),
+        onDragOver: (e) => { e.preventDefault(); setDragOver(true) },
+        onDragLeave: () => setDragOver(false),
+        onDrop: onDrop
+      },
+        React.createElement('span', null, dragOver ? '松手即上传' : '把 study-goal-*.zip 拖到这里，或'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: uploading || ioBusy, onClick: () => fileRef.current && fileRef.current.click() }, uploading ? '上传中…' : '📎 选择文件上传'),
+        React.createElement('input', { ref: fileRef, type: 'file', accept: '.zip,application/zip', style: { display: 'none' }, onChange: onPickFile })
+      ),
+      uploads.length > 0 && React.createElement('div', { className: 'stuiMeta' }, '已上传的包（临时目录，7 天后自动清理）:'),
+      uploads.map((row) => React.createElement('div', { key: row.uploadId, className: 'stuiChRow' },
+        React.createElement('span', { className: 'stuiChTitle', title: row.name + ' · sha256:' + String(row.sha256).slice(0, 12) }, row.name),
+        row.duplicateOf && React.createElement('span', { className: 'stuiChip', 'data-tone': 'warn' }, '重复'),
+        React.createElement('span', { className: 'stuiChip' }, fmtBytes(row.bytes)),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || uploading, onClick: () => previewWith(impMode, impForce, { upload: row.uploadId }) }, '🔍'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || uploading, title: '按当前 force 设置直接覆盖导入（先预览，有冲突则停在预览）', onClick: () => importUploadWith(row, 'overwrite') }, '⤴'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || uploading, title: '合并导入：只新增与快进，本地分叉项不动', onClick: () => importUploadWith(row, 'merge') }, '➕'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy || uploading, title: '另存副本：新 goalId、会话全部换身份，绝不碰现有目标', onClick: () => importUploadWith(row, 'copy') }, '📋'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, title: '改名（仅显示名）', onClick: () => doRenameUpload(row) }, '✏️'),
+        React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'danger', disabled: ioBusy, onClick: () => doDeleteUpload(row) }, '🗑')
+      )),
+      uploads.length > 0 && React.createElement('div', { className: 'stuiMeta' }, '⤴ 覆盖 · ➕ 合并 · 📋 另存副本 —— 对选中包一键执行（有冲突会停在预览说明原因）'),
+      // ── 导入操作区（服务器路径引用仍可用） ────────────────────────────────────
       React.createElement('div', { className: 'stuiDraftOv' }, '导入 = 应用一个包（可重复执行）：同一个包再导一次是「更新」而不是复制。目标 / 会话 / 工作区都按这个原则处理；本地比包新的内容不会被悄悄吃掉（需要勾 force）。'),
       React.createElement('input', {
-        className: 'stuiInput', value: impPath, placeholder: 'C:\\Users\\me\\Downloads\\study-goal-…-20260909.zip',
+        className: 'stuiInput', value: impPath, placeholder: '服务器路径：C:\\Users\\me\\Downloads\\study-goal-…-20260909.zip（或 exports 目录里的文件名）；本机浏览器的包请直接用上面的上传',
         onChange: (e) => { setImpPath(e.target.value); setImpPreview(null) }
       }),
       React.createElement('div', { className: 'stuiRow' },
@@ -489,7 +597,7 @@ function apply(ctx) {
             type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: ioBusy || impPreview.canImport !== true,
             onClick: () => doConfirmImport()
           }, ioBusy ? '导入中…' : '✓ 确认' + (impPreview.mode === 'copy' ? '另存副本' : impPreview.mode === 'overwrite' ? '覆盖导入' : '合并导入')),
-          React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, onClick: () => setImpPreview(null) }, '取消')
+          React.createElement('button', { type: 'button', className: 'stuiAct', disabled: ioBusy, onClick: () => clearPreview() }, '取消')
         )
       )
     )
@@ -519,7 +627,7 @@ function apply(ctx) {
           React.createElement('span', { className: 'stuiRow' },
             React.createElement('button', {
               type: 'button', className: 'stuiIconBtn', 'data-active': view === 'io' || undefined,
-              title: '导出包 / 导入', onClick: () => { const next = view === 'io' ? 'list' : 'io'; setView(next); setImpPreview(null); if (next === 'io') loadExports() }
+              title: '导出包 / 导入', onClick: () => { const next = view === 'io' ? 'list' : 'io'; setView(next); setImpPreview(null); if (next === 'io') { loadExports(); loadUploads() } }
             }, '📦'),
             React.createElement('button', { type: 'button', className: 'stuiIconBtn', title: '刷新', onClick: () => refresh() }, '⟳'),
             React.createElement('button', { type: 'button', className: 'stuiIconBtn', title: '收起', onClick: () => setOpenBoth(false) }, '✕')

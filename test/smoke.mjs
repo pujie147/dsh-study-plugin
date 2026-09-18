@@ -130,6 +130,54 @@ function callFile(url, opts = {}) {
   })
 }
 
+const uploadRoute = routes['/study-upload']
+check('上传路由已注册', !!uploadRoute && uploadRoute.path === '/study-upload' && uploadRoute.kind === 'prefix')
+
+/** 构造 multipart/form-data 请求体（一个或多个文件 part）。 */
+function buildMultipart(boundary, parts) {
+  const chunks = []
+  for (const p of parts) {
+    chunks.push(Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="' + (p.field || 'file') + '"; filename="' + (p.name || 'x.zip') + '"\r\nContent-Type: application/zip\r\n\r\n'))
+    chunks.push(Buffer.isBuffer(p.data) ? p.data : Buffer.from(String(p.data)))
+    chunks.push(Buffer.from('\r\n'))
+  }
+  chunks.push(Buffer.from('--' + boundary + '--\r\n'))
+  return Buffer.concat(chunks)
+}
+/** 把整块 body 切成小块喂给上传 handler（测流式解析的跨 chunk 边界）。 */
+function callUpload(bodyBuf, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const res = {
+      code: 0, body: '', headers: null,
+      writeHead(code, h) { this.code = code; this.headers = h || null },
+      end(b) {
+        let json = null
+        try { json = JSON.parse(String(b)) } catch {}
+        resolve({ code: this.code, json, text: String(b == null ? '' : b) })
+      }
+    }
+    const req = new EventEmitter()
+    req.method = opts.method || 'POST'
+    req.headers = { 'content-type': opts.contentType === undefined ? 'multipart/form-data; boundary=' + (opts.boundary || 'SB') : opts.contentType }
+    req.socket = { remoteAddress: opts.remote || '127.0.0.1' }
+    req.destroy = () => { req.destroyed = true }
+    // 关键：handler 是 async（建目录 await 发生在挂监听之前），必须等它完成注册再投数据。
+    // EventEmitter 无背压，同步灌完 data+end 后事件循环可能一直不空转 ⇒ WriteStream 的
+    // open/flush/close 永不落定；每块之间让出一个 tick，流才有机会推进。
+    ;(async () => {
+      try { await uploadRoute.handler(req, res) } catch (e) { reject(e); return }
+      if (res.code) return   // handler 同步路径已应答（405/400）⇒ 不再投递
+      const size = opts.chunkSize || 4096
+      for (let i = 0; i < bodyBuf.length; i += size) {
+        if (req.destroyed || res.code) return
+        req.emit('data', bodyBuf.subarray(i, i + size))
+        await new Promise((r) => setImmediate(r))
+      }
+      if (!req.destroyed && !res.code) req.emit('end')
+    })()
+  })
+}
+
 // ── 路由守卫（只守方法与 body 大小，不守来源） ──────────────────────────────
 {
   const r = await callRpc('study.list', {}, { method: 'GET' })
@@ -220,10 +268,20 @@ let exportedGoalId = ''
   // ── M4 前置：用真 locate 造出该目标的会话 transcript（目标会话 + 章节会话 + 空 subagent 会话）
   const goalAbsDir = path.join(tmpRoot, goalId)
   const ev = (type, seq, data, extra) => JSON.stringify(Object.assign({ type, seq, time: 1788000100000 + seq, data }, extra || {}))
+  // header 形状跟随**宿主当前代际**（v3 起要求 version:3 + isSeeded，且文件名带 vN）。
+  // cwd 必须与 locate 的入参逐字一致：宿主 assertStoredIdentity 用 header.cwd **字符串反推**
+  // 期望路径并与实际比对（realpath 兜底只救大小写别名），8.3 短名/长名混用会认账失败。
+  function sessionHeaderLine(sid, cwd) {
+    const m = /session(?:\.v(\d+))?\.jsonl/.exec(path.basename(mockPersistence.locate({ cwd, id: sid }).path))
+    const version = m && m[1] !== undefined ? Number(m[1]) : 0
+    return JSON.stringify(Object.assign(
+      { type: 'session', version, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' },
+      version >= 3 ? { isSeeded: false } : {}))
+  }
   async function makeSession(sid, cwd, rows) {
     const abs = mockPersistence.locate({ cwd, id: sid }).path
     await fsp.mkdir(path.dirname(abs), { recursive: true })
-    const lines = [JSON.stringify({ type: 'session', version: 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }), ...rows]
+    const lines = [sessionHeaderLine(sid, cwd), ...rows]
     await fsp.writeFile(abs, await P.jsonlToZstdFrames(lines.join('\n') + '\n', 2))
     return abs
   }
@@ -455,6 +513,72 @@ let exportedGoalId = ''
   const r11 = await callRpc('study.list', {})
   check('list 不再含已删目标', !r11.json.goals.some((g) => g.id === exportedGoalId), r11.json.goals.map((g) => g.id))
   await callRpc('study.deleteGoal', { goalId: id2 })
+}
+
+// ── M4.2: Web 上传（/study-upload + upload 引用 + 内容级去重） ───────────────
+{
+  const zipPath = path.join(tmpRoot, 'exports', exportedFile)
+  const zipBuf2 = await fsp.readFile(zipPath)
+  const B = 'SMOKEBOUNDARY123'
+
+  // 守卫：GET / 非 multipart / 多文件 part
+  check('上传拒绝 GET(405)', (await callUpload(Buffer.alloc(0), { method: 'GET' })).code === 405)
+  check('上传拒绝非 multipart(400)', (await callUpload(Buffer.from('x'), { contentType: 'application/json' })).code === 400)
+  const twoFiles = buildMultipart(B, [{ name: 'a.zip', data: zipBuf2 }, { name: 'b.zip', data: Buffer.from('whatever') }])
+  const multi = await callUpload(twoFiles, { boundary: B })
+  check('multipart 里多个文件 part → 400', multi.code === 400 && /多个文件/.test(multi.text), multi.code + ' ' + multi.text)
+
+  // 正常上传（切成 7 字节小块喂，压跨 chunk 的边界扫描）。
+  // 注意：测试夹具用 EventEmitter 同步投递、没有背压 —— 小文件下 feed 里的
+  // ws.write 可能未落盘。真实 HTTP req 是流（背压天然成立），这里 settle 会 await drain。
+  const one = buildMultipart(B, [{ name: 'study-goal-demo.zip', data: zipBuf2 }])
+  const up = await callUpload(one, { boundary: B, chunkSize: 7, remote: '10.0.0.9' })
+  const upId = up.json && up.json.uploadId
+  check('上传成功返回 uploadId 且非回环来源可达', up.code === 200 && up.json.ok === true && /^[a-f0-9]{32}$/.test(String(upId)) && up.json.duplicate === false, { code: up.code, text: up.text.slice(0, 160) })
+  check('上传落盘 uploads/ 且字节与源 zip 一致', Buffer.compare(await fsp.readFile(path.join(tmpRoot, 'uploads', upId + '.upload')), zipBuf2) === 0)
+
+  // listUploads 行含元数据
+  const lu = await callRpc('study.listUploads', {})
+  const row = lu.json && (lu.json.uploads || []).find((r) => r.uploadId === upId)
+  check('listUploads 列出该包（name/bytes/sha256）', !!row && row.name === 'study-goal-demo.zip' && row.bytes === zipBuf2.length && /^[a-f0-9]{64}$/.test(row.sha256), row)
+
+  // 重复上传同内容 ⇒ duplicate、磁盘不增
+  const before = (await fsp.readdir(path.join(tmpRoot, 'uploads'))).length
+  const dupUp = await callUpload(buildMultipart(B, [{ name: 'copy-of-same.zip', data: zipBuf2 }]), { boundary: B })
+  check('同内容再传 ⇒ duplicate:true 且复用原 uploadId', dupUp.code === 200 && dupUp.json.duplicate === true && dupUp.json.uploadId === upId, dupUp.json)
+  check('重复上传不落第二份文件', (await fsp.readdir(path.join(tmpRoot, 'uploads'))).length === before, await fsp.readdir(path.join(tmpRoot, 'uploads')))
+
+  // {upload} 引用走预览 → 真导入（与 path 引用等价语义）
+  const pvU = await callRpc('study.inspectImport', { upload: upId, mode: 'overwrite' })
+  check('{upload} 可预览且 canImport', pvU.json && pvU.json.ok === true && pvU.json.canImport === true, pvU.json && pvU.json.error)
+  const imU = await callRpc('study.importGoal', { upload: upId, confirm: true, mode: 'overwrite' })
+  check('{upload} 确认导入成功（goalId 沿用包内值）', imU.json && imU.json.ok === true && imU.json.goalId === exportedGoalId, imU.json && { err: imU.json.error, rb: imU.json.rolledBack })
+
+  // rename 只动 sidecar；非法 id 全拒
+  const rn = await callRpc('study.renameUpload', { upload: upId, name: '../../evil 名.zip' })
+  check('renameUpload 清洗名字（去路径成分）', rn.json && rn.json.ok === true && !/[\\/]/.test(rn.json.name), rn.json)
+  check('非法 uploadId 被拒（穿越样本）', (await callRpc('study.deleteUpload', { upload: '../index' })).json.ok === false)
+  check('readExport 拒绝非法 upload', (await callRpc('study.inspectImport', { upload: 'a/../b' })).json.ok === false)
+
+  // deleteUpload 后引用即失效
+  const del = await callRpc('study.deleteUpload', { upload: upId })
+  check('deleteUpload ok 且 pair 清干净', del.json && del.json.ok === true && !(await fsp.stat(path.join(tmpRoot, 'uploads', upId + '.upload')).catch(() => undefined)) && !(await fsp.stat(path.join(tmpRoot, 'uploads', upId + '.json')).catch(() => undefined)), del.json)
+  check('删除后 inspect 报找不到', (await callRpc('study.inspectImport', { upload: upId })).json.ok === false)
+
+  // 删除后重传 ⇒ sha 现算，必然放行（防"删了但账目残留挡住重传"）
+  const up2 = await callUpload(buildMultipart(B, [{ name: 'study-goal-demo.zip', data: zipBuf2 }]), { boundary: B })
+  check('删除后重传同内容成功（去重不误挡）', up2.code === 200 && up2.json.ok === true && up2.json.duplicate === false && /^[a-f0-9]{32}$/.test(String(up2.json.uploadId)), up2.json)
+  if (up2.json && up2.json.uploadId) await callRpc('study.deleteUpload', { upload: up2.json.uploadId })
+
+  // 半途而废的流不留残file：只发到一半就 end（无终止 boundary）⇒ premature ⇒ 400。
+  const half = one.subarray(0, Math.floor(one.length / 2))
+  const beforeHalf = (await fsp.readdir(path.join(tmpRoot, 'uploads')).catch(() => [])).length
+  const cut = await callUpload(half, { boundary: B })
+  check('流提前结束 ⇒ 400', cut.code === 400, cut.code)
+  // 失败路径的 destroy→close→unlinkRetry 最长 ~1.2s（夹具无背压时 write 队列吊住 drain）
+  let residue = []
+  for (let i = 0; i < 30; i++) { residue = await fsp.readdir(path.join(tmpRoot, 'uploads')).catch(() => []); if (residue.length === beforeHalf) break; await new Promise((r) => setTimeout(r, 100)) }
+  check('半途而废不留残file', residue.length === beforeHalf, residue)
 }
 
 // ── M2/M4: 聊天工具 ─────────────────────────────────────────────────────────
