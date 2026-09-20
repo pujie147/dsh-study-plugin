@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.4] - 2026-09-20
+
+### added
+- **删除远端目标（GitHub 同步补齐删除能力）**：旧版同步只有绑定/推送/拉取/解绑，**没有任何删除 GitHub 端数据的入口**（`syncUnbind` 只清本机凭据，仓库里的数据一律留）。现新增：
+  1. 新 RPC **`study.syncDeleteRemote`**（`remoteGoalId` + `confirm`）：从固定仓 `dsh-study-sync` 删掉 `study-goals/<remoteGoalId>/` 目录下的**全部文件**（递归收集后逐个 Contents DELETE，带 `sha` 前置条件；404/409 视作已被并发清理而跳过）。**本地目标与各设备账本一律不动**；
+  2. **不可逆 ⇒ 双重闸门**：RPC 侧未带 `confirm=true` 只回 `needChoice` 并亮出将被删的文件数与远端来源（标题/时间/设备/体积）；面板侧远端每一行的「🗑 删除」走**内联二次确认**（首次点击变「确认删除?」，再点才真正带 `confirm=true` 调用），与本机目标删除交互一致；
+  3. 删除后本机该目标的下次 `syncInspect` 自然转「☁ 远端还没有」（`remoteMissing`），可再推。
+- 取舍：**本期只做「删除单个已推送目标」，不删整个仓库**——固定仓承载全部目标，整仓删除blast radius 过大且账号可自助在 GitHub 完成；认领标记与 `study-goals/` 前缀边界不变。
+
+### notes
+- 测试：`sync.test` mock 补 `DELETE /contents` 分支 + 新增 §9.5（confirm 闸门 / 只删该目标 / 不牵连其它目标 / 重复删 noop / 删后转 remoteMissing / 列表移除 / 非法 id 被拒），88/0 绿；`client.test` 新增断言 #40（远端行删除＝内联二次确认 → `syncDeleteRemote{confirm:true}`），47 全绿。
+- ⚠ **真机验收未做**：需在真 GitHub 账号上验证 fine-grained PAT 的 Contents 删除权限、多设备并发删除、删后重推。
+
 ## [0.7.3] - 2026-09-20
 
 ### added

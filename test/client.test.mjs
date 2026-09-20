@@ -101,7 +101,8 @@ const handlers = {
   'study.syncUnbind': (a) => { rpc.push(['syncUnbind', a]); return { ok: true, bound: false } },
   'study.syncInspect': (a) => { rpc.push(['syncInspect', a]); return inspResults[a.goalId] || { ok: true, status: 'remoteMissing', goalId: a.goalId, remoteGoalId: a.goalId, local: {}, remote: null } },
   'study.syncPush': (a) => { rpc.push(['syncPush', a]); return pushResult },
-  'study.syncPull': (a) => { rpc.push(['syncPull', a]); return pullResult }
+  'study.syncPull': (a) => { rpc.push(['syncPull', a]); return pullResult },
+  'study.syncDeleteRemote': (a) => { rpc.push(['syncDeleteRemote', a]); return deleteRemoteResult }
 }
 // 同步面板的可控返回
 let syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
@@ -111,6 +112,7 @@ let remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goa
 const inspResults = {}
 let pushResult = { ok: true, pushed: true }
 let pullResult = { ok: true, pulled: true }
+let deleteRemoteResult = { ok: true, deleted: 2 }
 let bindResult = { ok: true, bound: true, config: { auth: { account: 'tester', tokenHint: '••••0101' }, repo: { fullName: 'tester/dsh-study-sync', branch: 'main' } } }
 let rebindResult = { ok: true, bound: true, config: bindResult.config }
 let takeOverResult = { ok: true, bound: true, config: bindResult.config }
@@ -700,6 +702,18 @@ await click(btnText('⬇ 拉取到本地'), 'remote-row pull')
 const remoteRowPull = rpc.filter((c) => c[0] === 'syncPull').map((c) => c[1]).pop()
 assert.deepEqual(remoteRowPull, { remoteGoalId: 'goal-demo' }, '远端行拉取应按 remoteGoalId 且不带 discardLocal')
 ok('远端目标行：首次「拉取到本地」走 syncPull{remoteGoalId}（不带 discardLocal）')
+// 远端目标行「删除」：内联二次确认，确认后才走 syncDeleteRemote{confirm:true}
+rpc.length = 0
+assert.ok(btnText('🗑 删除'), '远端目标行应有「🗑 删除」按钮')
+await click(btnText('🗑 删除'), 'remote delete arm')
+tree = await renderAll()
+assert.ok(!rpc.some((c) => c[0] === 'syncDeleteRemote'), '首次点击只进入确认态，不应触发删除')
+assert.ok(btnText('确认删除?'), '首次点击后应切到「确认删除?」内联态')
+deleteRemoteResult = { ok: true, deleted: 2 }
+await click(btnText('确认删除?'), 'remote delete confirm')
+const delCall = rpc.filter((c) => c[0] === 'syncDeleteRemote').map((c) => c[1]).pop()
+assert.deepEqual(delCall, { remoteGoalId: 'goal-demo', confirm: true }, '确认删除必须带 confirm=true 且按 remoteGoalId')
+ok('远端目标行删除：内联二次确认 → syncDeleteRemote{confirm:true}')
 await click(btnText('检查本机目标同步状态'), 'inspect all')
 tree = await renderAll()
 assert.ok(rpc.some((c) => c[0] === 'syncInspect' && c[1].goalId === 'goal-demo'), '未对本机目标做 syncInspect')

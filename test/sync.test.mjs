@@ -127,6 +127,14 @@ function makeGithubMock() {
           state.blobs.set(sha, buf)
           return send(cur === undefined ? 201 : 200, { content: { name: path.posix.basename(fp), path: fp, sha }, commit: { sha: 'c' + state.requests.length } })
         }
+        if (req.method === 'DELETE') {
+          const b = JSON.parse(body)
+          const cur = r.files.get(fp)
+          if (cur === undefined) return send(404, { message: 'Not Found' })
+          if (b.sha !== gitBlobSha(cur)) return send(409, { message: 'sha was not created in the repository' })
+          r.files.delete(fp)
+          return send(200, { content: null, commit: { sha: 'd' + state.requests.length } })
+        }
         return send(405, { message: 'Method Not Allowed' })
       }
       return send(404, { message: 'no route ' + p })
@@ -447,6 +455,36 @@ console.log('\n══ 9b. 多台主机绑同一账号：后来者直接 adopt，
   const devA = JSON.parse(shared.get('study-goals/' + goalId + '/bundle.meta.json').toString('utf8')).deviceId
   const devD = JSON.parse(shared.get('study-goals/' + dg.goalId + '/bundle.meta.json').toString('utf8')).deviceId
   check('各主机 deviceId 独立（冲突展示能区分来源）', dp.ok === true && /^dev-/.test(devA) && /^dev-/.test(devD) && devA !== devD, { devA, devD })
+}
+
+console.log('\n══ 9.5 删除远端目标：confirm 闸门 + 删该目标全部文件 + 本地/其它目标不动 ══')
+{
+  const c = await A.call('study.createGoal', { topic: '待删除', target_level: '入门', requirements: '中文' })
+  const delGoalId = c.goalId
+  await makeSession(A, 'sess-del-1', goalDirOf(A, delGoalId), [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('session/title', 1, { title: '待删除会话' }),
+    ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ])
+  const dp = await A.call('study.syncPush', { goalId: delGoalId })
+  check('待删除目标已推到仓', dp.ok === true && dp.pushed === true, dp)
+  const shared = mock.state.repos.get('tester/dsh-study-sync').files
+  const gpath = 'study-goals/' + delGoalId + '/'
+  check('仓内确有该目标的 bundle+meta', shared.has(gpath + 'bundle.zip') && shared.has(gpath + 'bundle.meta.json'), [...shared.keys()].filter((k) => k.startsWith(gpath)))
+  const noConf = await A.call('study.syncDeleteRemote', { remoteGoalId: delGoalId })
+  check('无 confirm → needChoice 且一文件不删', noConf.ok === false && noConf.needChoice === true && shared.has(gpath + 'bundle.zip'), noConf)
+  const dr = await A.call('study.syncDeleteRemote', { remoteGoalId: delGoalId, confirm: true })
+  check('confirm=true 删除成功（≥2 文件）', dr.ok === true && dr.deleted >= 2, dr)
+  check('该目标文件全部从仓里消失', !shared.has(gpath + 'bundle.zip') && !shared.has(gpath + 'bundle.meta.json'), [...shared.keys()].filter((k) => k.startsWith(gpath)))
+  check('其它目标（goalId）不受牵连', shared.has('study-goals/' + goalId + '/bundle.meta.json'), [...shared.keys()].slice(0, 6))
+  const idel = await A.call('study.syncDeleteRemote', { remoteGoalId: delGoalId, confirm: true })
+  check('再删同一目标 ⇒ noop', idel.ok === true && idel.noop === true && idel.deleted === 0, idel)
+  const iid = await A.call('study.syncInspect', { goalId: delGoalId })
+  check('删除后本机检查转 remoteMissing（本地目标仍在）', iid.ok === true && iid.status === 'remoteMissing', iid)
+  const listAfter = await A.call('study.syncListRemote')
+  check('远端列表不再含被删目标', listAfter.ok === true && !(listAfter.goals || []).some((g) => g.remoteGoalId === delGoalId), (listAfter.goals || []).map((g) => g.remoteGoalId))
+  const bad = await A.call('study.syncDeleteRemote', { remoteGoalId: '../evil', confirm: true })
+  check('非法 remoteGoalId 被拒', bad.ok === false && /非法/.test(bad.error || ''), bad)
 }
 
 console.log('\n══ 10. 失效 → 重绑恢复；降级面 ══')
