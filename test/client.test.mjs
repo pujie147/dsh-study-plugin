@@ -534,23 +534,28 @@ sessionsSvc.create = origCreate
 sessionsSvc.open = origOpen
 ok('宿主形状复位，避免污染后续断言')
 
-// ── 打开讲义：better-sidebar 页签优先 ⇒ 探不到才新标签 /study-file ⇒ 开始学习联动 ──
+// ── 打开讲义：唯一入口 =「📖 开始学习」（独立讲义按钮已移除）；better-sidebar 页签优先 ⇒ 才新标签 ──
 const origFeatures = betterSidebarSvc.features
-const notesBtnIn = async (title, label) => {
+const NOTES_PATH = '/home/me/.dsh/study-work/goal-demo/chapters/01-chapter.md'
+const sidebarOpen = (sessionId) => 'sidebar:' + JSON.stringify({
+  scope: { sessionId: sessionId }, path: NOTES_PATH, title: '计算机系统基础'
+})
+const startChapter = async () => {
   await renderAll()
-  let b = btnIn(title, label)
-  if (!b) { await expand(title); b = btnIn(title, label) }
-  assert.ok(b, '章节行缺少「' + label + '」按钮')
-  return b
+  let b = btnIn('软件设计', '📖 开始学习')
+  if (!b) { await expand('软件设计'); b = btnIn('软件设计', '📖 开始学习') }
+  assert.ok(b, '章节行缺少「📖 开始学习」按钮')
+  await click(b, 'start chapter')
+  return renderAll()
 }
 
-// (1) 未装 better-sidebar：点「📖 讲义」→ readChapter 拿路径 → 新标签打开 /study-file 页
+// (1) 未装 better-sidebar：开始学习 → readChapter 拿路径 → 新标签打开 /study-file 页
 await useHost({ ui: true, legacy: false }, [goalRow])
 hostShape.sidebar = false
 openedUrls.length = 0
-await click(await notesBtnIn('软件设计', '📖 讲义'), 'chapter notes')
+tree = await startChapter()
+assert.deepEqual(opened, ['ui-open:session-c1'], '应先切换到已记录的章节会话：' + JSON.stringify(opened))
 assert.deepEqual(rpc.filter((c) => c[0] === 'readChapter').map((c) => c[1]).pop(), { goalId: 'goal-demo', chapter_index: 1 }, 'readChapter 参数不对')
-tree = await renderAll()
 assert.deepEqual(openedUrls.slice(-1), ['/study-file?goalId=goal-demo&chapter=1'], '应新标签打开讲义页：' + JSON.stringify(openedUrls))
 assert.ok(bodyText().indexOf('本章目标') < 0, '讲义不该在面板内渲染')
 ok('打开讲义：未装 better-sidebar 时新标签打开 /study-file 页，面板不自渲染')
@@ -558,8 +563,7 @@ ok('打开讲义：未装 better-sidebar 时新标签打开 /study-file 页，�
 // (1b) 浏览器拦住新标签：白话提示里要带地址，不能静默失败
 openedUrls.length = 0
 windowOpenResult = null
-await click(await notesBtnIn('软件设计', '📖 讲义'), 'chapter notes popup blocked')
-tree = await renderAll()
+tree = await startChapter()
 assert.ok(bodyText().indexOf('/study-file?goalId=goal-demo&chapter=1') >= 0, '弹窗被拦时应把地址提示出来: ' + bodyText().slice(0, 300))
 windowOpenResult = {}
 ok('打开讲义：新标签被拦截时显示可手动访问的地址')
@@ -568,57 +572,45 @@ ok('打开讲义：新标签被拦截时显示可手动访问的地址')
 await useHost({ ui: true, legacy: false }, [goalRow])
 hostShape.sidebar = true
 openedUrls.length = 0
-await click(await notesBtnIn('软件设计', '📖 讲义'), 'chapter notes via better-sidebar')
-assert.deepEqual(opened, ['sidebar:' + JSON.stringify({
-  scope: { sessionId: 'session-c1' },
-  path: '/home/me/.dsh/study-work/goal-demo/chapters/01-chapter.md',
-  title: '计算机系统基础'
-})], '应按 openFile(scope, path, title) 交给 better-sidebar：' + JSON.stringify(opened))
-tree = await renderAll()
+tree = await startChapter()
+assert.deepEqual(opened, ['ui-open:session-c1', sidebarOpen('session-c1')], '应按 openFile(scope, path, title) 交给 better-sidebar：' + JSON.stringify(opened))
 assert.deepEqual(openedUrls, [], 'better-sidebar 已受理时不该再开新标签')
 assert.ok(bodyText().indexOf('本章目标') < 0, 'better-sidebar 已受理时不该在面板内自渲染')
-ok('打开讲义：better-sidebar 在场时优先开成右侧页签（scope=本章会话），本插件退让')
+ok('打开讲义：better-sidebar 在场时以本章会话为 scope 开右侧页签，本插件退让')
 
 // (2b) 装了但能力面没有 openFile：绝不硬调，降级成新标签
-hostShape.sidebar = false
 betterSidebarSvc.features = ['badge', 'tabLifecycle']
 await useHost({ ui: true, legacy: false }, [goalRow])
 hostShape.sidebar = true
-opened.length = 0; openedUrls.length = 0
-await click(await notesBtnIn('软件设计', '📖 讲义'), 'chapter notes without openFile feature')
-assert.deepEqual(opened, [], 'features 不含 openFile 时不该调用它')
-tree = await renderAll()
+openedUrls.length = 0
+tree = await startChapter()
+assert.deepEqual(opened, ['ui-open:session-c1'], 'features 不含 openFile 时不该调用它：' + JSON.stringify(opened))
 assert.deepEqual(openedUrls.slice(-1), ['/study-file?goalId=goal-demo&chapter=1'], '缺能力应降级成新标签：' + JSON.stringify(openedUrls))
 betterSidebarSvc.features = origFeatures
 ok('打开讲义：按 features 门控能力，缺 openFile 时降级而非硬调')
 
-// (3) 讲义文件还没生成：报白话错误，不抛
+// (3) 讲义文件还没生成：会话照样打开，讲义报白话错误且不抛、不开新标签
 hostShape.sidebar = false
 openedUrls.length = 0
 notesResult = { ok: false, error: '讲义文件还不存在：请先点「生成讲义」' }
-await useHost({ ui: false, legacy: true }, [goalRow])
-await click(await notesBtnIn('软件设计', '📖 讲义'), 'chapter notes missing')
-tree = await renderAll()
+await useHost({ ui: true, legacy: false }, [goalRow])
+tree = await startChapter()
 assert.ok(bodyText().indexOf('讲义文件还不存在') >= 0, '缺讲义时应白话报错: ' + bodyText().slice(0, 200))
+assert.ok(bodyText().indexOf('打开章节会话失败') < 0, '讲义缺失不该被说成会话打开失败')
+assert.deepEqual(opened, ['ui-open:session-c1'], '会话打开这一步不应被讲义失败推翻')
 assert.deepEqual(openedUrls, [], '读不到文件时不该开新标签')
-notesResult = { ok: true, title: '计算机系统基础', content: '# 本章目标\n计算机系统基础\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-chapter.md' }
+notesResult = { ok: true, title: '计算机系统基础', content: '# 本章目标\n计算机系统基础\n', filePath: NOTES_PATH }
 ok('打开讲义：文件缺失时显示宿主返回的错误而非抛错')
 
-// (4) 「📖 开始学习」：进章节会话后，把**同一个会话 id 当 scope** 交给 better-sidebar 开页签
+// (4) 回归：就绪章节行只剩一个 📖 入口 =「📖 开始学习」，独立「📖 讲义」按钮已移除
+hostShape.sidebar = false
 await useHost({ ui: true, legacy: false }, [goalRow])
-hostShape.sidebar = true
-openedUrls.length = 0
-await click(await notesBtnIn('软件设计', '📖 开始学习'), 'start chapter')
-assert.deepEqual(opened, ['ui-open:session-c1', 'sidebar:' + JSON.stringify({
-  scope: { sessionId: 'session-c1' },
-  path: '/home/me/.dsh/study-work/goal-demo/chapters/01-chapter.md',
-  title: '计算机系统基础'
-})], '应先切会话、再以该会话为 scope 开页签：' + JSON.stringify(opened))
-assert.ok(rpc.some((c) => c[0] === 'readChapter' && c[1].goalId === 'goal-demo' && c[1].chapter_index === 1), '开始学习后应自动读取本章讲义')
 tree = await renderAll()
-assert.deepEqual(openedUrls, [], '页签已受理时不该再开新标签')
-assert.ok(bodyText().indexOf('软件设计') >= 0, '目标列表应保持在位')
-ok('「📖 开始学习」= 进章节会话 + 以该会话为 scope 自动打开本章讲义页签')
+const bookBtns = flat.filter((e) => e.type === 'button' && textOf(e).indexOf('📖') >= 0)
+assert.deepEqual(bookBtns.map((e) => textOf(e)), ['📖 开始学习'], '章节行的 📖 入口应只剩「开始学习」：' + JSON.stringify(bookBtns.map((e) => textOf(e))))
+assert.ok(bodyText().indexOf('也可随时单点') < 0, '提示文案不该再承诺单点讲义')
+assert.ok(bodyText().indexOf('自动在右侧打开本章讲义') >= 0, '提示文案未说明自动开讲义: ' + bodyText().slice(0, 300))
+ok('章节行不再有独立「📖 讲义」按钮，提示文案与之一致')
 
 // ── 空列表：提示文案与「＋ 添加学习目标」必须同时在场（回归：按钮曾被关在
 //    goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口）────────

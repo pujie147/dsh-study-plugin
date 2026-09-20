@@ -395,10 +395,10 @@ function apply(ctx) {
       }
     }
 
-    // 打开章节讲义：先经 study.readChapter 校验文件确实存在并拿到绝对路径；
-    // better-sidebar 在就把路径交给它，否则 window.open 本插件的 /study-file 页（浏览器新标签）。
+    // 打开章节讲义（只由「📖 开始学习」在会话就绪后调用，busy 由那条路径统一管）：先经
+    // study.readChapter 校验文件确实存在并拿到绝对路径；better-sidebar 在就把路径交给它开成
+    // 右侧页签，否则 window.open 本插件的 /study-file 页（浏览器新标签）。
     const openChapterNotes = async (g, c, sessionId) => {
-      setBusyKey('notes:' + g.id + ':' + c.index)
       try {
         const r = await call('study.readChapter', { goalId: g.id, chapter_index: c.index })
         if (!r || r.ok !== true) { setError(String((r && r.error) || '读取讲义失败')); return }
@@ -411,8 +411,6 @@ function apply(ctx) {
         if (!openedWin) setNotice('讲义页已就绪，但浏览器拦住了新标签：' + url)
       } catch (e) {
         setError('打开讲义失败: ' + errText(e))
-      } finally {
-        setBusyKey(null)
       }
     }
 
@@ -864,7 +862,7 @@ function apply(ctx) {
                   exp && React.createElement('div', { className: 'stuiGoalBody' },
                     React.createElement('div', { className: 'stuiDetail' },
                       React.createElement('div', { className: 'stuiMeta' }, '目标: ' + (g.target_level || '未说明')),
-                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；章节讲义就绪后点「开始学习」进该章会话并自动打开本章讲义，也可随时单点「📖 讲义」查看')
+                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；章节讲义就绪后点「📖 开始学习」进该章会话，并自动在右侧打开本章讲义')
                     ),
                     React.createElement('div', { className: 'stuiDetail' },
                       g.status === 'draft_pending' && hasDraft && React.createElement('div', { className: 'stuiDraftOv' }, '草案: ' + ((g.draft && g.draft.overview) || '')),
@@ -900,8 +898,7 @@ function apply(ctx) {
                           React.createElement('span', { className: 'stuiChip', 'data-tone': toneOf(c.status) }, labelOf(c.status)),
                           c.status === 'draft' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.generateChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '生成中…' : '生成讲义'),
                           c.status === 'generating' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.continueChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '继续中…' : '继续生成'),
-                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: chBusy, onClick: () => openChapterSession(g, c) }, chBusy ? '打开中…' : '📖 开始学习'),
-                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: busyKey === 'notes:' + g.id + ':' + c.index, title: '打开本章讲义（DSH-better-sidebar 页签优先，未装则浏览器新标签）', onClick: () => openChapterNotes(g, c) }, busyKey === 'notes:' + g.id + ':' + c.index ? '打开中…' : '📖 讲义')
+                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: chBusy, onClick: () => openChapterSession(g, c) }, chBusy ? '打开中…' : '📖 开始学习')
                         )
                       }),
                       (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && chapterList.length === 0 && React.createElement('div', { className: 'stuiMeta' }, '章节待生成'),
