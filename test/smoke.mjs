@@ -176,6 +176,12 @@ let exportedGoalId = ''
   const r3 = await callRpc('study.startResearch', { goalId, sessionId: 'sess-goal-1' })
   check('startResearch ok', r3.json && r3.json.ok === true, r3.json)
   check('调研指令已注入会话', injected.length === 1 && injected[0].id === 'sess-goal-1' && /课程规划 AI/.test(injected[0].msg.content[0].text), injected)
+  {
+    const ri = injected[0].msg.content[0].text
+    check('调研指令=全课程总览+三可选字段+排版约定(D34)', /全课程总览/.test(ri) && /env_baseline/.test(ri) && /depends_on/.test(ri) && /project_thread/.test(ri) && /LaTeX/.test(ri) && /mermaid/.test(ri), ri.slice(0, 200))
+    check('调研指令=偏好沉淀回路且指向 _meta/teaching-prefs.md', /偏好沉淀/.test(ri) && /teaching-prefs\.md/.test(ri), ri.slice(-200))
+    check('无偏好文件时调研指令不含偏好段(缺失不炸)', !/用户教学偏好/.test(ri), ri.slice(0, 120))
+  }
   const gDisp = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
   check('startResearch 记录「已派发」事实(researchDispatched + 时间)', gDisp.researchDispatched === true && typeof gDisp.researchDispatchedAt === 'string', gDisp)
 
@@ -191,20 +197,22 @@ let exportedGoalId = ''
   await fsp.writeFile(draftAbs, JSON.stringify({
     course: 'Transformer 入门', overview: '从注意力到完整架构',
     chapters: [
-      { title: '注意力机制', summary: 'QKV 与缩放点积', est_hours: 0.3, focus_points: ['QKV', '缩放'] },
-      { title: '位置编码' }
+      { title: '注意力机制', summary: 'QKV 与缩放点积', est_hours: 0.3, focus_points: ['QKV', '缩放'], env_baseline: 'Python+PyTorch 环境+git 仓库(主分支=基线)', project_thread: '在 baseline 分支工程内新增 attention/ 模块' },
+      { title: '位置编码', depends_on: [1, 99, -2, 1.5, 'x'] }
     ]
   }))
   const r4 = await callRpc('study.list', {})
   const g1 = r4.json.goals.find((g) => g.id === goalId)
   check('草案采纳 → draft_pending', g1.status === 'draft_pending', g1.status)
   check('草案章节规范化(index/est_hours 下限/缺失字段)', g1.draft.chapters[0].index === 1 && g1.draft.chapters[0].est_hours === 0.5 && g1.draft.chapters[1].title === '位置编码' && g1.draft.chapters[1].est_hours === null && g1.draft.chapters[1].focus_points.length === 0, g1.draft && g1.draft.chapters)
+  check('草案可选字段规范化(D34: 字符串清洗/depends_on 仅留合法前置章号)', g1.draft.chapters[0].env_baseline === 'Python+PyTorch 环境+git 仓库(主分支=基线)' && g1.draft.chapters[1].depends_on.length === 1 && g1.draft.chapters[1].depends_on[0] === 1 && g1.draft.chapters[1].project_thread === undefined, g1.draft.chapters)
 
   // 批准
   const r5 = await callRpc('study.approveDraft', { goalId })
   check('approveDraft ok(chapters:2)', r5.json && r5.json.ok === true && r5.json.chapters === 2, r5.json)
   const gj = JSON.parse(await fsp.readFile(path.join(tmpRoot, goalId, 'goal.json'), 'utf8'))
   check('goal.json 章节文件命名 01-slug.md', gj.chapters[0].file === '01-attention-mechanism.md' || /^01-[^/]+\.md$/.test(gj.chapters[0].file), gj.chapters[0].file)
+  check('批准透传可选字段(D34)', gj.chapters[0].env_baseline === 'Python+PyTorch 环境+git 仓库(主分支=基线)' && gj.chapters[1].depends_on[0] === 1, gj.chapters)
 
   // 写讲义 → 轮询采纳 → active/ready
   const chAbs = path.join(tmpRoot, goalId, 'chapters', gj.chapters[0].file)
@@ -220,12 +228,40 @@ let exportedGoalId = ''
   const g2 = r6.json.goals.find((g) => g.id === goalId)
   check('讲义采纳 → ready + 目标 active', g2.chapters[0].status === 'ready' && g2.status === 'active', { ch: g2.chapters[0].status, goal: g2.status })
 
+  // 教学偏好记忆体登场：此后所有指令都应带上它（导出侧也应含 meta/ 条目）
+  const prefsAbs = path.join(tmpRoot, '_meta', 'teaching-prefs.md')
+  await fsp.mkdir(path.dirname(prefsAbs), { recursive: true })
+  await fsp.writeFile(prefsAbs, '- 2026-09-19 讲义一律先总后分，概览配 mermaid 框架图\n')
+
   // 章节会话记录 + 开始学习
   const r7 = await callRpc('study.recordChapterSession', { goalId, chapter_index: 1, sessionId: 'sess-ch-1' })
   check('recordChapterSession ok', r7.json && r7.json.ok === true, r7.json)
   const r8 = await callRpc('study.startChapter', { goalId, chapter_index: 1, sessionId: 'sess-ch-1' })
   check('startChapter ok', r8.json && r8.json.ok === true, r8.json)
   check('教练指令已注入(含回写机制)', injected.some((m) => m.id === 'sess-ch-1' && /学习教练/.test(m.msg.content[0].text) && /回写/.test(m.msg.content[0].text)), injected)
+  {
+    const ci = injected[injected.length - 1].msg.content[0].text
+    check('教练指令含偏好注入+沉淀回路(D34)', /用户教学偏好/.test(ci) && /先总后分/.test(ci) && /偏好沉淀/.test(ci) && /teaching-prefs\.md/.test(ci), ci.slice(0, 200))
+  }
+
+  // generateChapter：第1章=环境基线确立；第2章=读全部前置章讲义+承接与补完+闭环
+  const injB0 = injected.length
+  const rg1 = await callRpc('study.generateChapter', { goalId, chapter_index: 1 })
+  check('generateChapter ch1 ok(注入目标会话)', rg1.json && rg1.json.ok === true && injected.length === injB0 + 1, rg1.json)
+  {
+    const t1 = injected[injected.length - 1].msg.content[0].text
+    check('ch1 指令=环境基线+git 分支约定+先总后分', /环境的起点|工程线的起点/.test(t1) && /git init/.test(t1) && /checkout -b chapter\//.test(t1) && /本章概览\(总\)/.test(t1) && /作黑盒使用，第 N 章详述/.test(t1) && /用户教学偏好/.test(t1) && !/前置章讲义/.test(t1), t1.slice(0, 260))
+  }
+  const rL9a = await callRpc('study.list', {})   // ch1 讲义文件在盘 → 采纳回 ready，别把 generating 状态带进 ch2 的前置章判定
+  const rg2 = await callRpc('study.generateChapter', { goalId, chapter_index: 2 })
+  check('generateChapter ch2 ok', rg2.json && rg2.json.ok === true, rg2.json)
+  {
+    const t2 = injected[injected.length - 1].msg.content[0].text
+    check('ch2 指令=前置章讲义路径+承接与补完+清偿欠账+LaTeX/mermaid', /前置章讲义\(动笔前必须用 read 工具逐份读完\)/.test(t2) && t2.indexOf('chapters/' + gj.chapters[0].file) > 0 && /承接与补完/.test(t2) && /欠账清偿/.test(t2) && /已在第 2 章讲清/.test(t2) && /LaTeX/.test(t2) && /mermaid/.test(t2) && /全课程总览/.test(t2) && /依赖章: 1/.test(t2), t2.slice(0, 300))
+  }
+  const rL9 = await callRpc('study.list', {})
+  const g9 = rL9.json.goals.find((g) => g.id === goalId)
+  check('重新生成不毁已有讲义(ch1 文件在→回到 ready)', g9.chapters[0].status === 'ready' && g9.chapters[1].status === 'generating', g9.chapters.map((c) => c.status))
 
   // continueChapter 对已就绪章节 → ready 短路
   const r9 = await callRpc('study.continueChapter', { goalId, chapter_index: 1 })
@@ -264,7 +300,8 @@ let exportedGoalId = ''
   async function makeSession(sid, cwd, rows) {
     const abs = mockPersistence.locate({ cwd, id: sid }).path
     await fsp.mkdir(path.dirname(abs), { recursive: true })
-    const lines = [JSON.stringify({ type: 'session', version: 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }), ...rows]
+    const gm = /\.v(\d+)\./.exec(path.basename(abs))   // 宿主校验：代际文件名 vN 必须与 header version 一致
+    const lines = [JSON.stringify({ type: 'session', version: gm ? Number(gm[1]) : 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }), ...rows]
     await fsp.writeFile(abs, await P.jsonlToZstdFrames(lines.join('\n') + '\n', 2))
     return abs
   }
@@ -287,8 +324,13 @@ let exportedGoalId = ''
   // 另一个目标工作区里混进的无关会话（同 sessRoot、不同项目目录）——不得被带走
   await makeSession('sess-other', path.join(tmpRoot, 'other-goal'), [ev('turn/start', 0, { turn: 1 }), ev('turn/end', 1, { turn: 1, reason: { kind: 'completed' } })])
   for (const sid of ['sess-goal-1', 'sess-ch-1', 'sess-sub-1']) {
-    const v = await mockPersistence.inspect(sid)
-    if (!v || !v.meta) throw new Error('测试前置数据未被宿主认账: ' + sid)
+    // 宿主 rc.2 的 sessionPersistence 无 inspect() ⇒ 与插件侧同口径按能力降级，只保证字节可读
+    if (typeof mockPersistence.inspect === 'function') {
+      const v = await mockPersistence.inspect(sid)
+      if (!v || !v.meta) throw new Error('测试前置数据未被宿主认账: ' + sid)
+    } else if (!mockPersistence.locate({ cwd: goalAbsDir, id: sid }).path) {
+      throw new Error('测试前置数据不可定位: ' + sid)
+    }
   }
   const rowsOf = async (sid, cwd) => { try { return P.analyzeTranscript(await fsp.readFile(mockPersistence.locate({ cwd, id: sid }).path)).lines.length } catch { return -1 } }
   const projectionOf = async (dir) => { const w = await wsRegistryReal.resolveByPath(dir).catch(() => undefined); return w ? w.sessionIds.map(String) : [] }
@@ -323,6 +365,7 @@ let exportedGoalId = ''
   check('空会话被识别为 blank（宿主会隐藏，不是导入丢失）', man.sessions.find((s) => s.id === 'sess-sub-1').blank === true, man.sessions.map((s) => [s.id, s.blank]))
   const wantGoal = ['goal/goal.json', 'goal/draft.json', 'goal/chapters/' + gj.chapters[0].file, 'goal/chapters/01-qa.md', 'goal/chapters/01-notes/梯度消失.md', 'goal/demo.py']
   check('goal 树全部内容入包（讲义/qa/notes/代码/draft/goal.json）', wantGoal.every((n) => zentries.has(n)), wantGoal.filter((n) => !zentries.has(n)))
+  check('教学偏好随包旅行(D34: meta/teaching-prefs.md 入包)', zentries.has('meta/teaching-prefs.md') && /先总后分/.test(zentries.get('meta/teaching-prefs.md').toString('utf8')), [...zentries.keys()].filter((k) => k.startsWith('meta/')))
   check('会话绑定关系被记录(goal/chapter-1/unbound)', man.sessions.map((s) => s.boundTo).sort().join(',') === 'chapter-1,goal,unbound', man.sessions.map((s) => [s.id, s.boundTo]))
   check('附件按内容寻址入包', zentries.has(man.attachments[0].entry) && man.attachments[0].sha256 === pngRef.attachmentId.slice(7), man.attachments)
   check('导出包不含 .mnemon/凭据/缓存等', ![...zentries.keys()].some((k) => /\.mnemon|credentials|settings\.yaml|projcache/.test(k)), [...zentries.keys()])
@@ -343,6 +386,7 @@ let exportedGoalId = ''
   // ── P2 全新机器式恢复：清掉一切 ⇒ 预览 ⇒ 导入 ⇒ 宿主自己的投影认账 ─────────
   await fsp.rm(goalAbsDir, { recursive: true, force: true })
   await fsp.rm(projectDirOf(goalAbsDir), { recursive: true, force: true })
+  await fsp.rm(prefsAbs, { force: true })
   await fsp.writeFile(path.join(tmpRoot, 'index.json'), JSON.stringify({ goals: [] }, null, 2))
   const insp = await callRpc('study.inspectImport', { path: rE.json.path })
   check('inspectImport 预览 ok 且无冲突', insp.json && insp.json.ok === true && insp.json.canImport === true && insp.json.conflicts.length === 0, insp.json && insp.json.conflicts)
@@ -351,6 +395,14 @@ let exportedGoalId = ''
   const imp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true })
   check('importGoal ok 且 goalId 沿用包内值', imp.json && imp.json.ok === true && imp.json.goalId === exportedGoalId, imp.json)
   check('导入还原了目标目录树', !!(await fsp.stat(path.join(goalAbsDir, 'goal.json')).catch(() => undefined)) && !!(await fsp.stat(path.join(goalAbsDir, 'demo.py')).catch(() => undefined)), imp.json)
+  {
+    const prefsBack = await fsp.readFile(prefsAbs, 'utf8').catch(() => '')
+    check('导入重建全局教学偏好(D34: meta/ → _meta/)', /先总后分/.test(prefsBack) && (prefsBack.match(/先总后分/g) || []).length === 1, prefsBack)
+    await fsp.appendFile(prefsAbs, '- 2026-09-20 本机独有偏好行\n')
+    const impAgain = await callRpc('study.importGoal', { path: rE.json.path, confirm: true })
+    const prefsMerged = await fsp.readFile(prefsAbs, 'utf8').catch(() => '')
+    check('二次导入=偏好行级并集不重复且保留本机行(D34)', impAgain.json && impAgain.json.ok === true && /本机独有偏好行/.test(prefsMerged) && (prefsMerged.match(/先总后分/g) || []).length === 1, prefsMerged)
+  }
   const proj2 = await projectionOf(goalAbsDir)
   check('宿主工作区投影认账全部 3 条会话（这是"看不看得见"的权威）', proj2.slice().sort().join(',') === 'sess-ch-1,sess-goal-1,sess-sub-1', { projected: proj2, warnings: imp.json.warnings })
   check('导入复用/登记工作区（真注册表 uuid，path 指向目标目录）', /^[0-9a-f-]{36}$/.test(String(imp.json.workspaceId)) && (await wsRegistryReal.get(String(imp.json.workspaceId))).path === await fsp.realpath(goalAbsDir), imp.json.workspaceId)
@@ -362,7 +414,7 @@ let exportedGoalId = ''
   const shaPng = pngRef.attachmentId.slice(7)
   const backPng = await fsp.readFile(path.join(attachRoot, shaPng.slice(0, 2), shaPng)).catch(() => undefined)
   check('附件按内容寻址回写，attachmentId 不变（会话引用不悬空）', !!backPng && Buffer.compare(backPng, pngBytes) === 0)
-  check('导入自检 = 宿主 inspect() 通过', imp.json.ok === true && imp.json.verified === true, { verified: imp.json.verified })
+  check('导入自检 verified 与宿主能力一致(rc.2 无 inspect ⇒ false 属诚实降级)', imp.json.ok === true && imp.json.verified === (typeof mockPersistence.inspect === 'function'), { verified: imp.json.verified, hostInspect: typeof mockPersistence.inspect })
   const led2 = JSON.parse(await fsp.readFile(path.join(goalAbsDir, '.study-sync.json'), 'utf8'))
   check('写了设备本地身份账本（remoteId↔localId 三条）', led2.remoteGoalId === exportedGoalId && led2.sessions.length === 3 && led2.sessions.every((x) => x.remoteId === x.localId), led2.sessions.map((x) => [x.remoteId, x.localId]))
   check('导入报告哪几条按宿主规则不会单独出现', /不会在工作区里单独出现/.test((imp.json.warnings || []).join(' ')), imp.json.warnings)
@@ -396,7 +448,7 @@ let exportedGoalId = ''
   const ff = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite' })
   check('更新的包 ⇒ 走 append 快进（1 条追加，其余 noop）', ff.json && ff.json.ok === true && ff.json.applied.append === 1 && ff.json.applied.noop === 2, ff.json && ff.json.applied)
   check('快进不改本地身份（localId 未被换掉）', (await projectionOf(goalAbsDir)).sort().join(',') === 'sess-ch-1,sess-goal-1,sess-sub-1', await projectionOf(goalAbsDir))
-  check('快进行数正确且宿主 inspect 认账', (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows + 3 && !!(await mockPersistence.inspect('sess-goal-1')), await rowsOf('sess-goal-1', goalAbsDir))
+  check('快进行数正确（宿主有 inspect 时再加认账）', (await rowsOf('sess-goal-1', goalAbsDir)) === baseRows + 3 && (typeof mockPersistence.inspect !== 'function' || !!(await mockPersistence.inspect('sess-goal-1'))), await rowsOf('sess-goal-1', goalAbsDir))
   const ffAgain = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite' })
   check('快进收敛后再导一次 = 幂等', ffAgain.json && ffAgain.json.ok === true && ffAgain.json.idempotent === true, ffAgain.json && ffAgain.json.applied)
 
