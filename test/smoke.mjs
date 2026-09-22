@@ -27,6 +27,7 @@ function check(name, cond, extra) {
 // ── 基础设施 ─────────────────────────────────────────────────────────────────
 const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-smoke-'))
 const injected = []
+const failInject = new Set()           // 该集合里的会话 id 注入时抛错（模拟「代理未激活」，测 D36 派发回滚）
 const flushed = []
 const routes = {}
 const effects = []
@@ -79,7 +80,7 @@ const ctx = {
       tools: {
         register: (def) => { registeredTools.push(def); return () => { const i = registeredTools.indexOf(def); if (i >= 0) registeredTools.splice(i, 1) } }
       },
-      agents: { get: (id) => ({ followup: (msg) => { injected.push({ id, msg }) } }) },
+      agents: { get: (id) => ({ followup: (msg) => { if (failInject.has(id)) throw new Error('会话代理未激活（测试注入）'); injected.push({ id, msg }) } }) },
       workspaceRegistry: wsRegistryReal,
       sessionPersistence: mockPersistence,
       sessions: sessionsSvc,
@@ -466,6 +467,153 @@ let exportedGoalId = ''
   await callRpc('study.deleteGoal', { goalId: wGoal })
 }
 
+// ── 测试单元（v0.9.0，D36）：多份追加不覆盖 + 编号预占回滚 + 扫盘收编 + 蓝图/陪练指令 + 错题本 + scope 页 ──
+{
+  const rowNow = async () => (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+  const chAbs = (name) => path.join(tmpRoot, goalId, 'chapters', name)
+  const LONG = '题目与解析正文，需要超过两百字以通过落卷采纳门槛。'.repeat(12)
+
+  // 会话内自带能力（不依赖聊天工具）：调研指令=目标测试能力，教练指令=第 6 条本章出卷能力
+  {
+    const ri = injected[0].msg.content[0].text
+    check('调研指令自带「目标测试能力」(goal-test-NN 命名+蓝图先行+额度入卷+统一错题规则)', /【目标测试能力】/.test(ri) && /goal-test-NN\.md/.test(ri) && /错题按额度入卷/.test(ri) && /只先给蓝图/.test(ri) && /错题本记录规则/.test(ri) && /goal-mistakes\.md/.test(ri), ri.slice(-300))
+    const coach = injected.find((m) => /本章学习教练/.test(m.msg.content[0].text)).msg.content[0].text
+    check('教练指令第 6 条=讲义问答答错记 01-mistakes.md + 会话内出卷(先 ls 取号绝不复用)', /【错题与本章测试】/.test(coach) && /01-mistakes\.md/.test(coach) && /01-test-XX\.md/.test(coach) && /绝不复用/.test(coach) && /【错题重做｜来源/.test(coach) && /错题本记录规则/.test(coach), coach.slice(-360))
+  }
+
+  // 前置闸门
+  check('generateChapterTest 未知目标 → error', (await callRpc('study.generateChapterTest', { goalId: 'nope', chapter_index: 1 })).json.ok === false)
+  check('generateChapterTest 未知章节 → error', /章节不存在/.test((await callRpc('study.generateChapterTest', { goalId, chapter_index: 99 })).json.error || ''))
+  check('generateChapterTest 讲义未就绪 → 拒绝出卷', /未就绪/.test((await callRpc('study.generateChapterTest', { goalId, chapter_index: 2 })).json.error || '') && ((await rowNow()).chapters[1].test || []).length === 0)
+  {
+    const gTmp = (await callRpc('study.createGoal', { topic: 'D36 闸门用' })).json.goalId
+    check('generateGoalTest 草案批准前 → 拒(没有可覆盖全课程的材料)', /课程草案批准前/.test((await callRpc('study.generateGoalTest', { goalId: gTmp })).json.error || ''))
+    await fsp.writeFile(path.join(tmpRoot, gTmp, 'draft.json'), JSON.stringify({ course: 'x', overview: 'y', chapters: [{ title: 'a' }] }))
+    await callRpc('study.list', {})   // 先轮询采纳草案（approveDraft 读的是 goal.draft）
+    await callRpc('study.approveDraft', { goalId: gTmp })
+    check('generateGoalTest 无目标会话 → 拒(不猜不落空)', /尚未记录目标会话/.test((await callRpc('study.generateGoalTest', { goalId: gTmp })).json.error || ''))
+    await callRpc('study.deleteGoal', { goalId: gTmp })
+  }
+
+  // 派发失败 → 回滚预占条目（编号不烧死）
+  failInject.add('sess-ch-1'); failInject.add('sess-goal-1')
+  const rFail = await callRpc('study.generateChapterTest', { goalId, chapter_index: 1 })
+  check('出卷注入失败 → ok:false 且回滚条目（列表不残留 generating）', rFail.json.ok === false && /没有可用会话/.test(rFail.json.error || '') && ((await rowNow()).chapters[0].test || []).length === 0, rFail.json)
+  const rFailG = await callRpc('study.generateGoalTest', { goalId })
+  check('目标卷注入失败 → 同样回滚 goalTests', rFailG.json.ok === false && /派发失败/.test(rFailG.json.error || '') && ((await rowNow()).goalTests || []).length === 0, rFailG.json)
+  failInject.clear()
+
+  // 正常派发 ×2：追加编号、旧卷不覆盖
+  const injN = injected.length
+  const rT1 = await callRpc('study.generateChapterTest', { goalId, chapter_index: 1, requirements: '选择题10道' })
+  check('📝 派发成功=优先注入本章会话 + n=1 + 01-test-01.md', rT1.json.ok === true && rT1.json.test_n === 1 && rT1.json.file === '01-test-01.md' && injected.length === injN + 1 && injected[injN].id === 'sess-ch-1', rT1.json)
+  {
+    const t = injected[injN].msg.content[0].text
+    check('出卷指令=蓝图先行(确认前不写文件)+额度组卷(优先重错、绝不超插)+重做标注+统一错题规则', /你是出卷 AI/.test(t) && /只先给出卷蓝图/.test(t) && /先不写任何文件/.test(t) && /错题按额度匹配组卷/.test(t) && /优先标「重错」/.test(t) && /绝不超插蓝图外模块的错题/.test(t) && /【错题重做｜来源/.test(t) && /错题本记录规则/.test(t), t.slice(0, 220))
+    check('出卷指令=依据本章讲义+落卷/错题本路径+附加要求优先+偏好注入+题答案分离', t.indexOf('/chapters/' + gj.chapters[0].file) > 0 && t.indexOf('01-test-01.md') > 0 && t.indexOf('01-mistakes.md') > 0 && /选择题10道/.test(t) && /用户教学偏好/.test(t) && /参考答案与解析/.test(t), t.slice(0, 300))
+  }
+  const rT2 = await callRpc('study.generateChapterTest', { goalId, chapter_index: 1 })
+  check('重复点击=追加 01-test-02.md（旧卷不覆盖）', rT2.json.ok === true && rT2.json.test_n === 2 && rT2.json.file === '01-test-02.md', rT2.json)
+  {
+    const c1 = (await rowNow()).chapters[0]
+    check('折叠区视图=两条 test 均 generating（失败派发没留 residue）', c1.test.length === 2 && c1.test.map((x) => x.status).join(',') === 'generating,generating', c1.test)
+    const gjT = JSON.parse(await fsp.readFile(path.join(tmpRoot, goalId, 'goal.json'), 'utf8'))
+    check('requirements 记入预占条目（仅本卷生效不串卷）', gjT.chapters[0].tests[0].requirements === '选择题10道' && gjT.chapters[0].tests[1].requirements === undefined, gjT.chapters[0].tests)
+  }
+
+  // file-as-truth 采纳 + 野文件收编 + 编号防撞
+  await fsp.writeFile(chAbs('01-test-01.md'), '# 第 1 章测试 01\n' + LONG + '<script>alert(2)</script>\n')
+  check('落卷 >200 字 → 轮询采纳 generating→ready（另一份仍 generating）', (await rowNow()).chapters[0].test.map((x) => x.status).join(',') === 'ready,generating')
+  await fsp.writeFile(chAbs('01-test-09.md'), '# 盘上野卷（AI 直接写出的）\n' + LONG)
+  check('adoptTestFiles 收编未登记卷（01-test-09 → ready）', (await rowNow()).chapters[0].test.some((x) => x.n === 9 && x.status === 'ready'), (await rowNow()).chapters[0].test)
+  const rT3 = await callRpc('study.generateChapterTest', { goalId, chapter_index: 1 })
+  check('派发前先扫盘 ⇒ 新号跳过野文件（n=10，不与 01-test-09 撞号）', rT3.json.ok === true && rT3.json.test_n === 10 && rT3.json.file === '01-test-10.md', rT3.json)
+
+  // 会话记录 + 打开陪练
+  const rrs = await callRpc('study.recordTestSession', { goalId, chapter_index: 1, test_n: 1, sessionId: 'sess-t-1' })
+  check('recordTestSession ok + 幂等重记', rrs.json.ok === true && (await callRpc('study.recordTestSession', { goalId, chapter_index: 1, test_n: 1, sessionId: 'sess-t-1' })).json.ok === true, rrs.json)
+  check('recordTestSession 缺 sessionId → error', (await callRpc('study.recordTestSession', { goalId, chapter_index: 1, test_n: 1, sessionId: '' })).json.ok === false)
+  check('recordTestSession 缺 test_n → error', /缺少 test_n/.test((await callRpc('study.recordTestSession', { goalId, chapter_index: 1, sessionId: 'x' })).json.error || ''))
+  check('recordTestSession 不存在的卷 → error', /没有测试 77|该章没有测试/.test((await callRpc('study.recordTestSession', { goalId, chapter_index: 1, test_n: 77, sessionId: 'x' })).json.error || ''))
+  const rOpenGen = await callRpc('study.startTest', { goalId, chapter_index: 1, test_n: 2, sessionId: 'sess-t-2' })
+  check('未落盘的卷(generating) → 「▶ 打开」被拒(不注入陪练)', rOpenGen.json.ok === false && /还没生成完毕/.test(rOpenGen.json.error || ''), rOpenGen.json)
+  const injS = injected.length
+  const rOpen = await callRpc('study.startTest', { goalId, chapter_index: 1, test_n: 1 })
+  check('▶ 打开 ready 卷 → 注入陪练到条目已记录的 sess-t-1（缺省 sessionId）', rOpen.json.ok === true && injected.length === injS + 1 && injected[injS].id === 'sess-t-1', rOpen.json)
+  {
+    const t = injected[injS].msg.content[0].text
+    check('陪练指令=逐题呈现+答错三讲(为什么错/考点/考点内容)+记错题+重做回标+成绩汇报', /你是陪练教练/.test(t) && /逐题呈现/.test(t) && /为什么错/.test(t) && /考点内容/.test(t) && /→ 已在 YYYY-MM-DD 重做答对/.test(t) && /错题本记录规则/.test(t) && /汇报成绩/.test(t), t.slice(0, 220))
+    check('陪练指令=试卷路径+本章错题本路径(来源=01-test-01.md)', t.indexOf('01-test-01.md') > 0 && t.indexOf('01-mistakes.md') > 0)
+  }
+  check('startTest 后 sessionId 已记入条目', JSON.parse(await fsp.readFile(path.join(tmpRoot, goalId, 'goal.json'), 'utf8')).chapters[0].tests[0].sessionId === 'sess-t-1')
+
+  // 错题本计数（^## 块）
+  await fsp.writeFile(chAbs('01-mistakes.md'), '# 第 1 章错题本\n## 考点：缩放因子 ｜ 错于 2026-09-22 ｜ 来源 讲义问答\n**原题** …\n## 考点：KV cache ｜ 错于 2026-09-22 ｜ 来源 01-test-01.md\n**原题** …\n')
+  await fsp.writeFile(path.join(tmpRoot, goalId, 'goal-mistakes.md'), '# 目标错题本\n## 考点：整卷时间分配 ｜ 错于 2026-09-22 ｜ 来源 goal-test-01.md\nx\n')
+  {
+    const row = await rowNow()
+    check('错题计数=按 ## 块（章 2 条 / 目标 1 条）', row.chapters[0].mistakes === 2 && row.goalMistakes === 1, { m: row.chapters[0].mistakes, gm: row.goalMistakes })
+  }
+
+  // readTestFile 四个 scope + 借道拒绝 + 未知 scope
+  const rtf = await callRpc('study.readTestFile', { goalId, scope: 'chapter-test', chapter_index: 1, test_n: 1 })
+  check('readTestFile chapter-test → 正文+路径+标题', rtf.json.ok === true && rtf.json.filePath.indexOf('/chapters/01-test-01.md') > 0 && rtf.json.title === '第 1 章测试 01 · 注意力机制' && /题目与解析正文/.test(rtf.json.content), rtf.json && { ok: rtf.json.ok, t: rtf.json.title })
+  check('readTestFile chapter-mistakes → 01-mistakes.md', (await callRpc('study.readTestFile', { goalId, scope: 'chapter-mistakes', chapter_index: 1 })).json.filePath.indexOf('/chapters/01-mistakes.md') > 0)
+  check('readTestFile goal-mistakes → 目标根目录', (await callRpc('study.readTestFile', { goalId, scope: 'goal-mistakes' })).json.filePath.indexOf('/goal-mistakes.md') > 0)
+  check('readTestFile 未知 scope → error', /未知 scope/.test((await callRpc('study.readTestFile', { goalId, scope: 'bogus' })).json.error || ''))
+  {
+    const goalJsonAbs = path.join(tmpRoot, goalId, 'goal.json')
+    const gjCur = JSON.parse(await fsp.readFile(goalJsonAbs, 'utf8'))
+    const savedFile = gjCur.chapters[0].tests[0].file
+    gjCur.chapters[0].tests[0].file = '../goal.json'
+    await fsp.writeFile(goalJsonAbs, JSON.stringify(gjCur))
+    check('goal.json 被改坏(file 带相对路径) ⇒ basename 全等拦下，读不出目录外文件', /不合法/.test((await callRpc('study.readTestFile', { goalId, scope: 'chapter-test', chapter_index: 1, test_n: 1 })).json.error || ''))
+    gjCur.chapters[0].tests[0].file = savedFile
+    await fsp.writeFile(goalJsonAbs, JSON.stringify(gjCur))
+  }
+
+  // 目标卷派发 + 采纳
+  const injG = injected.length
+  const rGT = await callRpc('study.generateGoalTest', { goalId, requirements: '案例题占三成' })
+  check('🎯 派发目标卷 → 注入目标会话 + goal-test-01.md', rGT.json.ok === true && rGT.json.test_n === 1 && rGT.json.file === 'goal-test-01.md' && injected[injG].id === 'sess-goal-1', rGT.json)
+  {
+    const t = injected[injG].msg.content[0].text
+    check('目标卷指令=依据(全课程总览+全部 ready 章讲义路径)+goal 维度错题本', /目标测试（覆盖全课程）/.test(t) && /全部讲义\(出卷前用 read 逐份读完\)/.test(t) && t.indexOf(gj.chapters[0].file) > 0 && /goal-mistakes\.md/.test(t) && /goal-test-01\.md/.test(t) && /案例题占三成/.test(t), t.slice(0, 260))
+  }
+  check('goal-test 未落盘 → readTestFile 报「文件还不存在」', /文件还不存在/.test((await callRpc('study.readTestFile', { goalId, scope: 'goal-test', test_n: 1 })).json.error || ''))
+  await fsp.writeFile(path.join(tmpRoot, goalId, 'goal-test-01.md'), '# 目标测试 01\n' + LONG)
+  check('目标卷采纳 → goalTests ready', (await rowNow()).goalTests.some((x) => x.n === 1 && x.status === 'ready'), (await rowNow()).goalTests)
+
+  // /study-file 的 scope 分支（兜底页）+ 旧行为不变
+  {
+    const pTest = await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&scope=chapter-test&chapter=1&test=1')
+    check('测试卷 scope 页 200 + 标题 + 注入不执行 + CSP', pTest.code === 200 && pTest.text.indexOf('<title>第 1 章测试 01 · 注意力机制</title>') > 0 && pTest.text.indexOf('<h1>第 1 章测试 01</h1>') > 0 && pTest.text.indexOf('<script>alert(2)</script>') < 0 && pTest.text.indexOf('&lt;script&gt;') >= 0 && String(pTest.headers['content-security-policy']).indexOf("default-src 'none'") === 0, { code: pTest.code, head: pTest.text.slice(0, 140) })
+    check('错题本 scope 页 200', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&scope=goal-mistakes')).text.indexOf('<h1>目标错题本</h1>') > 0)
+    check('scope 页缺 test → 404', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&scope=chapter-test&chapter=1')).code === 404)
+    check('scope 页未知 scope → 404', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&scope=nope')).code === 404)
+    check('无 scope 参数仍走旧讲义页（行为逐字不变）', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&chapter=1&format=raw')).code === 200)
+  }
+
+  // study_test_generate（外部会话派发口）：缺 goal_id 拒绝 + 路由 + 透传错误
+  {
+    const tt = registeredTools.find((x) => x.name === 'study_test_generate')
+    check('study_test_generate 已注册且 goal_id 为 required', !!tt && /goal_id/.test(JSON.stringify(tt.parameters)) && /required/.test(JSON.stringify(tt.parameters)), tt && JSON.stringify(tt.parameters))
+    let noGoal
+    try { noGoal = await tt.execute({}) } catch (e) { noGoal = { ok: false, error: String((e && e.message) || e) } }
+    check('缺 goal_id → schema required 直接拒绝（严禁猜目标）', noGoal.ok === false && /goal_id/.test(noGoal.error || ''), noGoal)
+    const noGoalDirect = await tt.execute({ goal_id: '' })
+    check('handler 层兜底：goal_id 空串穿过 schema 也被拒并指引 study_plan_status', noGoalDirect.ok === false && /study_plan_status/.test(noGoalDirect.error || ''), noGoalDirect)
+    const badCh = await tt.execute({ goal_id: goalId, chapter_index: '2' })
+    check('chapter_index 字符串→数字路由；未就绪错误原样透传', badCh.ok === false && /未就绪/.test(badCh.error || ''), badCh)
+    const injTT = injected.length
+    const okG = await tt.execute({ goal_id: goalId, requirements: '外部会话要卷' })
+    check('不带 chapter_index ⇒ 派发目标卷(n=2) + message 指向蓝图确认', okG.ok === true && okG.test_n === 2 && injected[injTT].id === 'sess-goal-1' && /蓝图/.test(okG.message || ''), okG)
+    const st = await (registeredTools.find((x) => x.name === 'study_plan_status')).execute({})
+    const srow = st.goals.find((x) => x.id === goalId)
+    check('study_plan_status 回带 tests_ready/goal_tests_ready/mistakes_total', srow.tests_ready === 2 && srow.goal_tests_ready === 1 && srow.mistakes_total === 3, srow && { t: srow.tests_ready, g: srow.goal_tests_ready, m: srow.mistakes_total })
+  }
+}
+
   // ── M4 前置：用真 locate 造出该目标的会话 transcript（目标会话 + 章节会话 + 空 subagent 会话）
   const goalAbsDir = path.join(tmpRoot, goalId)
   const ev = (type, seq, data, extra) => JSON.stringify(Object.assign({ type, seq, time: 1788000100000 + seq, data }, extra || {}))
@@ -726,7 +874,7 @@ let exportedGoalId = ''
 {
   check('defineTool 已解析（静态注册启用）', registeredTools.length > 0, '注册数=' + registeredTools.length)
   const names = registeredTools.map((t) => t.name).sort()
-  check('7 个工具注册', names.join(',') === 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status', names)
+  check('8 个工具注册', names.join(',') === 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_test_generate', names)
   const byName = Object.fromEntries(registeredTools.map((t) => [t.name, t]))
   const createJson = JSON.stringify(byName.study_plan_create && byName.study_plan_create.parameters)
   check('create schema 含 topic 且表达 required', /topic/.test(createJson) && /required/.test(createJson), createJson)

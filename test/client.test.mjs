@@ -131,6 +131,12 @@ const handlers = {
   'study.reattachGoalSessions': (a) => { rpc.push(['reattach', a]); return { ok: true, workspaceId: 'ws-1', attached: 2, failed: [] } },
   'study.readChapter': (a) => { rpc.push(['readChapter', a]); return notesResult },
   'study.startChapter': (a) => { rpc.push(['startChapter', a]); return { ok: true } },
+  // ── D36 测试单元（🎯/📝 派发、▶ 陪练、试卷/错题本文件页）的可控返回 ──
+  'study.generateChapterTest': (a) => { rpc.push(['genChapterTest', a]); return genChapterTestResult },
+  'study.generateGoalTest': (a) => { rpc.push(['genGoalTest', a]); return genGoalTestResult },
+  'study.startTest': (a) => { rpc.push(['startTest', a]); return startTestResult },
+  'study.recordTestSession': (a) => { rpc.push(['recordTestSession', a]); return { ok: true } },
+  'study.readTestFile': (a) => { rpc.push(['readTestFile', a]); return testFileResult },
   // ── M5 GitHub 同步（可控返回，供同步面板用例驱动）──
   'study.syncGetConfig': (a) => { rpc.push(['syncGetConfig', a]); return syncCfg },
   'study.syncSetConfig': (a) => { rpc.push(['syncSetConfig', a]); return { ok: true, config: Object.assign({}, syncCfg.config, a) } },
@@ -150,6 +156,11 @@ const handlers = {
 let syncCfg = { ok: true, bound: false, bindState: 'unbound', fetch: true, config: {} }
 // 「打开讲义」的可控返回（study.readChapter）
 let notesResult = { ok: true, title: '计算机系统基础', content: '# 本章目标\n计算机系统基础\n- 要点一\n> 💡 [补充：流水](01-notes/x.md) — 概括\n```py\nprint("<img src=x onerror=alert(1)>")\n```\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-chapter.md' }
+// D36 测试单元用例的可控返回
+let genChapterTestResult = { ok: true, test_n: 3, file: '01-test-03.md' }
+let genGoalTestResult = { ok: true, test_n: 2, file: 'goal-test-02.md' }
+let startTestResult = { ok: true, sessionId: 'session-t1' }
+let testFileResult = { ok: true, title: '第 1 章测试 01 · 计算机系统基础', content: '# 题\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-test-01.md' }
 let remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goals: [] }
 const inspResults = {}
 let pushResult = { ok: true, pushed: true }
@@ -411,6 +422,9 @@ const rowRange = (title) => {
   return []
 }
 const btnIn = (title, label) => rowRange(title).find((e) => e.type === 'button' && textOf(e) === label)
+// D36 起 📖/📝/🎯/▶/📕 都是纯图标按钮（文字在悬停 title 里），按 className + 图标文字找
+const iconBtnIn = (title, emoji) => rowRange(title).find((e) => e.type === 'button' && e.props.className === 'stuiIconBtn' && textOf(e) === emoji)
+const iconBtnsIn = (title, emoji) => rowRange(title).filter((e) => e.type === 'button' && e.props.className === 'stuiIconBtn' && textOf(e) === emoji)
 const expand = async (title) => { await click(rowRange(title).find((e) => e.props.className === 'stuiGoalTitle'), 'expand ' + title); return await renderAll() }
 
 await expand('尚未派发')
@@ -586,9 +600,9 @@ const sidebarOpen = (sessionId) => 'sidebar:' + JSON.stringify({
 })
 const startChapter = async () => {
   await renderAll()
-  let b = btnIn('软件设计', '📖 开始学习')
-  if (!b) { await expand('软件设计'); b = btnIn('软件设计', '📖 开始学习') }
-  assert.ok(b, '章节行缺少「📖 开始学习」按钮')
+  let b = iconBtnIn('软件设计', '📖')
+  if (!b) { await expand('软件设计'); b = iconBtnIn('软件设计', '📖') }
+  assert.ok(b && b.props.title.indexOf('开始学习') >= 0, '章节行缺少悬停「📖 开始学习」的图标按钮')
   await click(b, 'start chapter')
   return renderAll()
 }
@@ -646,15 +660,105 @@ assert.deepEqual(openedUrls, [], '读不到文件时不该开新标签')
 notesResult = { ok: true, title: '计算机系统基础', content: '# 本章目标\n计算机系统基础\n', filePath: NOTES_PATH }
 ok('打开讲义：文件缺失时显示宿主返回的错误而非抛错')
 
-// (4) 回归：就绪章节行只剩一个 📖 入口 =「📖 开始学习」，独立「📖 讲义」按钮已移除
+// (4) 回归：就绪章节行的 📖 入口收敛为纯图标（D36：文字进悬停 title），独立「📖 讲义」按钮仍不存在
 hostShape.sidebar = false
 await useHost({ ui: true, legacy: false }, [goalRow])
 tree = await renderAll()
 const bookBtns = flat.filter((e) => e.type === 'button' && textOf(e).indexOf('📖') >= 0)
-assert.deepEqual(bookBtns.map((e) => textOf(e)), ['📖 开始学习'], '章节行的 📖 入口应只剩「开始学习」：' + JSON.stringify(bookBtns.map((e) => textOf(e))))
+assert.deepEqual(bookBtns.map((e) => textOf(e)), ['📖'], '章节行的 📖 入口应只剩纯图标「📖」：' + JSON.stringify(bookBtns.map((e) => textOf(e))))
+assert.ok(bookBtns[0].props.title.indexOf('📖 开始学习') >= 0, '悬停 title 必须说明「开始学习」')
 assert.ok(bodyText().indexOf('也可随时单点') < 0, '提示文案不该再承诺单点讲义')
-assert.ok(bodyText().indexOf('自动在右侧打开本章讲义') >= 0, '提示文案未说明自动开讲义: ' + bodyText().slice(0, 300))
-ok('章节行不再有独立「📖 讲义」按钮，提示文案与之一致')
+assert.ok(bodyText().indexOf('自动打开本章讲义') >= 0, '提示文案未说明自动开讲义: ' + bodyText().slice(0, 300))
+ok('章节行只剩纯图标「📖」（悬停=开始学习），提示文案与之一致')
+
+// ── D36 测试单元：🎯/📝 纯图标派发、章节/目标测试折叠区、▶ 陪练会话、📕 错题本页签 ──
+const d36Row = {
+  id: 'goal-d36', title: '测试单元目标', status: 'active', target_level: '软考中级', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g',
+  path: '/home/me/.dsh/study-work/goal-d36', draft: null,
+  chapters: [{ index: 1, title: '计算机系统基础', file: '01-chapter.md', status: 'ready', sessionId: 'session-c1', lastError: '',
+    test: [
+      { n: 1, file: '01-test-01.md', status: 'ready', sessionId: 'session-t1' },
+      { n: 2, file: '01-test-02.md', status: 'generating' }
+    ], mistakes: 2 }],
+  goalTests: [{ n: 1, file: 'goal-test-01.md', status: 'ready' }],
+  goalMistakes: 1
+}
+const d36Snapshot = () => ({ byId: { 'session-g': {}, 'session-c1': {}, 'session-t1': {} }, phase: 'ready' })
+await useHost({ ui: true, legacy: false, snapshot: d36Snapshot }, [d36Row])
+hostShape.sidebar = false
+sessionsSvc.list.getSnapshot = d36Snapshot
+await expand('测试单元目标')
+// (1) 图标按钮三件套就位：📖(悬停=开始学习) / 📝(悬停含「生成本章讲义测试」) / 🎯(悬停含「生成目标测试」)
+assert.ok(iconBtnIn('测试单元目标', '📝') && iconBtnIn('测试单元目标', '📝').props.title.indexOf('生成本章讲义测试') >= 0, '章节行缺悬停「📝 生成本章讲义测试」的图标按钮')
+assert.ok(iconBtnIn('测试单元目标', '🎯') && iconBtnIn('测试单元目标', '🎯').props.title.indexOf('生成目标测试') >= 0, '目标行缺悬停「🎯 生成目标测试」的图标按钮')
+ok('D36：🎯/📝 均为纯图标按钮，文字在悬停 title 里')
+// (2) 折叠区默认收起：计数摘要 + generating 提示，明细不渲染
+assert.ok(bodyText().indexOf('▸ 本章测试（2 份 · 错题 2）') >= 0, '本章测试折叠头缺失: ' + bodyText().slice(0, 300))
+assert.ok(bodyText().indexOf('⏳ 有考卷生成中') >= 0, '收起态应提示有卷在生成')
+assert.ok(bodyText().indexOf('▸ 目标测试（1 份 · 错题 1）') >= 0, '目标测试折叠头缺失')
+assert.ok(bodyText().indexOf('🧪 测试 01') < 0, '未展开不该渲染明细')
+ok('D36：折叠区默认收起，摘要带份数与错题数并提示生成中')
+// (3) 展开本章测试区：ready 卷带 ▶，generating 卷只有 chip；错题本行在场
+await click(rowRange('测试单元目标').find((e) => textOf(e).indexOf('本章测试（') >= 0 && typeof e.props.onClick === 'function'), 'expand chapter tests')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('🧪 测试 01') >= 0 && bodyText().indexOf('试卷就绪') >= 0 && bodyText().indexOf('生成中…') >= 0, '展开后应见两卷两态')
+assert.ok(bodyText().indexOf('有考卷生成中') < 0, '展开后收起态提示该让位给明细')
+assert.ok(bodyText().indexOf('📕 本章错题本') >= 0 && bodyText().indexOf('2 条') >= 0, '本章错题本行缺失')
+const chPlays = iconBtnsIn('测试单元目标', '▶')
+assert.equal(chPlays.length, 1, '▶ 只该出现在 ready 卷上：' + chPlays.length)
+ok('D36：展开后逐卷呈现（ready 有 ▶、generating 没有）+ 错题本行')
+// (4) ▶ 打开本章卷 = 「开始学习」同构：复用条目会话 + startTest 注入 + 试卷交 better-sidebar/新标签
+rpc.length = 0; opened.length = 0; openedUrls.length = 0
+await click(iconBtnsIn('测试单元目标', '▶')[0], 'open chapter test')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'startTest' && c[1].goalId === 'goal-d36' && c[1].chapter_index === 1 && c[1].test_n === 1 && c[1].sessionId === 'session-t1'), 'startTest 参数不对: ' + JSON.stringify(rpc))
+assert.ok(!rpc.some((c) => c[0] === 'recordTestSession'), '条目已记测试会话 ⇒ 不该再新建')
+assert.deepEqual(opened, ['ui-open:session-t1'], '应切进该卷的陪练会话: ' + JSON.stringify(opened))
+const rtC = rpc.find((c) => c[0] === 'readTestFile')
+assert.ok(rtC && rtC[1].scope === 'chapter-test' && rtC[1].chapter_index === 1 && rtC[1].test_n === 1, 'readTestFile 参数不对: ' + JSON.stringify(rtC))
+assert.deepEqual(openedUrls.slice(-1), ['/study-file?goalId=goal-d36&scope=chapter-test&chapter=1&test=1'], '无 sidebar 时应新标签兜底出试卷页: ' + JSON.stringify(openedUrls))
+ok('D36：▶=复用已记会话 + startTest 注入 + 试卷 /study-file 兜底页')
+// (5) 📝/🎯 点击即派发（追加一份新卷），成功提示指向「会话内确认蓝图」
+rpc.length = 0
+await click(iconBtnIn('测试单元目标', '📝'), 'dispatch chapter test')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'genChapterTest' && c[1].goalId === 'goal-d36' && c[1].chapter_index === 1), '📝 应打 study.generateChapterTest: ' + JSON.stringify(rpc))
+assert.ok(bodyText().indexOf('📝 第 1 章测试第 3 份已派发') >= 0 && bodyText().indexOf('确认出卷蓝图') >= 0, '缺派发成功提示: ' + bodyText().slice(0, 300))
+rpc.length = 0
+await click(iconBtnIn('测试单元目标', '🎯'), 'dispatch goal test')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'genGoalTest' && c[1].goalId === 'goal-d36'), '🎯 应打 study.generateGoalTest')
+assert.ok(bodyText().indexOf('🎯 目标测试第 2 份已派发') >= 0, '缺目标卷派发提示')
+ok('D36：📝/🎯 一次点击=派发一份新卷并提示去会话确认蓝图')
+// (6) 目标测试区展开 + 无 sessionId 的卷：新建会话→记回条目→startTest→goal-test 兜底页
+await click(rowRange('测试单元目标').find((e) => textOf(e).indexOf('目标测试（') >= 0 && typeof e.props.onClick === 'function'), 'expand goal tests')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('🎯 目标卷 01') >= 0 && bodyText().indexOf('📕 目标错题本') >= 0, '目标测试区明细缺失')
+rpc.length = 0; opened.length = 0; openedUrls.length = 0
+const gPlays = iconBtnsIn('测试单元目标', '▶')
+await click(gPlays[gPlays.length - 1], 'open goal test (fresh session)')
+tree = await renderAll()
+assert.ok(rpc.some((c) => c[0] === 'recordTestSession' && c[1].goalId === 'goal-d36' && c[1].test_n === 1 && c[1].sessionId === 'session-new'), '无记录的卷应先新建会话并记回条目: ' + JSON.stringify(rpc))
+assert.ok(rpc.some((c) => c[0] === 'startTest' && c[1].sessionId === 'session-new' && c[1].test_n === 1 && c[1].chapter_index === undefined), '目标卷 startTest 不该带 chapter_index: ' + JSON.stringify(rpc))
+const rtG = rpc.find((c) => c[0] === 'readTestFile')
+assert.ok(rtG && rtG[1].scope === 'goal-test' && rtG[1].test_n === 1, 'goal-test 文件参数不对: ' + JSON.stringify(rtG))
+assert.deepEqual(openedUrls.slice(-1), ['/study-file?goalId=goal-d36&scope=goal-test&test=1'], JSON.stringify(openedUrls))
+ok('D36：未记会话的卷先建后记再注入；目标卷派发/开卷不带 chapter_index')
+// (7) 📕 错题本：装了 better-sidebar 时以目标会话为 scope 开页签，不开新标签
+hostShape.sidebar = true
+rpc.length = 0; opened.length = 0; openedUrls.length = 0
+testFileResult = { ok: true, title: '目标错题本', content: '# 目标错题本\n## 考点：x\n', filePath: '/home/me/.dsh/study-work/goal-d36/goal-mistakes.md' }
+await click(rowRange('测试单元目标').find((e) => e.type === 'button' && e.props.title === '打开目标错题本'), 'open goal mistakes')
+tree = await renderAll()
+const rtM = rpc.find((c) => c[0] === 'readTestFile')
+assert.ok(rtM && rtM[1].scope === 'goal-mistakes', '📕 应读 goal-mistakes: ' + JSON.stringify(rtM))
+assert.deepEqual(opened.slice(-1), ['sidebar:' + JSON.stringify({ scope: { sessionId: 'session-g' }, path: testFileResult.filePath, title: '目标错题本' })], '错题本应开成目标会话的右侧页签: ' + JSON.stringify(opened))
+assert.deepEqual(openedUrls, [], 'better-sidebar 已受理时不该开新标签')
+hostShape.sidebar = false
+testFileResult = { ok: true, title: '第 1 章测试 01 · 计算机系统基础', content: '# 题\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-test-01.md' }
+sessionsSvc.list.getSnapshot = origSnapshot
+ok('D36：📕 错题本走 better-sidebar 页签（scope=目标会话），缺席才兜底新标签')
 
 // ── 空列表：提示文案与「＋ 添加学习目标」必须同时在场（回归：按钮曾被关在
 //    goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口）────────

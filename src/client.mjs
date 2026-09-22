@@ -362,6 +362,78 @@ function apply(ctx) {
       })
     }
 
+    // ── D36 测试单元：派发（📝/🎯）、陪练会话（▶ 打开）、文档页签（试卷/错题本） ──
+    const testFileUrl = (goalId, scope, chapter, test) => {
+      let u = '/study-file?goalId=' + encodeURIComponent(goalId) + '&scope=' + encodeURIComponent(scope)
+      if (chapter !== undefined && chapter !== null) u += '&chapter=' + encodeURIComponent(chapter)
+      if (test !== undefined && test !== null) u += '&test=' + encodeURIComponent(test)
+      return u
+    }
+    const openStudyDoc = async (args, sid, url) => {
+      try {
+        const r = await call('study.readTestFile', args)
+        if (!r || r.ok !== true) { setError(String((r && r.error) || '读取文件失败')); return }
+        if (openInSidebar(r.filePath, sid || undefined, r.title)) return
+        let openedWin = null
+        try {
+          if (typeof window !== 'undefined' && typeof window.open === 'function') openedWin = window.open(url, '_blank')
+        } catch (e) {}
+        if (!openedWin) setNotice('页面已就绪，但浏览器拦住了新标签: ' + url)
+      } catch (e) { setError('打开失败: ' + errText(e)) }
+    }
+    const testLoc = (g, kind, c, t) => {
+      const a = { goalId: g.id, test_n: t.n }
+      if (kind === 'chapter') a.chapter_index = c.index
+      return a
+    }
+    const doGenGoalTest = async (g) => {
+      await doAction('gentest:' + g.id, async () => {
+        const r = await call('study.generateGoalTest', { goalId: g.id })
+        if (r && r.ok === true) setNotice('🎯 目标测试第 ' + r.test_n + ' 份已派发：请进目标会话确认出卷蓝图，落卷后在本页「目标测试」区打开')
+        return r
+      })
+    }
+    const doGenChapterTest = async (g, c) => {
+      await doAction('genctest:' + g.id + ':' + c.index, async () => {
+        const r = await call('study.generateChapterTest', { goalId: g.id, chapter_index: c.index })
+        if (r && r.ok === true) setNotice('📝 第 ' + c.index + ' 章测试第 ' + r.test_n + ' 份已派发：请进本章/目标会话确认出卷蓝图')
+        return r
+      })
+    }
+    // 打开测试 = 「开始学习」同构：有测试会话直接切回，没有就在目标工作区新建并记回该卷，
+    // 注入陪练指令后切会话、再把试卷开成页签（陪练逐题就在该会话进行）。
+    const openTest = async (g, c, t, kind) => {
+      if (!sessionsSvc) { setError('会话服务不可用'); return }
+      const key = 'test:' + g.id + ':' + (kind === 'chapter' ? c.index : 'g') + ':' + t.n
+      setBusyKey(key); setError('')
+      try {
+        let sid = t.sessionId
+        if (!sid) {
+          let wsId = g.workspaceId
+          if (!wsId) {
+            const r = await call('study.ensureGoalWorkspace', { goalId: g.id })
+            if (!r || r.ok !== true) { setError(String((r && r.error) || '无法建立工作区')); return }
+            wsId = r.workspaceId
+          }
+          if (typeof sessionsSvc.create !== 'function') { setError('宿主未提供会话创建能力'); return }
+          sid = unwrapSessionId(await sessionsSvc.create({ workspaceId: wsId }))
+          if (!sid) { setError('创建测试会话失败: 未返回会话 id'); return }
+          const rec = await call('study.recordTestSession', Object.assign(testLoc(g, kind, c, t), { sessionId: sid }))
+          if (!rec || rec.ok !== true) { setError(String((rec && rec.error) || '记录测试会话失败')); return }
+        }
+        const st = await call('study.startTest', Object.assign(testLoc(g, kind, c, t), { sessionId: sid }))
+        if (st && st.ok !== true) setError(String(st.error || '注入陪练指令失败'))
+        if (sid && !openSessionInUi(sid)) setError('宿主未能切换到测试会话，请在左侧会话列表手动打开')
+        await refresh()
+        await openStudyDoc(Object.assign({ scope: kind === 'chapter' ? 'chapter-test' : 'goal-test' }, testLoc(g, kind, c, t)), sid,
+          testFileUrl(g.id, kind === 'chapter' ? 'chapter-test' : 'goal-test', kind === 'chapter' ? c.index : null, t.n))
+      } catch (e) {
+        setError('打开测试失败: ' + errText(e))
+      } finally {
+        setBusyKey(null)
+      }
+    }
+
     const createGoal = async () => {
       if (!form.topic.trim()) { setError('请填写主题'); return }
       setBusyKey('create')
@@ -979,6 +1051,11 @@ function apply(ctx) {
                       onClick: () => openGoalSession(g)
                     }, opening ? '切换中…' : '📄 打开会话'),
                     React.createElement('button', {
+                      type: 'button', className: 'stuiIconBtn', disabled: goalBusy || busyKey === 'gentest:' + g.id,
+                      title: '🎯 生成目标测试（每次点击新增一份；派发后请到目标会话确认出卷蓝图）',
+                      onClick: () => doGenGoalTest(g)
+                    }, busyKey === 'gentest:' + g.id ? '⏳' : '🎯'),
+                    React.createElement('button', {
                       type: 'button', className: 'stuiIconBtn', title: '导出为 zip（目标全部内容 + 全部会话）',
                       disabled: goalBusy || busyKey === 'export:' + g.id,
                       onClick: () => doExport(g)
@@ -987,7 +1064,7 @@ function apply(ctx) {
                   exp && React.createElement('div', { className: 'stuiGoalBody' },
                     React.createElement('div', { className: 'stuiDetail' },
                       React.createElement('div', { className: 'stuiMeta' }, '目标: ' + (g.target_level || '未说明')),
-                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；章节讲义就绪后点「📖 开始学习」进该章会话，并自动在右侧打开本章讲义')
+                      React.createElement('div', { className: 'stuiMeta' }, '💡 目标与每章都有独立会话：点「打开会话」进目标总会话；讲义就绪后点「📖」进该章会话并自动打开本章讲义。测试：🎯 出一份目标测试、📝 出一份本章测试（点击即派发，请到对应会话确认出卷蓝图）；「▶ 打开」进陪练会话逐题作答，答错会讲解并记入错题本'),
                     ),
                     webSection(g),
                     React.createElement('div', { className: 'stuiDetail' },
@@ -1019,14 +1096,56 @@ function apply(ctx) {
                       chapterList.map((c) => {
                         const chBusy = busyKey === g.id + ':' + c.index || busyKey === 'ch:' + g.id + ':' + c.index
                         const readyForLearn = c.status === 'ready' || c.status === 'done'
-                        return React.createElement('div', { key: c.index, className: 'stuiChRow' },
-                          React.createElement('span', { className: 'stuiChTitle', title: c.file }, String(c.index).padStart(2, '0') + '. ' + c.title),
-                          React.createElement('span', { className: 'stuiChip', 'data-tone': toneOf(c.status) }, labelOf(c.status)),
-                          c.status === 'draft' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.generateChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '生成中…' : '生成讲义'),
-                          c.status === 'generating' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.continueChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '继续中…' : '继续生成'),
-                          readyForLearn && React.createElement('button', { type: 'button', className: 'stuiAct', disabled: chBusy, onClick: () => openChapterSession(g, c) }, chBusy ? '打开中…' : '📖 开始学习')
+                        const tests = c.test || []
+                        const mistakesN = c.mistakes || 0
+                        const tExp = expanded['t:' + g.id + ':' + c.index] === true
+                        return React.createElement('div', { key: c.index },
+                          React.createElement('div', { className: 'stuiChRow' },
+                            React.createElement('span', { className: 'stuiChTitle', title: c.file }, String(c.index).padStart(2, '0') + '. ' + c.title),
+                            React.createElement('span', { className: 'stuiChip', 'data-tone': toneOf(c.status) }, labelOf(c.status)),
+                            c.status === 'draft' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.generateChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '生成中…' : '生成讲义'),
+                            c.status === 'generating' && React.createElement('button', { type: 'button', className: 'stuiAct', 'data-tone': 'primary', disabled: chBusy, onClick: () => doAction(g.id + ':' + c.index, () => call('study.continueChapter', { goalId: g.id, chapter_index: c.index })) }, busyKey === g.id + ':' + c.index ? '继续中…' : '继续生成'),
+                            readyForLearn && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: chBusy, title: chBusy ? '打开中…' : '📖 开始学习（进入本章会话并打开讲义）', onClick: () => openChapterSession(g, c) }, chBusy ? '⏳' : '📖'),
+                            readyForLearn && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '📝 生成本章讲义测试（每次点击新增一份；派发后到会话内确认出卷蓝图）', onClick: () => doGenChapterTest(g, c) }, busyKey === 'genctest:' + g.id + ':' + c.index ? '⏳' : '📝')
+                          ),
+                          readyForLearn && (tests.length > 0 || mistakesN > 0) && React.createElement('div', { className: 'stuiDetail' },
+                            React.createElement('div', { className: 'stuiMeta', style: { cursor: 'pointer' }, onClick: () => setExpanded(Object.assign({}, expanded, { ['t:' + g.id + ':' + c.index]: !tExp })) },
+                              (tExp ? '▾ ' : '▸ ') + '本章测试（' + tests.length + ' 份' + (mistakesN > 0 ? ' · 错题 ' + mistakesN : '') + '）'),
+                            !tExp && tests.some((t) => t.status === 'generating') && React.createElement('div', { className: 'stuiMeta' }, '⏳ 有考卷生成中（待你在会话内确认蓝图或等它落盘）'),
+                            tExp && tests.map((t) => React.createElement('div', { key: 't' + t.n, className: 'stuiChRow' },
+                              React.createElement('span', { className: 'stuiChTitle', title: t.file }, '🧪 测试 ' + String(t.n).padStart(2, '0')),
+                              React.createElement('span', { className: 'stuiChip', 'data-tone': t.status === 'ready' ? 'ok' : 'busy' }, t.status === 'ready' ? '试卷就绪' : '生成中…'),
+                              t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, c, t, 'chapter') }, busyKey === 'test:' + g.id + ':' + c.index + ':' + t.n ? '⏳' : '▶')
+                            )),
+                            tExp && mistakesN > 0 && React.createElement('div', { className: 'stuiChRow' },
+                              React.createElement('span', { className: 'stuiChTitle' }, '📕 本章错题本'),
+                              React.createElement('span', { className: 'stuiChip' }, mistakesN + ' 条'),
+                              React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '打开本章错题本', onClick: () => openStudyDoc({ goalId: g.id, scope: 'chapter-mistakes', chapter_index: c.index }, c.sessionId || g.sessionId, testFileUrl(g.id, 'chapter-mistakes', c.index, null)) }, '📕')
+                            )
+                          )
                         )
                       }),
+                      (() => {
+                        const gtests = g.goalTests || []
+                        const gmN = g.goalMistakes || 0
+                        if (gtests.length === 0 && gmN === 0) return null
+                        const gtExp = expanded['gt:' + g.id] === true
+                        return React.createElement('div', { className: 'stuiDetail' },
+                          React.createElement('div', { className: 'stuiMeta', style: { cursor: 'pointer' }, onClick: () => setExpanded(Object.assign({}, expanded, { ['gt:' + g.id]: !gtExp })) },
+                            (gtExp ? '▾ ' : '▸ ') + '目标测试（' + gtests.length + ' 份' + (gmN > 0 ? ' · 错题 ' + gmN : '') + '）'),
+                          !gtExp && gtests.some((t) => t.status === 'generating') && React.createElement('div', { className: 'stuiMeta' }, '⏳ 有考卷生成中（待你在目标会话确认蓝图或等它落盘）'),
+                          gtExp && gtests.map((t) => React.createElement('div', { key: 'gt' + t.n, className: 'stuiChRow' },
+                            React.createElement('span', { className: 'stuiChTitle', title: t.file }, '🎯 目标卷 ' + String(t.n).padStart(2, '0')),
+                            React.createElement('span', { className: 'stuiChip', 'data-tone': t.status === 'ready' ? 'ok' : 'busy' }, t.status === 'ready' ? '试卷就绪' : '生成中…'),
+                            t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, null, t, 'goal') }, busyKey === 'test:' + g.id + ':g:' + t.n ? '⏳' : '▶')
+                          )),
+                          gtExp && gmN > 0 && React.createElement('div', { className: 'stuiChRow' },
+                            React.createElement('span', { className: 'stuiChTitle' }, '📕 目标错题本'),
+                            React.createElement('span', { className: 'stuiChip' }, gmN + ' 条'),
+                            React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '打开目标错题本', onClick: () => openStudyDoc({ goalId: g.id, scope: 'goal-mistakes' }, g.sessionId, testFileUrl(g.id, 'goal-mistakes', null, null)) }, '📕')
+                          )
+                        )
+                      })(),
                       (g.status === 'approved' || g.status === 'active' || g.status === 'completed') && chapterList.length > 0 && (() => {
                         const pendingN = chapterList.filter((c) => c.status === 'draft').length
                         const genN = chapterList.filter((c) => c.status === 'generating').length

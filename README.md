@@ -6,8 +6,8 @@
 ## 形态（与 dsh-free-search / @xmanrui/dsh-im 等同构）
 - **宿主半** `lib/index.js`：ESM 模块，`export function apply(ctx, config)`。
   - `ctx.inject(['webServer','agents','workspaceRegistry','tools'], …)` 注入服务；导出/导入另用一条 inject 取 `sessionPersistence / sessions / attachments`（缺席只降级该功能，面板与聊天工具不受影响）
-  - `/study-rpc` webServer prefix 路由（POST only + 1MB 上限；**不判定来源 IP**，局域网可达）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip；`/study-file` GET 路由出章节讲义页（入参只有 goalId+chapter，落点经 goal.json 反查，正文转义 + CSP `default-src 'none'`）；`study.readChapter` 供面板「打开讲义」—— 路径优先交给 client 侧的 `betterSidebar` 服务（DSH-better-sidebar）开成右侧页签，取不到才 `window.open` `/study-file` 新标签
-  - `study_plan_*` 聊天工具 ×5 + `study_goal_export`/`study_goal_import` ×2：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
+  - `/study-rpc` webServer prefix 路由（POST only + 1MB 上限；**不判定来源 IP**，局域网可达）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip；`/study-file` GET 路由出学习文档页（章节讲义 / 测试卷 / 错题本；入参只有 goalId+编号/scope，落点经 goal.json 反查，正文转义 + CSP `default-src 'none'`）；`study.readChapter`/`study.readTestFile` 供面板「打开讲义/试卷」—— 路径优先交给 client 侧的 `betterSidebar` 服务（DSH-better-sidebar）开成右侧页签，取不到才 `window.open` `/study-file` 新标签
+  - `study_plan_*` 聊天工具 ×6（含 `study_test_generate` 派发测试）+ `study_goal_export`/`study_goal_import` ×2：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
 - **可携化** `lib/portable.js`：零依赖 ZIP（store + deflate，已与 Windows 自带解压器互操作验证）+ zstd 会话帧工具（复刻宿主帧切分、帧级 header 重写〔可换 id/cwd/parentSession〕、只追加尾帧、行级前缀关系判定、zip-slip 防御、附件引用收集）
 - **客户端半** `lib/client.js`（构建产物，勿手改）：`window.__ModuleLoader__.load({id, factory:(require)=>…})` 形态；
   源码 `src/client.mjs`；CSS 从仓库根 `src/client.js` 的 `styles.insert` 提取并内联。
@@ -91,6 +91,18 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - **边界（诚实说明）**：不执行 JS——前端渲染的站点会拿到「正文过少」，只标注不重试；robots 轻量遵守（只认 `User-agent: *`，抓不到即放行）；DSH 中途重启会让面板卡在「抓取中」，点「🔁 重抓」即覆盖重来（幂等）；reject 草案**不清网页材料**。网页材料在目标树下，随导出包 / GitHub 同步自动旅行。
 
 设计细节见 [docs/design/web-course.md](./docs/design/web-course.md)（决策 D35）。
+
+## 测试单元：单元卷 + 目标卷，错题进卷（v0.9.0）
+
+每章讲义行有「📝」、目标行「打开会话」旁有「🎯」（都是纯图标钮，悬停出文字）：**每点一次派发一份新卷，旧卷永不覆盖**；测试分别折叠在「▶ 本章测试（N 份 · 错题 M）」与全部讲义下方的「▶ 目标测试」里。
+
+- **蓝图先行，错题按额度进卷**：AI 收到派发后第一步只在会话里报**出卷蓝图**（题型×题量×模块配比，如"软考中级设计师：选择题 75 / 案例题 5"），**确认前一个字都不写**；确认后才读错题本，**各模块槽位有多少额度就最多拉多少条错题**（优先重错），缺口出新题、超额留在本里——绝不强插。你的需求里已给全题型/题量时，AI 复述后可直接继续。
+- **统一错题本**：讲义问答答错与测试答错记**同一本**、同一格式（`来源` 字段区分）；章维度 `NN-mistakes.md`、目标维度 `goal-mistakes.md`，各记各读。折叠区「📕」随时开错题本页签。条目**永久留痕**：重做答对只在原条目追加「→ 已在 YYYY-MM-DD 重做答对」，不销账。
+- **打开测试 = 「开始学习」同款闭环**：折叠区点「▶」为该卷复用/新建**专属陪练会话**，试卷开在右侧页签（better-sidebar，缺席回落浏览器标签）；AI **逐题呈现**，答对给简评，答错讲「错误原因 + 考点 + 考点内容」并记错题本，整卷完成汇报成绩。
+- **在会话里要卷不用工具**：目标/章节会话的指令自带出卷能力，直接说"给我出一份测试"即可；**外部**会话要卷必须先确认目标（聊天工具 `study_test_generate` 强制 `goal_id`，绝不猜）。
+- 卷与错题本都在目标目录下 ⇒ 随导出包 / GitHub 同步自动旅行。边界：蓝图与额度都是提示词层约束（无硬校验）；派发后「生成中」包含"等你在会话里确认蓝图"，不设超时。
+
+设计口径见 docs/PROJECT.md 决策 D36。
 
 ## GitHub 同步（跨机器 · v0.7.0）
 

@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-09-22
+
+### added
+- **测试单元（D36）＝ 单元讲义测试 + 目标测试，多份不覆盖 + 专属陪练会话 + 统一错题本**：
+  1. **两类测试**：每章讲义行「📝」派发**单元讲义测试**（全部讲义下方「🎯」派发**目标测试**）；每次点击**追加一份新卷**（`ch.tests` / `g.goalTests`，编号只增不复用，旧卷永不覆盖），各带独立折叠区（「本章测试 N 份 · 错题 M」/「目标测试」）；
+  2. **蓝图先行**：出卷 AI 第一步只在会话里报**出卷蓝图**（题型×题量×模块配比，如软考中级设计师）等你确认，**确认前不写文件**；需求已给全题型/题量则复述后直接继续。错题**按蓝图各模块槽位额度**从错题本拉入（优先重错，缺口出新题、超额留本），**绝不超额度强插**；
+  3. **统一错题规则**（单一 `MISTAKE_RULE` 注入全部指令）：讲义问答答错与测试答错记**同一本**、同一 `## ` 块格式，`来源` 字段区分；章维度读 `NN-mistakes.md`、目标维度只读 `goal-mistakes.md`（各记各读）。重做答对→原条目追加「→ 已在 YYYY-MM-DD 重做答对」，永久留痕不销账；
+  4. **打开测试 = 「开始学习」同款闭环**：折叠区「▶」复用该卷陪练会话或新建并记回（`study.recordTestSession`），注入陪练指令（**逐题呈现**→答对简评→答错讲「错误原因+考点+考点内容」并记错题本→整卷成绩汇报），试卷经 better-sidebar 右侧页签打开、缺席回落 `/study-file?scope=`（新 scope：chapter-test / goal-test / chapter-mistakes / goal-mistakes，落点仍经 goal.json 反查 + basename 全等，旧讲义路径行为逐字不变）；
+  5. **会话内要卷自带上下文**：宿主 `defineTool` 的 execute 拿不到调用方会话 id（关键约束），故目标/章节会话内直接说「给我出一份测试」靠指令里预注入的出卷能力文本；外部会话要卷走新聊天工具 **`study_test_generate`**——缺 `goal_id` 直接报错并指引先 `study_plan_status` 确认，严禁猜目标；
+  6. **file-as-truth 采纳（承 D3）**：`adoptTestFiles` 每轮扫盘收编未登记的 `NN-test-XX.md` / `goal-test-XX.md`（>200 字判「试卷就绪」）；派发前先扫防野文件撞号，指令注入失败**回滚删除预占条目**（编号不被失败烧掉）。
+- 面板 UI：🎯（「📄 打开会话」后）与 📝（每章「📖」后）为纯图标钮、悬停出文字；「📖 开始学习」同步改为纯图标；折叠区每份卷一行「▶ 打开」+ 错题本一行「📕」。
+- 新 RPC ×5：`study.generateChapterTest` / `study.generateGoalTest` / `study.recordTestSession` / `study.startTest` / `study.readTestFile`；`study.list` 每章回带 `test`（份数/状态）与 `mistakes`（条数）、目标回带 `goalTests` / `goalMistakes`；`study_plan_status` 回带 `tests_ready` / `goal_tests_ready` / `mistakes_total`。
+
+### notes
+- 零新路由、零 npm 依赖、新模型工具 ×1；`study.*` RPC 现共 42 条。测试卷/错题本在目标目录下 ⇒ 随导出包与 GitHub 同步**自动旅行**。设计见 docs/PROJECT.md D36。
+- 边界：蓝图确认/额度组卷/逐题陪练都是**提示词层约束**（承 D34/D35），无硬校验；「生成中」覆盖"等你在会话里确认蓝图"这一等待态（不新增状态、不设超时）；错题计数按 `^## ` 块正则、AI 格式漂移会少计；「重做答对」是软优先不是硬排除。
+- 测试：宿主/client 用例见 test/ 下 D36 段。**⚠ 真机验收未做**：🎯/📝 派发→会话内蓝图确认→落卷→折叠区「▶」陪练→答错记错题→错题本页签→外部会话 `study_test_generate` 先确认目标，需实机跑一遍再发布。
+
 ## [0.8.0] - 2026-09-22
 
 ### added
