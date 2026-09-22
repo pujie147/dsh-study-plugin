@@ -1,6 +1,6 @@
 {
   "name": "study-plugin",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "description": "学习区（study-work）DSH 持久化插件：常驻学习面板 + /study-rpc 宿主路由 + study_plan_*/study_goal_* 聊天工具 + 覆盖式幂等导出导入（zip 可携化，云同步前置）+ 经固定仓 dsh-study-sync 的 GitHub 跨机同步（一键设备码 / PAT 绑定）。",
   "type": "module",
   "main": "lib/index.js",

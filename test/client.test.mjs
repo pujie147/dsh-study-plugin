@@ -53,6 +53,31 @@ const pendingRow = {
   path: '/home/me/.dsh/study-work/goal-pending', chapters: [],
   draft: { overview: '六章', approved: false, lastError: '', chapters: [{ index: 1, title: '地基', summary: '', est_hours: 2, focus_points: [] }] }
 }
+// ── 网页课程源（v0.8.0）行桩：未抓取 / 抓取中 / 材料就绪 / 抓取失败 + ⚡ 三态（部分待生成/全部就绪/有生成中）
+// web 字段是宿主 listSummary 由 goal.webCrawl 派生的摘要（status/ok/failed/skipped/blocked/total/startUrl/error）。
+const webRow = (id, title, over) => Object.assign({
+  id, title, status: 'researching', target_level: '入门', requirements: '', updatedAt: 'x',
+  workspaceId: 'ws-1', sessionId: 'session-g', researchDispatched: false,
+  path: '/home/me/.dsh/study-work/' + id, draft: null, chapters: []
+}, over)
+const webNoneRow = webRow('goal-web-none', '网页课未抓', {})
+const webRunRow = webRow('goal-web-run', '网页课抓取中', {
+  status: 'crawling',
+  web: { status: 'running', startedAt: 'x', finishedAt: '', error: '', startUrl: 'https://docs.demo.io/guide/', ok: 2, failed: 0, skipped: 1, blocked: 0, total: 3 }
+})
+const webDoneRow = webRow('goal-web-done', '网页课材料就绪', {
+  web: { status: 'done', startedAt: 'x', finishedAt: 'y', error: '', startUrl: 'https://docs.demo.io/guide/', ok: 3, failed: 0, skipped: 1, blocked: 0, total: 4 }
+})
+const webFailRow = webRow('goal-web-fail', '网页课抓取失败', {
+  web: { status: 'failed', startedAt: 'x', finishedAt: 'y', error: '全部页面抓取失败（站点不可达）', startUrl: 'https://dead.demo.io/', ok: 0, failed: 1, skipped: 0, blocked: 0, total: 1 }
+})
+const genRow = (id, title, statuses) => webRow(id, title, {
+  status: 'active', researchDispatched: true,
+  chapters: statuses.map((s, i) => ({ index: i + 1, title: '第' + (i + 1) + '章', file: '0' + (i + 1) + '-ch.md', status: s, sessionId: '', lastError: '' }))
+})
+const genMixedRow = genRow('goal-gen-mixed', '批量部分待生成', ['ready', 'draft', 'draft'])
+const genReadyRow = genRow('goal-gen-ready', '批量全部就绪', ['ready', 'ready'])
+const genBusyRow = genRow('goal-gen-busy', '批量有生成中', ['ready', 'generating'])
 const planOk = {
   goalId: 'goal-demo', dir: '/home/me/.dsh/study-work/goal-demo', title: '软件设计', chapters: 10,
   sessionCount: 3, attachments: 1, files: 9, bytesTotal: 260431,
@@ -67,10 +92,27 @@ const planOk = {
 let importIdempotent = false
 let inspectResult = { ok: true, canImport: true, conflicts: [], warnings: ['附件服务不可用时图片不会落盘'], plan: planOk }
 let listGoals = [goalRow, researchRow, dispatchedRow, ghostRow, pendingRow]
+// 网页课程源（v0.8.0）用例的可控返回
+let crawlStartResult = { ok: true, startUrl: 'https://docs.demo.io/guide/' }
+let crawlPreviewResult = {
+  ok: true, crawled: true, materialFiles: 3,
+  webSources: [{ url: 'https://docs.demo.io/guide/', title: '' }],
+  webCrawl: { status: 'running', startedAt: 'x', startUrl: 'https://docs.demo.io/guide/', pages: [
+    { url: 'https://docs.demo.io/guide/', depth: 0, status: 'ok', title: '指南首页', chars: 5200 },
+    { url: 'https://docs.demo.io/ch1/', depth: 1, status: 'ok', title: '第 1 章', chars: 4100 },
+    { url: 'https://docs.demo.io/ch2/', depth: 1, status: 'ok', title: '第 2 章', chars: 66, low: true },
+    { url: 'https://other.site/x', depth: 1, status: 'skipped', reason: '跨域链接', chars: 0 }
+  ] }
+}
+let genAllResult = { ok: true, chapters: 2, indices: [2, 3] }
 const handlers = {
   'study.list': () => ({ goals: listGoals }),
   'study.rejectDraft': (a) => { rpc.push(['reject', a]); return { ok: true } },
   'study.dispatchResearch': (a) => { rpc.push(['dispatch', a]); return dispatchResult },
+  // ── 网页课程源（v0.8.0）：抓取发起 / 预览 / 一次性生成（可控返回，供面板用例驱动）──
+  'study.startCrawl': (a) => { rpc.push(['startCrawl', a]); return crawlStartResult },
+  'study.getCrawlPreview': (a) => { rpc.push(['crawlPreview', a]); return crawlPreviewResult },
+  'study.generateAllChapters': (a) => { rpc.push(['generateAll', a]); return genAllResult },
   'study.recordGoalSession': (a) => { rpc.push(['record', a]); return { ok: true, sessionId: a.sessionId } },
   'study.exportGoal': (a) => { rpc.push(['export', a]); return { ok: true, file: 'study-goal-goal-demo.zip', path: '/exp/study-goal-goal-demo.zip', downloadUrl: '/study-export?file=study-goal-goal-demo.zip', bytes: 152043, counts: { files: 9, sessions: 3, attachments: 1, sessionBytes: 148000 }, warnings: [] } },
   'study.listExports': () => ({ ok: true, dir: '/home/me/.dsh/study-work/exports', exports: [{ file: 'study-goal-goal-demo.zip', bytes: 152043, mtime: '2026-09-10T02:00:00.000Z', downloadUrl: '/study-export?file=study-goal-goal-demo.zip' }] }),
@@ -835,5 +877,120 @@ tree = await renderAll()
 assert.ok(bodyText().indexOf('无 fetch') >= 0, '无 fetch 应给出降级提示')
 assert.ok(btnText('一键登录').props.disabled === true, '无 fetch 时一键授权按钮应禁用')
 ok('宿主无 fetch：面板降级提示同步不可用，授权按钮禁用而非抛错')
+
+// ── 网页课程源（v0.8.0）：URL 输入→抓取发起→进度→预览→确认调研→重抓/失败→⚡ 一次性生成三态 ──
+const crawlInputIn = (title) => rowRange(title).find((e) => e.type === 'input' && String((e.props || {}).placeholder || '').indexOf('docs.example.com') >= 0)
+const hasRpc = (name, args) => rpc.some((c) => c[0] === name && JSON.stringify(c[1]) === JSON.stringify(args))
+// M5 用例结束时面板停在 sync 视图，先回目标列表
+{ const back = btnText('← 返回目标列表'); if (back) await click(back, 'back to list before web-course') }
+
+// (1) 未抓取的目标：展开后给 URL 输入框 + 「🌐 抓取网页材料」；空地址不发 RPC
+rpc.length = 0
+listGoals = [webNoneRow]
+await click(hdrBtn('刷新'), 'refresh web-none')
+tree = await renderAll()
+await expand('网页课未抓')
+assert.ok(crawlInputIn('网页课未抓'), '未抓取目标应有网页地址输入框')
+assert.ok(String(crawlInputIn('网页课未抓').props.placeholder).indexOf('同域内链自动抓一层') >= 0, '输入框应说明同域一层/30 页上限')
+assert.ok(bodyText().indexOf('🌐 抓取网页材料') >= 0, '缺少「🌐 抓取网页材料」按钮')
+assert.ok(bodyText().indexOf('之后「开始调研」将基于材料一次性规划') >= 0, '缺少白话说明')
+await click(btnIn('网页课未抓', '🌐 抓取网页材料'), 'crawl with empty url')
+assert.ok(!rpc.some((c) => c[0] === 'startCrawl'), '空 URL 不该发起 study.startCrawl')
+tree = await renderAll()
+assert.ok(bodyText().indexOf('请先填写网页地址') >= 0, '空 URL 应有白话提示')
+ok('网页课程源：未抓取目标给 URL 入口，空地址拦在本地不发 RPC')
+
+// (2) 填地址 → 抓取派发 + 自动拉预览
+await click(hdrBtn('刷新'), 'retry web-none')   // 清掉上一条红字
+tree = await renderAll()
+await input(crawlInputIn('网页课未抓'), '  https://docs.demo.io/guide/  ')
+tree = await renderAll()   // 重渲染让按钮闭包看到新的 crawlInputs
+rpc.length = 0
+await click(btnIn('网页课未抓', '🌐 抓取网页材料'), 'crawl start')
+assert.ok(hasRpc('startCrawl', { goalId: 'goal-web-none', url: 'https://docs.demo.io/guide/' }), 'startCrawl 参数不对（应 trim）：' + JSON.stringify(rpc))
+assert.ok(hasRpc('crawlPreview', { goalId: 'goal-web-none' }), '发起成功后应立即拉一次 getCrawlPreview')
+ok('网页课程源：「🌐 抓取网页材料」→ study.startCrawl(trim 后 URL)，成功后拉预览')
+
+// (3) 抓取中：行 chip「抓取网页中…」+ 进度行 + 明细页（running 目标的预览由 3s 轮询自动拉）
+rpc.length = 0
+listGoals = [webRunRow]
+await click(hdrBtn('刷新'), 'refresh web-run')
+tree = await renderAll()
+assert.ok(textOf(rowRange('网页课抓取中')[0]).indexOf('抓取网页中…') >= 0, 'crawling 行 chip 应为「抓取网页中…」')
+assert.ok(hasRpc('crawlPreview', { goalId: 'goal-web-run' }), '抓取中的目标应自动拉 getCrawlPreview')
+await expand('网页课抓取中')
+assert.ok(bodyText().indexOf('🌐 正在抓取网页材料…（2 页成功 / 0 失败 / 1 跳过，共访问 3）') >= 0, '抓取进度行缺失: ' + bodyText().slice(0, 300))
+assert.ok(bodyText().indexOf('✓ 指南首页') >= 0 && bodyText().indexOf('⤳ 跳过 https://other.site/x（跨域链接）') >= 0, '未渲染逐页明细（无标题页应显 URL+原因）')
+assert.ok(!crawlInputIn('网页课抓取中'), '抓取中不该再给 URL 输入/重复发起入口')
+ok('网页课程源：crawling 态 = chip + 成功/失败/跳过进度行 + 逐页明细，且无重复抓取入口')
+
+// (4) 材料就绪：预览清单 + ⚠低正文提示 + 「✅ 确认材料 → ▶ 开始调研」+「🔁 重抓」
+rpc.length = 0
+listGoals = [webDoneRow]
+await click(hdrBtn('刷新'), 'refresh web-done')
+tree = await renderAll()
+await expand('网页课材料就绪')
+assert.ok(bodyText().indexOf('🌐 网页材料 3 页已就绪（跳过 1） · 来源 https://docs.demo.io/guide/') >= 0, '材料就绪摘要缺失: ' + bodyText().slice(0, 300))
+assert.ok(bodyText().indexOf('有页面正文过少') >= 0, '应提示疑似 JS 渲染页')
+assert.ok(bodyText().indexOf('✓ 第 2 章（66 字 ⚠过少）') >= 0, '逐页明细应带字数与 ⚠过少')
+assert.ok(btnIn('网页课材料就绪', '✅ 确认材料 → ▶ 开始调研'), 'researching 且未派发时应给「✅ 确认材料 → ▶ 开始调研」')
+assert.ok(btnIn('网页课材料就绪', '🔁 重抓'), '缺少「🔁 重抓」')
+rpc.length = 0
+await click(btnIn('网页课材料就绪', '✅ 确认材料 → ▶ 开始调研'), 'confirm research')
+assert.ok(hasRpc('dispatch', { goalId: 'goal-web-done' }), '确认材料应派发调研（复用存活会话，不重建）')
+assert.ok(!rpc.some((c) => c[0] === 'record'), '目标会话仍在镜像时不该重建')
+ok('网页课程源：材料就绪态渲染清单/低正文警告，「✅ 确认材料 → ▶ 开始调研」直派 dispatchResearch')
+
+// (5) 抓取失败：错误行 + 「🔁 重新抓取」+「⟳ 刷新明细」按需重拉
+listGoals = [webFailRow]
+await click(hdrBtn('刷新'), 'refresh web-fail')
+tree = await renderAll()
+await expand('网页课抓取失败')
+assert.ok(bodyText().indexOf('⚠ 抓取失败：全部页面抓取失败（站点不可达）') >= 0, '失败态文案缺失: ' + bodyText().slice(0, 300))
+assert.ok(btnIn('网页课抓取失败', '🔁 重新抓取') && btnIn('网页课抓取失败', '⟳ 刷新明细'), '失败态应有重抓与刷新明细按钮')
+rpc.length = 0
+await click(btnIn('网页课抓取失败', '⟳ 刷新明细'), 'refresh detail')
+assert.ok(hasRpc('crawlPreview', { goalId: 'goal-web-fail' }), '「⟳ 刷新明细」应重拉 getCrawlPreview')
+ok('网页课程源：失败态显示宿主 error + 「🔁 重新抓取」/「⟳ 刷新明细」')
+
+// (6) ⚡ 有「待生成」章：按钮报章数，只派发默认模式（不带 regenerate）——用户定的：一次生成只碰待生成章
+crawlStartResult = { ok: true, startUrl: 'https://docs.demo.io/guide/' }
+genAllResult = { ok: true, chapters: 2, indices: [2, 3] }
+rpc.length = 0
+listGoals = [genMixedRow]
+await click(hdrBtn('刷新'), 'refresh gen-mixed')
+tree = await renderAll()
+await expand('批量部分待生成')
+assert.ok(btnIn('批量部分待生成', '⚡ 一次性生成全部讲义（2 章）'), '部分就绪时按钮应只报「待生成」章数: ' + rowRange('批量部分待生成').filter((e) => e.type === 'button').map(textOf).join('|'))
+assert.ok(!btnIn('批量部分待生成', '⚡ 重新生成全部讲义'), '有待生成章时不该出现「重新生成」')
+rpc.length = 0
+await click(btnIn('批量部分待生成', '⚡ 一次性生成全部讲义（2 章）'), 'gen all mixed')
+assert.ok(hasRpc('generateAll', { goalId: 'goal-gen-mixed' }), '默认派发不应带 regenerate：' + JSON.stringify(rpc))
+tree = await renderAll()
+assert.ok(bodyText().indexOf('⚡ 一次性生成已派发（2 章）') >= 0, '成功后缺提示')
+ok('⚡ 一次性生成：只派发「待生成」章（3 章里 1 已就绪 → 按钮显示 2 章），调用不带 regenerate')
+
+// (7) 全部讲义就绪：同一位置变「⚡ 重新生成全部讲义」，派发带 regenerate=true
+genAllResult = { ok: true, chapters: 2, indices: [1, 2], regenerate: true }
+listGoals = [genReadyRow]
+await click(hdrBtn('刷新'), 'refresh gen-ready')
+tree = await renderAll()
+await expand('批量全部就绪')
+assert.ok(btnIn('批量全部就绪', '⚡ 重新生成全部讲义'), '全部就绪时应变「⚡ 重新生成全部讲义」: ' + rowRange('批量全部就绪').filter((e) => e.type === 'button').map(textOf).join('|'))
+rpc.length = 0
+await click(btnIn('批量全部就绪', '⚡ 重新生成全部讲义'), 'regen all')
+assert.ok(hasRpc('generateAll', { goalId: 'goal-gen-ready', regenerate: true }), '重新生成必须带 regenerate=true：' + JSON.stringify(rpc))
+tree = await renderAll()
+assert.ok(bodyText().indexOf('⚡ 一次性重新生成已派发（2 章）') >= 0, '重新生成缺提示')
+ok('⚡ 全部就绪 ⇒ 同键变「⚡ 重新生成全部讲义」，派发 regenerate=true')
+
+// (8) 有章节生成中：⚡ 入口收起，只给等待说明（既不重复派发也不覆盖）
+listGoals = [genBusyRow]
+await click(hdrBtn('刷新'), 'refresh gen-busy')
+tree = await renderAll()
+await expand('批量有生成中')
+assert.ok(bodyText().indexOf('⚡ 有章节正在生成中') >= 0, '生成中应给等待说明')
+assert.ok(!rowRange('批量有生成中').some((e) => e.type === 'button' && textOf(e).indexOf('⚡') >= 0), '生成中不该出现 ⚡ 派发按钮')
+ok('⚡ 有章生成中：收起派发按钮，只提示等待完成')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')

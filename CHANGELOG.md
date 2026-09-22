@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.0] - 2026-09-22
+
+### added
+- **网页课程源（D35）**：给学习目标挂一个网页 URL，插件把该页及其**同域内链**（BFS 深度 2、≤30 页、单页 2MB、单请求 15s、总预算 120s）抓成纯文本材料，之后的调研与讲义生成改为**基于材料、一次成型**：
+  1. **抓取全在宿主**（零新依赖）：新 RPC `study.startCrawl`（URL 校验 + 同目标防并发）后台跑同域 BFS，正文提取（剥 script/style、实体解码）落 `<goal>/research/web/NN-slug.txt` + `manifest.json`，抓取事实写 `goal.webCrawl`（谁执行谁写事实，承 D16），目标瞬态转 `crawling`、收尾回 `researching`；`study.getCrawlPreview` 出逐页明细（ok/failed/skipped/blocked + 正文过少 `low` 标注）供面板进度与预览清单；重抓整目录清空重写（幂等）；
+  2. **robots 轻量遵守**：只读 `robots.txt` 的 `User-agent: *` 段 Disallow 前缀，命中记 `blocked`；抓不到/非 2xx 一律放行。**不执行 JS** ⇒ 前端渲染站点会拿到「正文过少」，只标注不重试；
+  3. **材料模式调研**：已抓过材料则「▶ 开始调研」的指令禁网、逐份读 `research/web/`；AI 把材料覆盖不到的知识点记进草案新可选字段 `gap_notes[]`（采纳时清洗）；**reject 草案不清网页材料**；
+  4. **⚡ 一次性整理完全部讲义**：新 RPC `study.generateAllChapters` 向目标会话注入**一条**整课指令、单会话按章序连续写盘。按钮两态（用户两次更正定稿）：默认**只派发「待生成」章**（ready 章在指令里列作「已就绪(勿重写，仅作前置阅读)」；全就绪则拒绝并提示改用重新生成）；**全部就绪时按钮变「⚡ 重新生成全部讲义」**（`regenerate:true`，覆盖写入）；有章生成中一律拒；
+  5. **AI 补全必须标注**：gap_notes 与材料空白处由 AI 自动补，正文强制带「补充：非原始网页来源」标记——读者能分辨哪些话来自原始网页（诚实边界）。
+- 面板：目标行新增网页课程源区（URL 输入 → 抓取进度 → 预览清单 → 「✅ 确认材料 → ▶ 开始调研」→ ⚡），抓取期暂停整表 2.5s 轮询、改由 3s 单点拉进度；`research/web/` 在目标树下 ⇒ 材料随导出包与 GitHub 同步**自动旅行**，无需新通道。
+
+### fixed
+- `goal.json` 改**原子写**（tmp+rename）：抓取期高频写与面板 2.5s 轮询读撞车会让 `study.list` 读到半截 JSON 整表报错。
+- `manifest.json` 收尾**补写一次全量**：循环内逐页写发生在 skip/blocked/page-limit 分支之前，否则页面上限等尾部记录永远落不进包。
+- `robots.txt` 改专用文本抓取：原先复用页面抓取函数会把 text/plain 当「非 HTML」丢弃 ⇒ robots 判定形同虚设（回环 mock 站测试抓出的真 bug）。
+- `gap_notes` 清洗修掉 `String(null)` 产出字面 `"null"` 混进数组；删除 `generateAllChapters` 一处死代码。
+
+### notes
+- 零新路由、零新模型工具、零 npm 依赖；`study.*` RPC 净增 3 条（startCrawl / getCrawlPreview / generateAllChapters，现共 37 条，含 sync ×12）。设计见 [docs/design/web-course.md](./docs/design/web-course.md)。
+- 测试：`smoke` 新增网页课程源段——**回环真 HTTP mock 站真抓取**（非 mock fetch）：同域限定/深度 2 截断/30 页上限/robots blocked/重定向/非 HTML 分类全部以站点 hit 计数证明「从未访问」，加材料模式指令、`gap_notes` 清洗、⚡ 两态与不毁就绪讲义，约 38 断言全绿；`client.test` 新增 8 场景（URL 输入→进度→预览→开始调研→⚡ 流转），55/55 绿；`portable` 32/32 绿。
+- ⚠ **真机验收未做**：真站点全链路（抓取→确认→调研→批准→⚡ 整课生成）需按设计文档 §8 清单在实机跑一遍再发布；本机 `smoke` 的导入段仍被宿主 0.1.5-rc.2 缺 `inspect()` 挡住（master 已知红，非本轮回归）。
+
 ## [0.7.4] - 2026-09-20
 
 ### added

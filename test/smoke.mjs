@@ -9,6 +9,7 @@
 // 「导入保留源 session id ⇒ 宿主 list() 抛 duplicate / 继承归档态 ⇒ 会话看不见」这个真 bug。
 import { EventEmitter } from 'node:events'
 import { promises as fsp } from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
@@ -293,6 +294,177 @@ let exportedGoalId = ''
   check('讲义页未知目标 → 404', (await callPage('/study-file?goalId=nope&chapter=1')).code === 404)
   check('讲义页讲义未生成 → 404', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&chapter=2')).code === 404)
   check('讲义页拒绝非 GET', (await callPage(pageUrl, { method: 'POST' })).code === 405)
+
+// ── 网页课程源（v0.8.0）：回环 mock 站真抓取 + 材料模式调研 + ⚡ 整课一次性生成 ──
+// 抓取走的是**真实网络栈**（Node fetch → 127.0.0.1 临时 HTTP 服务），不是 mock fetch：
+// 同域限定 / 深度截断 / 页数上限 / not-html / 404 / robots / 幂等重抓 都要按真协议行为成立。
+{
+  const LONG = '知识要点段落，够两百字以避开低正文标记。'.repeat(12) // >200 字
+  const htmlPage = (title, body, links) => '<html><head><title>' + title + '</title><style>.x{color:red}</style>' +
+    '<script>console.log("evil " + (1 < 2))</script></head><body><h1>' + title + '</h1><p>' + body + '</p>' +
+    links.map((u) => '<a href="' + u + '">' + u + '</a>').join('') + '<br>页脚</body></html>'
+  const deeperHits = []          // 三级页被访问则记 URL（应当始终为空）
+  const privateHits = []         // robots 禁抓页被访问则记 URL（应当始终为空）
+  const srv1 = http.createServer((req, res) => {
+    const p = req.url.split('?')[0].split('#')[0]
+    const send = (code, ct, body) => { res.writeHead(code, { 'content-type': ct }); res.end(body) }
+    if (p === '/robots.txt') return send(404, 'text/plain', 'nope')            // robots 拉不到 = 放行
+    if (p === '/guide/') return send(200, 'text/html; charset=utf-8', htmlPage('指南首页', 'A &amp; B &lt;C&gt; 起步。' + LONG,
+      ['/ch1', '/sub', '/raw', '/missing', ...Array.from({ length: 40 }, (_, i) => '/t' + (i + 1)), 'http://other.invalid/x.html', '#frag', '/guide/', 'javascript:alert(1)']))
+    if (p === '/ch1') return send(200, 'text/html', htmlPage('第一章', LONG, ['/ch1/deeper']))
+    if (p === '/sub') return send(200, 'text/html', htmlPage('短章', '就一句话。', ['/sub/deeper']))  // 正文 <200 字 → low
+    if (/^\/t\d+$/.test(p)) return send(200, 'text/html', htmlPage('附录 ' + p.slice(2), LONG, []))
+    if (p === '/raw') return send(200, 'text/plain', 'not html')
+    if (p === '/missing') return send(404, 'text/html', 'gone')
+    if (p === '/ch1/deeper' || p === '/sub/deeper') { deeperHits.push(p); return send(200, 'text/html', htmlPage('三级', LONG, [])) }
+    return send(404, 'text/plain', 'nf')
+  })
+  const srv2 = http.createServer((req, res) => {
+    const p = req.url.split('?')[0]
+    const send = (code, ct, body) => { res.writeHead(code, { 'content-type': ct }); res.end(body) }
+    if (p === '/robots.txt') return send(200, 'text/plain', 'User-agent: studybot\nDisallow: /nope/\n\nUser-agent: *\nDisallow: /private/\n')
+    if (p === '/start') return send(200, 'text/html', htmlPage('入口', LONG, ['/public/p1', '/private/secret']))
+    if (p === '/public/p1') return send(200, 'text/html', htmlPage('公开页', LONG, []))
+    if (p === '/private/secret') { privateHits.push(p); return send(200, 'text/html', htmlPage('禁区', LONG, [])) }
+    return send(404, 'text/plain', 'nf')
+  })
+  await new Promise((r) => srv1.listen(0, '127.0.0.1', r))
+  await new Promise((r) => srv2.listen(0, '127.0.0.1', r))
+  const url1 = 'http://127.0.0.1:' + srv1.address().port + '/guide/'
+  const url2 = 'http://127.0.0.1:' + srv2.address().port + '/start'
+
+  const rowOf = async (gid) => { const j = (await callRpc('study.list', {})).json; return (((j || {}).goals) || []).find((g) => g.id === gid) }
+  const waitCrawl = async (gid) => {
+    for (let i = 0; i < 400; i++) {
+      const row = await rowOf(gid)
+      if (row && row.web && row.web.status !== 'running' && row.status !== 'crawling') return row
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    return null
+  }
+
+  const rc = await callRpc('study.createGoal', { topic: '网页课程源测试' })
+  const wGoal = rc.json.goalId
+  check('startCrawl 非法 URL → 拒（js/非 http 均挡）', (await callRpc('study.startCrawl', { goalId: wGoal, url: 'javascript:alert(1)' })).json.ok === false &&
+    /URL 无效/.test((await callRpc('study.startCrawl', { goalId: wGoal, url: 'javascript:alert(1)' })).json.error || ''))
+  const rStart = await callRpc('study.startCrawl', { goalId: wGoal, url: url1 })
+  check('startCrawl ok 且回带归一化 startUrl', rStart.json && rStart.json.ok === true && rStart.json.startUrl === url1, rStart.json)
+  const runRow = await rowOf(wGoal)
+  check('抓取派发 → 目标瞬态 crawling + web.status=running', runRow.status === 'crawling' && runRow.web && runRow.web.status === 'running', runRow && runRow.web)
+  check('抓取中重复发起被拒（防并发）', /正在抓取中/.test((await callRpc('study.startCrawl', { goalId: wGoal, url: url1 })).json.error || ''))
+  const doneRow = await waitCrawl(wGoal)
+  check('抓完自动回到 researching（crawling 只是瞬态）', !!doneRow && doneRow.status === 'researching', doneRow && { s: doneRow.status, w: doneRow.web })
+  check('list.web 摘要：done + 28 成 / 1 败 / 16 跳（含 15 页上限）', doneRow.web.status === 'done' && doneRow.web.ok === 28 && doneRow.web.failed === 1 && doneRow.web.skipped === 16 && doneRow.web.total === 45, doneRow.web)
+  {
+    const pv = await callRpc('study.getCrawlPreview', { goalId: wGoal })
+    const pages = pv.json.webCrawl.pages
+    check('预览 crawled=true + 材料文件数与 ok 页一致', pv.json.ok === true && pv.json.crawled === true && pv.json.materialFiles === 28, pv.json && pv.json.materialFiles)
+    check('深度 2 截断：三级页既不在清单也未被访问', !pages.some((p) => /deeper/.test(p.url)) && deeperHits.length === 0, deeperHits)
+    check('同域限定：外域链接根本不进清单', !pages.some((p) => /other\.invalid/.test(p.url)))
+    check('归一化去重：起始页(#锚点/自重)只一条', pages.filter((p) => p.url === url1).length === 1)
+    const byPath = (u) => pages.find((p) => p.url === u)
+    check('404 → failed(HTTP 404)；text/plain → skipped(not-html)', byPath(url1.replace('/guide/', '/missing')).status === 'failed' && /HTTP 404/.test(byPath(url1.replace('/guide/', '/missing')).reason) && byPath(url1.replace('/guide/', '/raw')).status === 'skipped' && byPath(url1.replace('/guide/', '/raw')).reason === 'not-html', pages.filter((p) => p.status !== 'ok').slice(0, 4))
+    check('30 页尝试上限，其余页记 skipped(page-limit)', pages.filter((p) => p.depth !== undefined).length === 30 && pages.filter((p) => p.reason === 'page-limit').length === 15, { attempts: pages.filter((p) => p.depth !== undefined).length, capped: pages.filter((p) => p.reason === 'page-limit').length })
+    check('低正文标记：短文页 low=true，长文页 low=false', byPath(url1.replace('/guide/', '/sub')).low === true && byPath(url1).low === false, byPath(url1.replace('/guide/', '/sub')))
+    const webDir = path.join(tmpRoot, wGoal, 'research', 'web')
+    const files = await fsp.readdir(webDir)
+    check('每 ok 页落 NN-slug.txt + manifest.json', files.length === 29 && files.includes('manifest.json') && pages.filter((p) => p.status === 'ok').every((p) => /^\d{2}-.+\.txt$/.test(p.file) && files.includes(p.file)), files.slice(0, 6))
+    const guideTxt = await fsp.readFile(path.join(webDir, byPath(url1).file), 'utf8')
+    check('正文提取：title 进记录；脚本/样式剔除；实体解码', /指南首页/.test(guideTxt) && /A & B <C>/.test(guideTxt) && !/console\.log/.test(guideTxt) && !/color:red/.test(guideTxt) && byPath(url1).title === '指南首页', guideTxt.slice(0, 120))
+    const man = JSON.parse(await fsp.readFile(path.join(webDir, 'manifest.json'), 'utf8'))
+    check('manifest 与 webCrawl 同步（整树可携，D3）', man.startUrl === url1 && man.pages.length === 45, man.pages && man.pages.length)
+  }
+  {
+    // robots：拉不到=放行已在 srv1 验证；这里验证 Disallow 前缀拦截（只认 User-agent: * 段）
+    const rc2 = await callRpc('study.createGoal', { topic: 'robots 测试' })
+    const g2 = rc2.json.goalId
+    await callRpc('study.startCrawl', { goalId: g2, url: url2 })
+    const d2 = await waitCrawl(g2)
+    const pv2 = await callRpc('study.getCrawlPreview', { goalId: g2 })
+    const pl = pv2.json.webCrawl.pages
+    check('robots 只认 * 段：/private/ 记 blocked 且从未被请求', pl.some((p) => p.status === 'blocked' && /\/private\/secret$/.test(p.url) && p.reason === 'robots') && privateHits.length === 0, pl)
+    check('robots 站其余页正常成文', d2.web.status === 'done' && d2.web.ok === 2 && d2.web.blocked === 1, d2.web)
+    await callRpc('study.deleteGoal', { goalId: g2 })
+  }
+  {
+    // 幂等重抓：先塞一个残留文件，重抓必须整批重建
+    const webDir = path.join(tmpRoot, wGoal, 'research', 'web')
+    await fsp.writeFile(path.join(webDir, 'leftover.txt'), 'stale')
+    await callRpc('study.startCrawl', { goalId: wGoal, url: url1 })
+    const again = await waitCrawl(wGoal)
+    const gone = await fsp.readFile(path.join(webDir, 'leftover.txt'), 'utf8').catch(() => undefined)
+    check('重抓幂等：research/ 整批重建，残留文件不存活', again.web.status === 'done' && again.web.ok === 28 && gone === undefined, { st: again.web.status, gone })
+  }
+  {
+    // 材料模式调研指令（webCrawl.done ⇒ 禁再抓取、逐份读材料、gap_notes 出口）
+    await callRpc('study.recordGoalSession', { goalId: wGoal, sessionId: 'sess-web-1' })
+    const inj0 = injected.length
+    const rd = await callRpc('study.dispatchResearch', { goalId: wGoal })
+    check('材料模式派发调研 ok', rd.json && rd.json.ok === true && injected.length === inj0 + 1, rd.json)
+    {
+      const ri = injected[injected.length - 1].msg.content[0].text
+      check('材料指令：禁重抓 + 逐份清单(绝对路径+来源) + web_search≤2 + gap_notes 字段', /「网页课程源」调研/.test(ri) && /禁止重新抓取网页/.test(ri) && /research\/web\/\d{2}-/.test(ri) && /（来源 http:\/\/127\.0\.0\.1/.test(ri) && /至多 2 次/.test(ri) && /gap_notes/.test(ri), ri.slice(0, 300))
+      check('材料指令仍是完整规划协议(overview/D34 可选字段/排版)', /全课程总览/.test(ri) && /env_baseline/.test(ri) && /LaTeX/.test(ri) && /mermaid/.test(ri))
+    }
+    // 草案带 gap_notes → 清洗 → reject 不清材料 → 再采纳 → 批准透传
+    const draftAbs = path.join(tmpRoot, wGoal, 'draft.json')
+    const draftJson = JSON.stringify({
+      course: '网页课', overview: '三章总览',
+      chapters: [
+        { title: '地基', summary: '一', focus_points: ['a'] },
+        { title: '正文', summary: '二', gap_notes: ['  缺部署实践  ', '', null] },
+        { title: '收尾', summary: '三', gap_notes: [] }
+      ]
+    })
+    await fsp.writeFile(draftAbs, draftJson)
+    await callRpc('study.list', {})
+    const wRow = await rowOf(wGoal)
+    check('gap_notes 清洗：trim + 去空/去 null，空数组=无字段', JSON.stringify(wRow.draft.chapters[1].gap_notes) === '["缺部署实践"]' && wRow.draft.chapters[0].gap_notes === undefined && wRow.draft.chapters[2].gap_notes === undefined, wRow.draft && wRow.draft.chapters.map((c) => c.gap_notes))
+    await callRpc('study.rejectDraft', { goalId: wGoal, reason: '再想想' })
+    check('reject 草案不清网页材料（重抓成本高，设计 §1）', (await fsp.readdir(path.join(tmpRoot, wGoal, 'research', 'web'))).filter((f) => f.endsWith('.txt')).length === 28)
+    await fsp.writeFile(draftAbs, draftJson)
+    await callRpc('study.list', {})
+    const ap = await callRpc('study.approveDraft', { goalId: wGoal })
+    check('approve ok(chapters:3)', ap.json && ap.json.ok === true && ap.json.chapters === 3, ap.json)
+    const gjw = JSON.parse(await fsp.readFile(path.join(tmpRoot, wGoal, 'goal.json'), 'utf8'))
+    check('批准透传 gap_notes 到 goal.json', gjw.chapters[1].gap_notes[0] === '缺部署实践' && gjw.chapters[0].gap_notes === undefined, gjw.chapters.map((c) => c.gap_notes))
+
+    // ⚡ 整课生成：只碰待生成章 → 全部就绪报错 → regenerate 覆盖
+    const chFile = (i) => path.join(tmpRoot, wGoal, 'chapters', gjw.chapters[i].file)
+    await fsp.mkdir(path.dirname(chFile(0)), { recursive: true })
+    await fsp.writeFile(chFile(0), '# 地基\n' + '内容'.repeat(200))
+    await callRpc('study.list', {})
+    check('单章文件在盘 → 采纳 ready（⚡ 前的混合态）', (await rowOf(wGoal)).chapters.map((c) => c.status).join(',') === 'ready,draft,draft', (await rowOf(wGoal)).chapters.map((c) => c.status))
+    const injA = injected.length
+    const ga = await callRpc('study.generateAllChapters', { goalId: wGoal })
+    check('generateAll 默认：只派发待生成 2 章（indices 2,3）', ga.json && ga.json.ok === true && ga.json.chapters === 2 && ga.json.indices.join(',') === '2,3' && ga.json.regenerate === undefined, ga.json)
+    check('generateAll 后注入目标会话 + 待生成章转 generating', injected.length === injA + 1 && (await rowOf(wGoal)).chapters.map((c) => c.status).join(',') === 'ready,generating,generating')
+    {
+      const t = injected[injected.length - 1].msg.content[0].text
+      check('整课指令：总数/章次地图/材料清单/缺料补全标注', /一次性整理全部讲义（共 3 章）/.test(t) && /章次地图: /.test(t) && /网页课程源材料\(先通读再动笔/.test(t) && /📤 补充：非原始网页来源/.test(t) && /六段结构\(先总后分\)/.test(t) && /gap_notes: 缺部署实践/.test(t) && /teaching-prefs/.test(t), t.slice(0, 200))
+      check('默认模式：就绪章仅前置、绝不重写；落盘清单只列 2/3 章', /已就绪\(勿重写，仅作前置阅读\): 第1章=/.test(t) && /绝不重写其讲义文件/.test(t) && /待你撰写落盘的章节[^。]*第2章/.test(t) && !/落盘的章节[^。]*第1章/.test(t))
+    }
+    check('全部 generating 时再点默认 ⚡ → 拒(没有处于「待生成」)', /没有处于「待生成」/.test((await callRpc('study.generateAllChapters', { goalId: wGoal })).json.error || ''))
+    await fsp.writeFile(chFile(1), '# 正文\n' + '内容'.repeat(200))
+    await fsp.writeFile(chFile(2), '# 收尾\n' + '内容'.repeat(200))
+    await callRpc('study.list', {})
+    check('三章全 ready ⇒ 默认 ⚡ 报「全部章节讲义已就绪」', (await rowOf(wGoal)).chapters.every((c) => c.status === 'ready') &&
+      /全部章节讲义已就绪/.test((await callRpc('study.generateAllChapters', { goalId: wGoal })).json.error || ''))
+    const injB = injected.length
+    const gr = await callRpc('study.generateAllChapters', { goalId: wGoal, regenerate: true })
+    check('regenerate=true：全 3 章覆盖派发 + 注入目标会话', gr.json && gr.json.ok === true && gr.json.chapters === 3 && gr.json.regenerate === true && injected.length === injB + 1, gr.json)
+    {
+      const t = injected[injected.length - 1].msg.content[0].text
+      check('regenerate 指令：覆盖写入全部章，无「勿重写」段', /覆盖写入/.test(t) && !/已就绪\(勿重写/.test(t) && /各章讲义文件: /.test(t))
+    }
+    await callRpc('study.list', {})   // 文件在盘 → 采纳回 ready
+    check('regenerate 派发后旧文件即被采纳回 ready（不毁数据）', (await rowOf(wGoal)).chapters.every((c) => c.status === 'ready'))
+    check('generateAll 未知目标 → error', (await callRpc('study.generateAllChapters', { goalId: 'nope' })).json.ok === false)
+  }
+  await new Promise((r) => srv1.close(r))
+  await new Promise((r) => srv2.close(r))
+  await callRpc('study.deleteGoal', { goalId: wGoal })
+}
 
   // ── M4 前置：用真 locate 造出该目标的会话 transcript（目标会话 + 章节会话 + 空 subagent 会话）
   const goalAbsDir = path.join(tmpRoot, goalId)

@@ -20,7 +20,7 @@ cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
 node test/smoke.mjs                 # 宿主半运行时冒烟（含 readChapter + /study-file 讲义页；跑在宿主真实 persistence + registry 上）
 node test/sync.test.mjs             # GitHub 同步宿主半（78 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt）
-npm test                            # smoke + portable + client(45，桩 React 真实渲染点击，含同步面板与「打开讲义」) + sync(78)
+npm test                            # smoke + portable + client(55，桩 React 真实渲染点击，含同步面板、「打开讲义」与网页课程源) + sync(78)
                                     # ⚠ 本机宿主升到 dsh 0.1.5-rc.2 后 JsonlSessionPersistence 无 inspect() ⇒ smoke(M4 起)/portable 崩，属夹具待跟进宿主漂移（见 CHANGELOG 0.7.2 备注），未改代码
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
@@ -81,6 +81,16 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - **前后章接续**：生成第 N≥2 章前，AI 必须先 read 全部前置 ready 章讲义，复用其环境与工程、清偿「作黑盒使用，第 N 章详述」的欠账；第 1 章是工程线起点——`git init`，主分支为全课程基线，**每章独立分支 `chapter/NN-主题` 开发、章末合回，禁止直接在主分支开发**。
 - **排版**：公式用 LaTeX/KaTeX，图用 mermaid（better-sidebar 的 markdown 预览原生渲染两者）。
 - **教学偏好记忆体** `~/.dsh/study-work/_meta/teaching-prefs.md`：你在聊天里提出的长期结构/组织/构建规则（AI 提炼、经你同意后）记在这里，对后续所有生成生效；**只记规则不记课程内容**，随导出包/GitHub 同步旅行，导入时按行并集合并。
+
+## 网页课程源：给个网址，照着教（v0.8.0）
+
+目标行里填一个网页地址点「🌐 抓取网页材料」，插件（宿主自己 fetch，AI 不碰网）把**该页及其同域内链**（深度 2、≤30 页、总预算 120s）抓成纯文本材料，落在 `<目标>/research/web/` 下——面板给逐页预览清单（成功/失败/跳过/robots 拦截，正文过少会标注），确认后才发起调研：
+
+- **调研改为基于材料**：指令禁网、逐份读网页材料；材料覆盖不到的知识点由 AI 记进草案 `gap_notes`，生成讲义时自动补全，且正文**强制标注「补充：非原始网页来源」**——哪些话来自原始网页、哪些是 AI 补的，读者分得清。
+- **⚡ 一次性整理完全部讲义**：草案批准后不再逐章手点，一条整课指令单会话连续写章。按钮两态：有「待生成」章时 ⚡ 只派发待生成章（已就绪的讲义**绝不重写**，只作前置阅读）；**全部就绪时按钮变「⚡ 重新生成全部讲义」**（覆盖写入）。有章正在生成时一律拒绝。
+- **边界（诚实说明）**：不执行 JS——前端渲染的站点会拿到「正文过少」，只标注不重试；robots 轻量遵守（只认 `User-agent: *`，抓不到即放行）；DSH 中途重启会让面板卡在「抓取中」，点「🔁 重抓」即覆盖重来（幂等）；reject 草案**不清网页材料**。网页材料在目标树下，随导出包 / GitHub 同步自动旅行。
+
+设计细节见 [docs/design/web-course.md](./docs/design/web-course.md)（决策 D35）。
 
 ## GitHub 同步（跨机器 · v0.7.0）
 
