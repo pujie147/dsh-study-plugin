@@ -13,3 +13,4 @@ dist/
 .mnemon/
 .publish/
 .tmp-*/
+/.idea
