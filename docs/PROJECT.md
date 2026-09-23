@@ -133,6 +133,7 @@ study-work/
 | study.recordTestSession | goalId,scope(test_n)[,chapter_index],sessionId | 把某卷的陪练会话 id 记回条目（幂等 upsert，v0.9.0） |
 | study.startTest | goalId,scope(test_n)[,chapter_index],sessionId | 折叠区「▶ 打开」：先采纳扫盘（卷没落地直接拒），记 sessionId 后向该会话注入**陪练指令**（逐题呈现→答对简评→答错三讲并记错题→重做答对回标→成绩汇报） |
 | study.readTestFile | goalId,scope,[test_n\|chapter_index(+test_n)] | 测试文档只读口（v0.9.0）：scope=chapter-test / goal-test / chapter-mistakes / goal-mistakes；落点全部由 goalId+编号经 goal.json 反查，file 过 basename 全等校验防借道；回 `{ok,filePath,title,content}` 供 better-sidebar 页签与 `/study-file` 兜底共用 |
+| study.deleteTest | goalId,test_n[,chapter_index] | 🗑 删除一份测试卷（v0.10.0）：先摘 `ch.tests`/`g.goalTests` 条目并落盘（面板即刻不再列，防重复触发）→ `unlink` 测试文件（ENOENT 吞掉）→ **物理删除该卷陪练会话目录**（宿主无删除会话 API ⇒ `sessionPersistence.locate` 定位 transcript → 取所在会话目录 → 校验确有 transcript 才 `rm -rf`）；`file` 过 basename 全等防借道；删会话属带外改动（左栏可能要重启 DSH 才刷新）、不可逆；会话删除失败只记 `note` 不推翻前两步。UI 两次点击确认 |
 | study.deleteGoal | goalId | 移出 index 并标记 deleted（文件保留） |
 | study.ensureGoalWorkspace | goalId | 按需创建/解析目标工作区 |
 | study.exportGoal | goalId | 导出该目标为 zip（目标树 + 全部会话 + 附件 + manifest v2），落 `exports/`；同秒连导自动加 `-n` 后缀不互相覆盖 |

@@ -594,6 +594,33 @@ let exportedGoalId = ''
     check('无 scope 参数仍走旧讲义页（行为逐字不变）', (await callPage('/study-file?goalId=' + encodeURIComponent(goalId) + '&chapter=1&format=raw')).code === 200)
   }
 
+  // study.deleteTest：删卷 + 删测试文件 + 物理删该卷陪练会话目录（不可逆；宿主无删除会话 API）
+  {
+    const goalAbsDir = path.join(tmpRoot, goalId)
+    const delSid = 'sess-del-1'
+    const delTranscript = mockPersistence.locate({ cwd: goalAbsDir, id: delSid }).path
+    await fsp.mkdir(path.dirname(delTranscript), { recursive: true })
+    await fsp.writeFile(delTranscript, 'dummy-transcript-bytes-not-real-zstd')
+    // 章卷 02（generating，盘上无 01-test-02.md）绑到这条真实会话目录
+    await callRpc('study.recordTestSession', { goalId, chapter_index: 1, test_n: 2, sessionId: delSid })
+    const rd2 = await callRpc('study.deleteTest', { goalId, chapter_index: 1, test_n: 2 })
+    check('deleteTest 章卷：ok + 从 goal.json 摘除条目', rd2.json.ok === true && !(await rowNow()).chapters[0].test.some((x) => x.n === 2), rd2.json)
+    check('deleteTest 物理删除该卷陪练会话目录', rd2.json.sessionRemoved === true && (await fsp.stat(path.dirname(delTranscript)).catch(() => undefined)) === undefined, { sessionRemoved: rd2.json.sessionRemoved })
+    // 章卷 01（ready，盘上有 01-test-01.md，绑的是不存在的假会话 sess-t-1）
+    const f1 = chAbs('01-test-01.md')
+    check('前置：01-test-01.md 在盘', (await fsp.stat(f1).catch(() => undefined)) !== undefined)
+    const rd1 = await callRpc('study.deleteTest', { goalId, chapter_index: 1, test_n: 1 })
+    check('deleteTest ready 卷：测试文件被 unlink', rd1.json.ok === true && (await fsp.stat(f1).catch(() => undefined)) === undefined, rd1.json)
+    check('deleteTest 假会话(盘无目录)：sessionRemoved 假 + note 说明，不推翻删除', rd1.json.sessionRemoved !== true && /未找到该会话/.test(rd1.json.note || ''), rd1.json)
+    check('deleteTest 不动错题本（01-mistakes.md 仍在）', (await fsp.stat(chAbs('01-mistakes.md')).catch(() => undefined)) !== undefined)
+    // 目标卷：绑假会话后删除，goalTests 清空且 goal-test-01.md 消失
+    await callRpc('study.recordTestSession', { goalId, test_n: 1, sessionId: 'sess-g-del' })
+    const rg = await callRpc('study.deleteTest', { goalId, test_n: 1 })
+    check('deleteTest 目标卷：scope=goal + goalTests 清空 + 文件删除', rg.json.ok === true && rg.json.scope === 'goal' && ((await rowNow()).goalTests || []).length === 0 && (await fsp.stat(path.join(goalAbsDir, 'goal-test-01.md')).catch(() => undefined)) === undefined, rg.json)
+    // 不存在的卷 → 报错，且不误伤
+    check('deleteTest 不存在的目标卷 → error', /没有目标测试/.test((await callRpc('study.deleteTest', { goalId, test_n: 42 })).json.error || ''))
+  }
+
   // study_test_generate（外部会话派发口）：缺 goal_id 拒绝 + 路由 + 透传错误
   {
     const tt = registeredTools.find((x) => x.name === 'study_test_generate')

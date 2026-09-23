@@ -95,6 +95,7 @@ function apply(ctx) {
     const [view, setView] = React.useState('list')
     const [expanded, setExpanded] = React.useState({})
     const [confirmDel, setConfirmDel] = React.useState(null)
+    const [confirmDelTest, setConfirmDelTest] = React.useState(null)   // 处于「确认删除?」内联态的测试行 key
     const [crawlInputs, setCrawlInputs] = React.useState({})   // goalId → 网址输入框内容
     const [crawlPrev, setCrawlPrev] = React.useState({})       // goalId → study.getCrawlPreview 结果
     const [busyKey, setBusyKey] = React.useState(null)
@@ -432,6 +433,32 @@ function apply(ctx) {
       } finally {
         setBusyKey(null)
       }
+    }
+
+    const testKey = (kind, g, c, t) => (kind === 'chapter' ? 'c:' + g.id + ':' + c.index : 'g:' + g.id) + ':' + t.n
+    // 删除一份测试：调用宿主 study.deleteTest（删测试文件 + 物理删该卷陪练会话 + 摘除 goal.json 条目）。
+    // 属不可逆操作，按钮两次点击确认；成功后尽力刷镜像，让左栏那条会话尽量免重启消失（拉不动则提示重启）。
+    const doDeleteTest = async (g, c, t, kind) => {
+      const key = testKey(kind, g, c, t)
+      setConfirmDelTest(null)
+      await doAction('deltest:' + key, async () => {
+        const r = await call('study.deleteTest', testLoc(g, kind, c, t))
+        if (r && r.ok === true) {
+          const label = (kind === 'chapter' ? '第 ' + c.index + ' 章卷 ' : '目标卷 ') + String(t.n).padStart(2, '0')
+          setNotice('🗑 已删除 ' + label + (r.sessionRemoved ? '（含陪练会话）' : (r.sessionId ? '（测试文件已删；会话未删除，请在左侧手动删除）' : '')) + (r.note ? '：' + r.note : '') + '。若左侧会话栏仍显示该会话，重启 DSH 即消失。')
+          await refreshWorkspaceMirror()
+        }
+        return r
+      })
+    }
+    const delTestBtn = (g, c, t, kind) => {
+      const key = testKey(kind, g, c, t)
+      const pending = confirmDelTest === key
+      return React.createElement('button', {
+        type: 'button', className: 'stuiIconBtn', 'data-tone': 'danger', disabled: busyKey !== null,
+        title: pending ? '再次点击确认删除（测试文件 + 该卷陪练会话，不可恢复）' : '🗑 删除本卷（连同测试文件与陪练会话，需二次确认）',
+        onClick: () => { if (pending) doDeleteTest(g, c, t, kind); else setConfirmDelTest(key) }
+      }, pending ? '确认?' : '🗑')
     }
 
     const createGoal = async () => {
@@ -1115,7 +1142,8 @@ function apply(ctx) {
                             tExp && tests.map((t) => React.createElement('div', { key: 't' + t.n, className: 'stuiChRow' },
                               React.createElement('span', { className: 'stuiChTitle', title: t.file }, '🧪 测试 ' + String(t.n).padStart(2, '0')),
                               React.createElement('span', { className: 'stuiChip', 'data-tone': t.status === 'ready' ? 'ok' : 'busy' }, t.status === 'ready' ? '试卷就绪' : '生成中…'),
-                              t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, c, t, 'chapter') }, busyKey === 'test:' + g.id + ':' + c.index + ':' + t.n ? '⏳' : '▶')
+                              t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, c, t, 'chapter') }, busyKey === 'test:' + g.id + ':' + c.index + ':' + t.n ? '⏳' : '▶'),
+                              delTestBtn(g, c, t, 'chapter')
                             )),
                             tExp && mistakesN > 0 && React.createElement('div', { className: 'stuiChRow' },
                               React.createElement('span', { className: 'stuiChTitle' }, '📕 本章错题本'),
@@ -1137,7 +1165,8 @@ function apply(ctx) {
                           gtExp && gtests.map((t) => React.createElement('div', { key: 'gt' + t.n, className: 'stuiChRow' },
                             React.createElement('span', { className: 'stuiChTitle', title: t.file }, '🎯 目标卷 ' + String(t.n).padStart(2, '0')),
                             React.createElement('span', { className: 'stuiChip', 'data-tone': t.status === 'ready' ? 'ok' : 'busy' }, t.status === 'ready' ? '试卷就绪' : '生成中…'),
-                            t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, null, t, 'goal') }, busyKey === 'test:' + g.id + ':g:' + t.n ? '⏳' : '▶')
+                            t.status === 'ready' && React.createElement('button', { type: 'button', className: 'stuiIconBtn', disabled: busyKey !== null, title: '▶ 打开测试：进入陪练会话逐题作答，试卷同时开成右侧页签', onClick: () => openTest(g, null, t, 'goal') }, busyKey === 'test:' + g.id + ':g:' + t.n ? '⏳' : '▶'),
+                            delTestBtn(g, null, t, 'goal')
                           )),
                           gtExp && gmN > 0 && React.createElement('div', { className: 'stuiChRow' },
                             React.createElement('span', { className: 'stuiChTitle' }, '📕 目标错题本'),

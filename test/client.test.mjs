@@ -137,6 +137,7 @@ const handlers = {
   'study.startTest': (a) => { rpc.push(['startTest', a]); return startTestResult },
   'study.recordTestSession': (a) => { rpc.push(['recordTestSession', a]); return { ok: true } },
   'study.readTestFile': (a) => { rpc.push(['readTestFile', a]); return testFileResult },
+  'study.deleteTest': (a) => { rpc.push(['deleteTest', a]); return deleteTestResult },
   // ── M5 GitHub 同步（可控返回，供同步面板用例驱动）──
   'study.syncGetConfig': (a) => { rpc.push(['syncGetConfig', a]); return syncCfg },
   'study.syncSetConfig': (a) => { rpc.push(['syncSetConfig', a]); return { ok: true, config: Object.assign({}, syncCfg.config, a) } },
@@ -161,6 +162,7 @@ let genChapterTestResult = { ok: true, test_n: 3, file: '01-test-03.md' }
 let genGoalTestResult = { ok: true, test_n: 2, file: 'goal-test-02.md' }
 let startTestResult = { ok: true, sessionId: 'session-t1' }
 let testFileResult = { ok: true, title: '第 1 章测试 01 · 计算机系统基础', content: '# 题\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-test-01.md' }
+let deleteTestResult = { ok: true, scope: 'chapter', sessionRemoved: true }
 let remoteGoals = { ok: true, repo: 'tester/dsh-study-sync', branch: 'main', goals: [] }
 const inspResults = {}
 let pushResult = { ok: true, pushed: true }
@@ -759,6 +761,34 @@ hostShape.sidebar = false
 testFileResult = { ok: true, title: '第 1 章测试 01 · 计算机系统基础', content: '# 题\n', filePath: '/home/me/.dsh/study-work/goal-demo/chapters/01-test-01.md' }
 sessionsSvc.list.getSnapshot = origSnapshot
 ok('D36：📕 错题本走 better-sidebar 页签（scope=目标会话），缺席才兜底新标签')
+
+// ── D36 补：测试行「🗑 删除」= 两次点击内联确认 → study.deleteTest（不可逆，删文件+会话）──
+{
+  const dels = iconBtnsIn('测试单元目标', '🗑')
+  assert.equal(dels.length, 3, '章测试 2 卷 + 目标测试 1 卷各应有一个 🗑：' + dels.length)
+  ok('D36：每份测试（章卷/目标卷）行都有 🗑 删除按钮')
+  // 章卷 01（第一行）：首次点击只进「确认?」态，不发 RPC
+  rpc.length = 0
+  await click(iconBtnsIn('测试单元目标', '🗑')[0], 'del chapter test step1')
+  tree = await renderAll()
+  assert.ok(!rpc.some((c) => c[0] === 'deleteTest'), '首次点击不该真的删除')
+  assert.ok(bodyText().indexOf('确认?') >= 0, '首次点击应把按钮切成「确认?」: ' + bodyText().slice(0, 200))
+  // 二次点击：真正调用 study.deleteTest，章卷带 chapter_index
+  await click(flat.find((e) => e.type === 'button' && textOf(e) === '确认?'), 'del chapter test step2')
+  tree = await renderAll()
+  const dtC = rpc.find((c) => c[0] === 'deleteTest')
+  assert.ok(dtC && dtC[1].goalId === 'goal-d36' && dtC[1].chapter_index === 1 && dtC[1].test_n === 1, '章卷删除参数不对: ' + JSON.stringify(rpc))
+  assert.ok(bodyText().indexOf('已删除') >= 0 && bodyText().indexOf('含陪练会话') >= 0, '缺删除成功提示: ' + bodyText().slice(0, 200))
+  // 目标卷（最后一行）：二次确认后不带 chapter_index
+  rpc.length = 0
+  await click(iconBtnsIn('测试单元目标', '🗑')[iconBtnsIn('测试单元目标', '🗑').length - 1], 'del goal test step1')
+  tree = await renderAll()
+  await click(flat.find((e) => e.type === 'button' && textOf(e) === '确认?'), 'del goal test step2')
+  tree = await renderAll()
+  const dtG = rpc.find((c) => c[0] === 'deleteTest')
+  assert.ok(dtG && dtG[1].goalId === 'goal-d36' && dtG[1].test_n === 1 && dtG[1].chapter_index === undefined, '目标卷删除不该带 chapter_index: ' + JSON.stringify(rpc))
+  ok('D36：🗑 删除两次点击确认后才发 study.deleteTest；章卷带 chapter_index、目标卷不带')
+}
 
 // ── 空列表：提示文案与「＋ 添加学习目标」必须同时在场（回归：按钮曾被关在
 //    goals.length>0 的分支里，新装/删空/首帧未加载时面板没有任何创建入口）────────

@@ -2,6 +2,19 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-09-23
+
+### added
+- **测试卷删除（🗑）**：章测试折叠区与目标测试折叠区的每一行卷，在「▶ 打开」后加一个 `🗑` 删除图标钮，**两次点击内联确认**（第一次变「确认?」，第二次才动手），删一份卷 = 删它的**测试文件 + 该卷专属陪练会话**：
+  1. 新 RPC `study.deleteTest`（goalId, test_n[, chapter_index]）：先 `findTestEntry` 定位 → **摘除 `ch.tests`/`g.goalTests` 条目并落盘**（面板立刻不再列出，防重复触发）→ `unlink` 测试文件（ENOENT 吞掉，未落盘的 generating 卷也删得掉）→ **物理删除该卷的陪练会话目录**；`file` 过 `basename` 全等校验防借道，与 `readTestFile` 同口径；
+  2. **宿主没有「删除会话」API**（见 PROJECT.md §5：`archivedSessionIds` 按 id 且不可逆、无解档），故会话删除走 `sessionPersistence.locate({cwd,id})` 定位 transcript → 取其所在会话目录 → **确认目录里确有 transcript 才 `rm -rf`**（护栏：目录不等于目标根、且确有 transcript）；这一步是对宿主落盘的**带外改动**；
+  3. **不可逆 + 左栏可能要重启**：删除提示如实写明"若左侧会话栏仍显示该会话，重启 DSH 即消失"（客户端删后尽力 `refresh()` 拉镜像，拉不动则回落提示）；会话删除失败（持久化服务缺席等）只记进 `note`，**不推翻已成功的摘条目 + 删文件**，避免留下"面板还在、盘上文件没了"的割裂态。
+- 面板：`🗑` 走 `stuiIconBtn`+`data-tone=danger`（补一条红色 CSS）；`study.deleteTest` 为第 43 条 `study.*` RPC。
+
+### notes
+- 零新路由、零 npm 依赖、零新聊天工具；`client.test` 64 断言、`smoke` deleteTest 段 8 断言（含伪造真实会话目录验证物理删除）全绿。
+- 边界：会话目录物理删除**不可恢复**；内存里若该 agent 仍活着可能重新落盘；错题本（`NN-mistakes.md`/`goal-mistakes.md`）与讲义**不在删除范围**（只删这一份卷的文件与会话）。测试：`docs/PROJECT.md` RPC 表已登记 `study.deleteTest`。**⚠ 真机验收未做**：卷派发/落卷→折叠区展开→`🗑` 两次确认→测试文件消失 + 左栏该会话消失（含会话正打开时的删除），需实机跑一遍。
+
 ## [0.9.1] - 2026-09-23
 
 ### fixed
