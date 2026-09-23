@@ -2,6 +2,11 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.1] - 2026-09-23
+
+### fixed
+- **侧栏底部入口冲突（学习区徽标把其他插件入口挤出侧栏）**：宿主 `sidebar.footer.action` 是 list 插槽，容器为 flex row **nowrap**，而学习区徽标占满整行 ⇒ 同插槽的「有更新/远程访问」（dsh-remote-web-ui）与「上下文洞察」（dsh-context）被顶到侧栏边界外，看不见也点不到。CSS 里本有换行意图的死规则 `.stuiWrap[class$=_footerActions]`（宿主容器没有 `stuiWrap` 类，永不命中）修为 `[class$=_footerActions]{flex-wrap:wrap}`。真机浏览器实测：展开态三入口纵向堆叠、收起态（rail）三枚 36px 圆钮排一列，均零溢出；面板锚点与点开回落正常。`client.test` 62 断言全绿。
+
 ## [0.9.0] - 2026-09-22
 
 ### added
