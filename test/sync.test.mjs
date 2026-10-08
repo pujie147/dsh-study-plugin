@@ -23,6 +23,7 @@ function check(name, cond, extra) {
   else { failed++; console.log('  ✗ ' + name + (extra !== undefined ? '  [' + JSON.stringify(extra).slice(0, 400) + ']' : '')) }
 }
 const gitBlobSha = (buf) => createHash('sha1').update('blob ' + buf.length + '\0').update(buf).digest('hex')
+const stat = (p) => fsp.stat(p).catch(() => null)
 
 // ── mock GitHub API ─────────────────────────────────────────────────────────
 function makeGithubMock() {
@@ -155,12 +156,13 @@ async function makeDevice(tag) {
   const H = await createHostServices({ sessionsRoot: sessRoot, sessions: sessionsSvc })
   if (!H) return undefined
   const routes = {}, effects = []
+  const toolDefs = []
   const ctx = {
     inject: (names, fn) => {
       const scope = {
         effect: (fn2, label) => { const d = fn2(); effects.push({ label, d }); return d },
         webServer: { register: (route) => { routes[route.path] = route; return () => { delete routes[route.path] } } },
-        tools: { register: () => () => {} },
+        tools: { register: (def) => { if (def && def.name) toolDefs.push(def); return () => {} } },
         agents: { get: () => ({ followup: () => {} }) },
         workspaceRegistry: H.registry,
         sessionPersistence: H.persistence,
@@ -190,7 +192,7 @@ async function makeDevice(tag) {
     setImmediate(() => { req.emit('data', JSON.stringify({ method, args: args || {} })); req.emit('end') })
     try { rpc.handler(req, res) } catch (e) { reject(e) }
   })
-  return { tag, root: tmpRoot, H, call }
+  return { tag, root: tmpRoot, H, call, toolDefs }
 }
 
 // 取不到宿主真实实现 ⇒ 整套跳过（前提就是跑宿主代码，不放宽断言）
@@ -485,6 +487,114 @@ console.log('\n══ 9.5 删除远端目标：confirm 闸门 + 删该目标全�
   check('远端列表不再含被删目标', listAfter.ok === true && !(listAfter.goals || []).some((g) => g.remoteGoalId === delGoalId), (listAfter.goals || []).map((g) => g.remoteGoalId))
   const bad = await A.call('study.syncDeleteRemote', { remoteGoalId: '../evil', confirm: true })
   check('非法 remoteGoalId 被拒', bad.ok === false && /非法/.test(bad.error || ''), bad)
+}
+
+console.log('\n══ 9.7 两段式拉取/导入（sync-stash）+ study_sync_* 聊天通道 ══')
+{
+  const E = await makeDevice('E')
+  await E.call('study.syncSetConfig', { apiBase: base, webBase: base })
+  mock.state.tokens.set('github_pat_mockEEEtester05', 'tester')
+  const eb = await E.call('study.syncBindPat', { token: 'github_pat_mockEEEtester05' })
+  check('E 设备（第三台）绑定就绪，用于两段式验证', eb.ok === true && eb.bound === true, eb)
+  const stashDir = path.join(E.root, 'sync-stash')
+  const blobReqs = () => mock.state.requests.filter((r) => /\/git\/blobs\//.test(r)).length
+  const c97 = await A.call('study.createGoal', { topic: '两段式试验', target_level: '入门', requirements: '中文' })
+  const g97 = c97.goalId
+  await makeSession(A, 'sess-97-1', goalDirOf(A, g97), [
+    ev('turn/start', 0, { turn: 1 }),
+    ev('session/title', 1, { title: '两段式会话' }),
+    ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
+  ])
+  const p97 = await A.call('study.syncPush', { goalId: g97 })
+  check('A 先推一个干净的新目标供两段式使用（goalId 的远端包在第 8 节被故意写坏）', p97.ok === true && p97.pushed === true, p97)
+  const before = await E.call('study.list', {})
+
+  const n0 = blobReqs()
+  const f1 = await E.call('study.syncFetch', { remoteGoalId: g97 })
+  check('syncFetch 回暂存条目（remoteGoalId/digest/字节数/包名）', f1.ok === true && !!f1.entry && f1.entry.remoteGoalId === g97 && /^stash-/.test(f1.entry.file) && !!f1.entry.digest && f1.entry.bytes > 0, f1)
+  check('sidecar 带展示信息（标题/章节/会话数/仓库）', f1.entry.title === '两段式试验' && f1.entry.sessions === 1 && /tester\/dsh-study-sync/.test(f1.entry.repo), f1.entry)
+  check('包确实写进本机 sync-stash（zip + sidecar）', !!(await stat(path.join(stashDir, f1.entry.file))) && !!(await stat(path.join(stashDir, f1.entry.file + '.meta.json'))), f1.entry && f1.entry.file)
+  const afterFetch = await E.call('study.list', {})
+  check('拉取不动本地：目标数不变且 E 还没有该目标', afterFetch.goals.length === before.goals.length && !afterFetch.goals.some((g) => g.id === g97), { b: before.goals.length, a: afterFetch.goals.length })
+  const f2 = await E.call('study.syncFetch', { remoteGoalId: g97 })
+  check('同 digest 再拉 ⇒ reused、复用同一包、不再下载 blob（幂等）', f2.ok === true && f2.reused === true && f2.entry.file === f1.entry.file && blobReqs() === n0 + 1, { blobs: blobReqs() - n0, file: f2.entry && f2.entry.file })
+
+  const lr = await E.call('study.syncListRemote')
+  const fb = await E.call('study.syncFetch', { remoteGoalId: 'all' })
+  const corrupt = (fb.results || []).find((x) => x.remoteGoalId === goalId)
+  check('all ⇒ 批量暂存覆盖仓库全部目标', fb.ok === true && fb.batch === true && fb.results.length === (lr.goals || []).length, { got: fb.results && fb.results.length, want: (lr.goals || []).length })
+  check('批量里个别包损坏 ⇒ 该项报错、其余照常暂存（不拖垮整批）', !!corrupt && /sha256/.test(corrupt.error || '') && fb.results.filter((x) => x.error).length === 1 && fb.fetched === fb.results.length - 1, { corrupt: corrupt && corrupt.error, fetched: fb.fetched, results: fb.results.length })
+  check('已暂存过的算 reused（不重复下载）', fb.reused >= 1, { reused: fb.reused })
+  const ls = await E.call('study.syncListStash')
+  check('syncListStash 每项带远端身份与拉取时间', ls.ok === true && ls.entries.length >= 2 && ls.entries.every((e) => !!e.remoteGoalId && !!e.fetchedAt && e.bytes > 0), ls.entries.slice(0, 3))
+
+  const pv = await E.call('study.syncApply', { file: f1.entry.file })
+  check('apply 不带 confirm ⇒ 预览（needConfirm + plan + canImport）', pv.ok === false && pv.preview === true && pv.needConfirm === true && !!pv.plan && pv.canImport === true, pv)
+  const ap = await E.call('study.syncApply', { file: f1.entry.file, mode: 'overwrite', confirm: true })
+  check('apply confirm ⇒ 写入本地并标 pulled（与一键拉取同结果）', ap.ok === true && ap.pulled === true && ap.goalId === g97, ap)
+  check('应用后 E 才出现该目标', (await E.call('study.list', {})).goals.some((g) => g.id === g97), null)
+  check('overwrite 应用盖了同步基线 ⇒ E 视角 upToDate', (await E.call('study.syncInspect', { goalId: g97 })).status === 'upToDate', null)
+  const ls2 = await E.call('study.syncListStash')
+  const applied = (ls2.entries || []).find((e) => e.file === f1.entry.file)
+  check('应用过的包保留并标记 appliedAt/appliedMode', !!applied && !!applied.appliedAt && applied.appliedMode === 'overwrite', applied)
+
+  const badName = await E.call('study.syncApply', { file: '../evil.zip', confirm: true })
+  check('非法包名（带路径）被拒 ⇒ 只认暂存区裸文件名', badName.ok === false && /裸文件名|非法/.test(badName.error || ''), badName)
+  const gone = await E.call('study.syncApply', { file: 'stash-nope-000.zip' })
+  check('暂存区没有该包 ⇒ 明确报错并提示先拉取', gone.ok === false && /暂存区没有/.test(gone.error || ''), gone)
+
+  // 仓库版比本地旧 ⇒ 本地会话先自独涨两帧，两段式必须挡住「旧包静默覆盖」
+  const absE = E.H.persistence.locate({ cwd: goalDirOf(E, g97), id: 'sess-97-1' }).path
+  const a0 = P.analyzeTranscript(await fsp.readFile(absE))
+  const tail = [ev('turn/start', a0.maxSeq + 1, { turn: 9 }), ev('turn/end', a0.maxSeq + 2, { turn: 9, reason: { kind: 'completed' } })]
+  const app = await P.appendLinesToTranscript(await fsp.readFile(absE), tail.map((l) => String(l)))
+  await fsp.writeFile(absE, app.bytes)
+  const ie = await E.call('study.syncInspect', { goalId: g97 })
+  check('E 本地涨帧 ⇒ localAhead', ie.status === 'localAhead', ie)
+  const blocked = await E.call('study.syncApply', { file: f1.entry.file, mode: 'overwrite', confirm: true })
+  check('本地更新时不带 force 应用旧包 ⇒ 被冲突挡住（AI 与面板都不自动覆盖）', blocked.ok === false && /冲突|force/.test(blocked.error || ''), blocked)
+  const merged = await E.call('study.syncApply', { file: f1.entry.file, mode: 'merge', confirm: true })
+  check('merge 应用旧包成功：本地分叉项不动', merged.ok === true, merged)
+  check('merge 不盖同步基线 ⇒ 仍是 localAhead', (await E.call('study.syncInspect', { goalId: g97 })).status === 'localAhead', null)
+
+  // 暂存区回收：TTL 过期 + 数量上限
+  await fsp.writeFile(path.join(stashDir, 'stash-old.zip'), Buffer.from('x'))
+  await fsp.writeFile(path.join(stashDir, 'stash-old.zip.meta.json'), JSON.stringify({ remoteGoalId: 'old', digest: 'zz', fetchedAt: new Date(Date.now() - 45 * 86400000).toISOString() }))
+  for (let i = 0; i < 24; i++) {
+    const nm = 'stash-fake-' + i + '.zip'
+    await fsp.writeFile(path.join(stashDir, nm), Buffer.from('x'))
+    await fsp.writeFile(path.join(stashDir, nm + '.meta.json'), JSON.stringify({ remoteGoalId: 'fake-' + i, digest: 'd' + i, fetchedAt: new Date(Date.now() - i * 1000).toISOString() }))
+  }
+  await E.call('study.syncFetch', { remoteGoalId: g97 })
+  const ls3 = await E.call('study.syncListStash')
+  check('TTL 过期的包在下次拉取时被回收', ls3.ok === true && !ls3.entries.some((e) => e.file === 'stash-old.zip'), ls3.entries.map((e) => e.file).slice(0, 6))
+  check('数量超上限 ⇒ 留最新、回收最旧（≤20）', ls3.entries.length <= 20, { n: ls3.entries.length })
+  const dl = await E.call('study.syncDeleteStash', { file: f1.entry.file })
+  check('删除暂存包只清本机（zip + sidecar 都没了）', dl.ok === true && !(await stat(path.join(stashDir, f1.entry.file))) && !(await stat(path.join(stashDir, f1.entry.file + '.meta.json'))), dl)
+  check('再删同一个 ⇒ noop 不报错', (await E.call('study.syncDeleteStash', { file: f1.entry.file })).noop === true, null)
+
+  const tStatus = E.toolDefs.find((t) => t.name === 'study_sync_status')
+  const tFetch = E.toolDefs.find((t) => t.name === 'study_sync_fetch')
+  const tApply = E.toolDefs.find((t) => t.name === 'study_sync_apply')
+  if (!tStatus || !tFetch || !tApply) {
+    console.log('  SKIP: defineTool 不可得 ⇒ study_sync_* 未注册，聊天通道断言跳过（RPC 已覆盖）')
+  } else {
+    check('聊天工具三件套已注册', true, E.toolDefs.map((t) => t.name).join(','))
+    const st = await tStatus.execute({})
+    check('study_sync_status：远端目标 + 本机映射与五态 + 暂存清单', st.ok === true && st.bound === true && st.goals.length >= 1 && st.goals.some((g) => g.remoteGoalId === g97 && g.localGoalId === g97 && !!g.status) && Array.isArray(st.stash), st.goals && st.goals.slice(0, 2))
+    const fe = await tFetch.execute({ remote_goal_id: g97 })
+    check('study_sync_fetch：暂存成功并给出下一步（指向 apply）', fe.ok === true && !!fe.entry && /study_sync_apply/.test(fe.next || ''), fe)
+    const noId = await tFetch.execute({})
+    check('fetch 缺 remote_goal_id ⇒ 指回 status、严禁猜 id', noId.ok === false && /study_sync_status/.test(noId.error || ''), noId)
+    const pvT = await tApply.execute({ stash_file: fe.entry.file })
+    check('study_sync_apply 不带 confirm ⇒ 预览 + next 指向 confirm=true', pvT.ok === false && pvT.needConfirm === true && /confirm=true/.test(pvT.next || ''), pvT)
+    const byId = await tApply.execute({ remote_goal_id: 'no-such-rgid' })
+    check('apply 引用不存在的远端目标 ⇒ stage=fetch 明确失败', byId.ok === false && byId.stage === 'fetch', byId)
+    const noRef = await tApply.execute({})
+    check('apply 两种引用都不给 ⇒ 报二选一', noRef.ok === false && /二选一/.test(noRef.error || ''), noRef)
+  }
+  const le = await E.call('study.list', {})
+  check('聊天通道跑完：E 本地目标仍只有应用过的那一个', le.goals.filter((g) => g.id === g97).length === 1, le.goals.map((g) => g.id))
 }
 
 console.log('\n══ 10. 失效 → 重绑恢复；降级面 ══')
