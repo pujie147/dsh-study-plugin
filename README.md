@@ -19,8 +19,8 @@
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
 node test/smoke.mjs                 # 宿主半运行时冒烟（含 readChapter + /study-file 讲义页；跑在宿主真实 persistence + registry 上）
-node test/sync.test.mjs             # GitHub 同步宿主半（78 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt）
-npm test                            # smoke + portable + client(55，桩 React 真实渲染点击，含同步面板、「打开讲义」与网页课程源) + sync(78)
+node test/sync.test.mjs             # GitHub 同步宿主半（122 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt + 两段式暂存 syncFetch/syncApply/syncListStash/syncDeleteStash + study_sync_* 聊天通道）
+npm test                            # smoke + portable + client(64，桩 React 真实渲染点击，含同步面板、「打开讲义」与网页课程源) + sync(122)
                                     # ⚠ 本机宿主升到 dsh 0.1.5-rc.2 后 JsonlSessionPersistence 无 inspect() ⇒ smoke(M4 起)/portable 崩，属夹具待跟进宿主漂移（见 CHANGELOG 0.7.2 备注），未改代码
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
@@ -118,6 +118,21 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 - **多台机器绑同一个 GitHub 账号是预期用法**：每台机器各自跑一遍授权、各拿一份独立令牌，共同认领并读写同一个 `dsh-study-sync`；后来者若发现仓里已有本插件的认领标记，直接**采用（adopt）**而不触发接管。导出包各带自己的 `deviceId`，冲突面板据此区分"是哪台机器推的"。**唯一的耦合点**是账号级"撤销这个 OAuth App"——见下方方式一与方式二的差别。
 
 打开面板点顶栏 **☁ GitHub 同步** 进入。设计细节见 [docs/design/github-sync.md](./docs/design/github-sync.md)。
+
+### 两段式拉取 / 导入（v0.11.0）
+
+「下载远端包」与「写入本地」被刻意拆成两步，中间隔一层**本机暂存区** `~/.dsh/study-work/sync-stash/`（zip + `.meta.json` 附属；同 digest 复用不重下，TTL 30 天 / 上限 20 个自动回收）：
+
+- **⬇ 拉取到暂存区**（面板逐目标「⬇ 暂存」或「⬇ 全部拉到暂存区」）：只把仓库里的 bundle 下载到暂存区，**本地目标/会话/工作区一律不动**；批量里个别包损坏只让该项报错、其余照常暂存。
+- **🔍 预览 → ✓ 确认导入**（暂存列表里逐个操作）：走与「📦 导出/导入」完全同一套预览/确认/三模式（⤴ 覆盖 / ➕ 合并 / 📋 另存副本）+ 逐文件 sha256 + 失败整体回滚。**只有覆盖导入成功才对齐同步基线**；本地比包新时不带 force 会被冲突挡住——面板与 AI 都**绝不自动吃掉任一侧**（force 由用户勾）。
+
+同一对构件（`study.syncFetch` / `study.syncApply`）也开成三个**聊天工具**，让 AI 跨机器取目标：
+
+- **`study_sync_status`**：仓库全景——绑定态、每个远端目标对应本机哪个目标及五态、暂存区已有哪些包（不确定 id 先调它，**严禁猜**）。
+- **`study_sync_fetch`**（`remote_goal_id` 或 `all`）：把指定/全部目标暂存，本地不动，返回里带下一步指引。
+- **`study_sync_apply`**（`stash_file` 或 `remote_goal_id`）：不带 `confirm` 只回预览，讲给学习者确认后再带 `confirm=true` 写入；AI 缺省 `mode=merge`（最保守）。
+
+示例：「仓库里有哪些目标」→「把 XX 先拉到暂存区别覆盖」→「预览一下这个包再决定」→「确认导入」。
 
 ### 授权方式一：一键登录 GitHub（设备码 OAuth，推荐）
 

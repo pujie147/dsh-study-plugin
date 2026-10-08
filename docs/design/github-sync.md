@@ -118,6 +118,18 @@ dsh-study-sync/
 当前实现里没有任何锁文件、没有"占用即拒绝"。若后续加提示性 badge，也必须保持：看到别的设备在场，
 只是**告诉用户**，push/pull 照常按 CAS 走，由 CAS 而不是软锁来裁决并发。理由见 D27。
 
+## 5b. 两段式拉取 / 导入与 AI 通道（M5.1，v0.11.0）
+
+`syncPull` 把「下载远端包」和「写入本地」焊在一步里，AI 或手滑点一下就直接覆盖本地。M5.1 在**不改 syncPull/autoSyncOnce/一键拉取**的前提下，另叠一层**可反复执行的暂存**：
+
+- **`study.syncFetch`**（下载段）：`fetchRemoteMeta` 拿 meta → 同 `digest` 已在暂存区则**复用不重下**（幂等，省一次 blob 请求）→ 否则 `fetchRemoteZip` + `zipSha256` 校验后落 `study-work/sync-stash/<stash-rgid-<blobSha12>>.zip` 与 `.meta.json` 附属（记 remoteGoalId/digest/repo/exportedAt/deviceId/title/chapters/sessions/fetchedAt）。**全程不动本地目标/会话/工作区**。`remoteGoalId=all|*` 走批量，逐项 try/catch：单个包损坏只让该项 `error`，其余照常暂存、整批不塌。
+- **`study.syncApply`**（写入段）：只认暂存区**裸文件名**（`path.basename(name)===name` 防穿越），转 `study.importGoal`，预览/确认/三模式（overwrite|merge|copy）/force 语义**全复用**，不新增判定。`overwrite` 成功且已绑定才 `stampSyncBase`（merge/copy 绝不动账本），成功后把 `appliedAt/appliedMode` 回写附属（保留原拉取元数据）。
+- **`study.syncListStash` / `study.syncDeleteStash`**：列与删本机暂存包（删除只清本机，仓库与本地目标不动）。回收 `pruneStash`：TTL 30 天 + 数量上限 20（留最新），开机 effect 与每次 fetch 后各跑一次。
+
+**AI 通道**：同一对构件开成三个聊天工具 `study_sync_status`（仓库全景 + 本机映射五态 + 暂存清单，缺 id 指回它、严禁猜）/ `study_sync_fetch`（`remote_goal_id` 或 `all`）/ `study_sync_apply`（不带 confirm 只回预览并附下一步指引，带 confirm 才写；**AI 缺省 `mode=merge`** 最保守）。
+
+守住的不变量：token 明文仍不进返回值；写盘前先 sha256；本地比包新 ⇒ 无 force 一律被冲突挡住（面板与 AI 都不自动吃掉任一侧）；只引用暂存区裸文件名，不接受任意路径。四条通道（面板手动、聊天 AI、开机快进、一键 syncPull）共用 `fetchOneRemoteBundle` + `syncApply` 这对构件，语义零新增。
+
 ## 6. 诚实边界（做不到 / 故意不做的）
 
 - **不做增量传输**：每次同步整包（`bundle.zip`）。超过 `MAX_SYNC_ZIP_BYTES = 50MB` 直接拒绝同步，
@@ -130,7 +142,7 @@ dsh-study-sync/
 
 ## 7. 测试
 
-`test/sync.test.mjs`（77 断言）跑在**真实宿主 fixture** + **内存 mock GitHub server**（回环 endpoint）上：
+`test/sync.test.mjs`（122 断言）跑在**真实宿主 fixture** + **内存 mock GitHub server**（回环 endpoint）上：
 两台设备 A/B 各持独立 `sessionPersistence` 根（另加 C/D 覆盖占用接管与多主机 adopt）。覆盖：
 
 - 绑定状态机（设备码 pending→authorized、PAT、失败不落盘、invalid→rebind、unbind）；
@@ -139,6 +151,7 @@ dsh-study-sync/
 - 五态与快进链（B 追加帧 → localAhead 推 → A remoteAhead 拉 → 内容随 remoteId 旅行）；
 - 真分叉二选一（覆盖仓库=force push / 放弃本地=discard pull，且不 prune）；
 - **CAS**：正确 sha ⇒ 200、过期 sha ⇒ 409；塞坏 zip ⇒ pull 时 sha256 拦下；
+- **两段式暂存（M5.1，§5b）**：`syncFetch` 单包/批量（个别损坏项不拖垮整批、`fetched=results-1`）、同 digest 复用不重下（blob 请求计数验证幂等）、sidecar 元数据、TTL+上限回收、`syncApply` 预览/确认三模式（conflicted 无 force 必挡、merge 不盖基线、overwrite 才 `stampSyncBase`）、裸文件名防穿越、`syncDeleteStash` noop；`study_sync_status/fetch/apply` 三工具走同一实现（args 字符串/布尔兼容、缺 id 指回 status）。**面板两段式渲染本轮未进 client.test，留真机验收**；
 - 降级红线：宿主无 fetch 只报不可用不抛、解绑只清本机、其它功能（list/导出）不受牵连。
 
 客户端面板见 `test/client.test.mjs` 的同步段（39 断言：一键 `oneClick` + 自动轮询、高级折叠、PAT 不回显、占用→接管/放弃、二选一按钮、force/discard 参数、降级禁用）。

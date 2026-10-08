@@ -2,6 +2,25 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.0] - 2026-10-08
+
+### added
+- **GitHub 同步两段式拉取 / 导入（M5.1）**：把「下载远端包」与「写入本地」拆开，中间隔一层可反复执行的本机暂存区 `~/.dsh/study-work/sync-stash/`（zip + `.meta.json` 附属；同 `digest` 复用不重下、TTL 30 天 / 上限 20 个自动回收）：
+  1. 新构件 `fetchOneRemoteBundle`（`fetchRemoteMeta` → 命中暂存即复用 → 否则 `fetchRemoteZip` + `zipSha256` 校验后落盘），**全程不动本地目标/会话/工作区**；
+  2. 新 RPC ×4：`study.syncFetch`（单 `remoteGoalId` 或 `all|*` 批量，批量逐项 try/catch，单个包损坏只让该项 `error`、其余照常暂存、整批不塌）、`study.syncApply`（只认暂存区**裸文件名**、`basename===name` 防穿越，转 `study.importGoal` 复用预览/确认/三模式/force **全语义**；`overwrite` 成功且已绑定才 `stampSyncBase`，merge/copy 绝不动账本；成功后把 `appliedAt/appliedMode` 回写附属）、`study.syncListStash`、`study.syncDeleteStash`（删除只清本机）；开机 effect（7s）+ 每次 fetch 后跑 `pruneStash`；
+  3. 聊天工具 ×3（与 RPC 同一实现）：`study_sync_status`（仓库全景 + 本机映射五态 + 暂存清单，缺 id 指回它、严禁猜）、`study_sync_fetch`（`remote_goal_id` 或 `all`）、`study_sync_apply`（不带 `confirm` 只回预览并附下一步指引，带 `confirm=true` 才写；**AI 缺省 `mode=merge` 最保守**）；
+  4. 面板「☁ 同步」新增「⬇ 全部拉到暂存区」与逐目标「⬇ 暂存」，暂存列表逐个「🔍 预览 → ✓ 确认导入」（覆盖/合并/另存副本三选一，**force 由用户勾选、不硬编码**）。
+- 四条通道（面板手动 / 聊天 AI / 开机快进 / 一键 `syncPull`）共用同一对构件，**语义零新增、一步式老路径不动**。
+
+### fixed
+- **面板两段式安全修正**：`doStashConfirm` 原会硬编码 `force:true`（静默吃掉本地分叉）⇒ 改为用户勾 `stashForce`，保住「conflicted 永不自动覆盖」红线。
+- **`chatImport` 的 `next` 指引此前不可达**：`importGoal` 预览返回 `ok:false/preview:true`，而旧代码按 `r.ok` 判定 ⇒ 改按 `preview`。
+- **`study_sync_fetch` 的 `remote_goal_id` 去掉 `required`**：宿主 `defineTool` 会在结构化引导前先抛 `ToolArgsError`，去掉后走 `chatSyncFetch` 自己的「指回 study_sync_status」引导。
+
+### notes
+- 零新路由（`/study-rpc` handler 表即白名单，新 RPC 自动暴露）、零 npm 依赖、token 明文永不进返回值、写盘前先 sha256。测试：`sync.test` **122 断言**（新增 §9.7 两段式：单包/批量部分失败继续、同 digest 幂等复用（blob 计数）、sidecar 元数据、TTL+上限回收、三模式应用、conflicted 无 force 必挡、merge 不盖基线、裸文件名防穿越、删除 noop、三聊天工具 args 字符串/布尔兼容）、`client.test` **64 全绿**、`portable.test` **32 全绿**（`smoke` 本机仍因宿主 0.1.5-rc.2 无 `inspect()` 先天红，非本轮回归）。文档：PROJECT.md 决策 **D37**、docs/design/github-sync.md §5b、README「两段式拉取/导入」、USAGE §2c、`README_LINES`（运行期 study-work/README）与 CLAUDE.md 方法/工具计数同步。
+- **⚠ 真机验收未做**：面板「⬇ 暂存 → 预览 → 确认」四步、AI 三工具实跑、覆盖导入后左栏新会话是否需重启 DSH 才出现（承知：导入/拉取属带外改动）。**边界（诚实）**：面板两段式**渲染**本轮未进 `client.test`，只有宿主 RPC 与聊天工具被覆盖。
+
 ## [0.10.0] - 2026-09-23
 
 ### added
