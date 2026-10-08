@@ -634,10 +634,12 @@ let exportedGoalId = ''
     check('chapter_index 字符串→数字路由；未就绪错误原样透传', badCh.ok === false && /未就绪/.test(badCh.error || ''), badCh)
     const injTT = injected.length
     const okG = await tt.execute({ goal_id: goalId, requirements: '外部会话要卷' })
-    check('不带 chapter_index ⇒ 派发目标卷(n=2) + message 指向蓝图确认', okG.ok === true && okG.test_n === 2 && injected[injTT].id === 'sess-goal-1' && /蓝图/.test(okG.message || ''), okG)
+    // 上面的 deleteTest 段已把目标卷清空 ⇒ 编号重新从 01 起（v0.10.0 之前的断言假设 n=2 已失效）
+    check('不带 chapter_index ⇒ 派发目标卷(卷清空后重新 01) + message 指向蓝图确认', okG.ok === true && okG.test_n === 1 && injected[injTT].id === 'sess-goal-1' && /蓝图/.test(okG.message || ''), okG)
     const st = await (registeredTools.find((x) => x.name === 'study_plan_status')).execute({})
     const srow = st.goals.find((x) => x.id === goalId)
-    check('study_plan_status 回带 tests_ready/goal_tests_ready/mistakes_total', srow.tests_ready === 2 && srow.goal_tests_ready === 1 && srow.mistakes_total === 3, srow && { t: srow.tests_ready, g: srow.goal_tests_ready, m: srow.mistakes_total })
+    // 章卷被删掉一份 ⇒ ready=1；刚派发的目标卷还是 generating ⇒ ready 仍为 0
+    check('study_plan_status 回带 tests_ready/goal_tests_ready/mistakes_total', srow.tests_ready === 1 && srow.goal_tests_ready === 0 && srow.mistakes_total === 3, srow && { t: srow.tests_ready, g: srow.goal_tests_ready, m: srow.mistakes_total })
   }
 }
 
@@ -648,7 +650,8 @@ let exportedGoalId = ''
     const abs = mockPersistence.locate({ cwd, id: sid }).path
     await fsp.mkdir(path.dirname(abs), { recursive: true })
     const gm = /\.v(\d+)\./.exec(path.basename(abs))   // 宿主校验：代际文件名 vN 必须与 header version 一致
-    const lines = [JSON.stringify({ type: 'session', version: gm ? Number(gm[1]) : 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard' }), ...rows]
+    // isSeeded 是宿主 v4 catalog 的必需字段：缺了它 ⇒ list() 静默跳过这条会话 ⇒ 工作区认不了账
+    const lines = [JSON.stringify({ type: 'session', version: gm ? Number(gm[1]) : 0, id: sid, createdAt: 1788000000000, cwd, delegationDepth: 0, agentPreset: 'standard', isSeeded: false }), ...rows]
     await fsp.writeFile(abs, await P.jsonlToZstdFrames(lines.join('\n') + '\n', 2))
     return abs
   }
@@ -803,7 +806,95 @@ let exportedGoalId = ''
   live.push({ id: 'sess-goal-1', header: { id: 'sess-goal-1', cwd: goalAbsDir } })
   const liveImp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'overwrite', force: true })
   check('会话 LIVE ⇒ sessionLive 冲突且 force 也不放行', liveImp.json && liveImp.json.ok === false && liveImp.json.conflicts.some((c) => c.kind === 'sessionLive'), JSON.parse(JSON.stringify(liveImp.json, (k, v) => (k === 'plan' ? undefined : v))))
+  // ── P5b 活体 + 逻辑内容一致（宿主重写过物理形态：字节变、行完全一致）⇒ noop，不该报 sessionLive ──
+  // 注意：这里只改 zstd 分帧批次，不动 header。宿主 0.2.x 会因"文件名 vN 与 header version 不符"
+  // 直接让 persistence.list() 抛错（整根都列不出来），所以不能用"改 version 字段"来模拟升分代。
+  const gp5 = mockPersistence.locate({ cwd: goalAbsDir, id: 'sess-goal-1' }).path
+  const before5 = await fsp.readFile(gp5)
+  const an5 = P.analyzeTranscript(before5)
+  const reframed = await P.jsonlToZstdFrames([JSON.stringify(an5.header), ...an5.lines].join('\n'), 3)
+  await fsp.writeFile(gp5, reframed)
+  check('换分帧只改物理形态：行数不变而字节已变', (await rowsOf('sess-goal-1', goalAbsDir)) === an5.lines.length && P.sha256Hex(reframed) !== P.sha256Hex(before5), { rows: an5.lines.length })
+  const genImp = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite' })
+  check('活体会话内容一致 ⇒ 判 noop 不撞活体门（假冲突已消）', genImp.json && genImp.json.ok === true && genImp.json.idempotent === true && genImp.json.applied.noop === 3 && !(genImp.json.conflicts || []).length, JSON.parse(JSON.stringify(genImp.json || {}, (k, v) => (k === 'plan' ? undefined : v))))
+  // 成功返回值里没有 plan（只有 inspectImport 预览有），故用预览读明细
+  const genPrev = await callRpc('study.inspectImport', { path: zipExtPath, mode: 'overwrite' })
+  const goal1 = ((((genPrev || {}).json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('预览里如实写明"逻辑内容一致，只是物理形态不同"', !!goal1 && goal1.action === 'noop' && /逻辑内容一致/.test(goal1.detail || ''), goal1 && goal1.detail)
+  check('noop 不动盘上字节（活体会话文件未被插件改写）', P.sha256Hex(await fsp.readFile(gp5)) === P.sha256Hex(reframed))
+  // 真差异 + 活体：硬冲突必须仍然成立（不能被上一条放松掉）
+  const base5 = await fsp.readFile(gp5)
+  await fsp.writeFile(gp5, (await P.appendLinesToTranscript(base5, [ev('turn/start', an5.lines.length, { turn: 9 })])).bytes)
+  const liveDiff = await callRpc('study.importGoal', { path: zipExtPath, confirm: true, mode: 'overwrite', force: true })
+  check('活体且内容确有差异 ⇒ sessionLive 硬冲突照旧', liveDiff.json && liveDiff.json.ok === false && liveDiff.json.conflicts.some((c) => c.kind === 'sessionLive'), liveDiff.json && { err: liveDiff.json.error })
+  await fsp.writeFile(gp5, base5)
   live.length = 0
+
+  // ── P5c 包体自述宿主分代（A）+ 高于本机宿主 ⇒ 拒收（B）─────────────────────
+  const LOCAL_GEN = Number(/\.v(\d+)\./.exec(path.basename(mockPersistence.locate({ cwd: goalAbsDir, id: 'fmt-probe' }).path))[1])
+  const zExt = P.readZip(await fsp.readFile(zipExtPath))
+  const manExt = P.readJsonEntry(zExt, 'manifest.json')
+  check('A：包里逐会话记下宿主分代（文件名 vN 权威 + header 自述），source 带导出机代次',
+    manExt.source.hostSessionFormatVersion === LOCAL_GEN && manExt.sessions.length > 0 && manExt.sessions.every((s) => s.sessionFormatVersion === LOCAL_GEN && s.sessionHeaderVersion === LOCAL_GEN),
+    { src: manExt.source.hostSessionFormatVersion, ss: manExt.sessions.map((s) => [s.sessionFormatVersion, s.sessionHeaderVersion]) })
+
+  /** 重打包：改 manifest（可选换某条会话正文），其余条目原样搬 */
+  async function repack(file, mutateMan, swap) {
+    const m = JSON.parse(JSON.stringify(manExt))
+    mutateMan(m)
+    // 被换掉的正文要同步指纹：readExport 逐条校 manifest.files，会话条目同时记在 files[] 与 sessions[].sha256
+    for (const [k, buf] of (swap || [])) {
+      const sha = P.sha256Hex(buf)
+      const f = (m.files || []).find((x) => x.name === k); if (f) { f.sha256 = sha; f.bytes = buf.length }
+      const s = (m.sessions || []).find((x) => x.entry === k); if (s) s.sha256 = sha
+    }
+    const rows = []
+    for (const [k, v] of zExt.entries()) {
+      if (k === 'manifest.json') { rows.push({ name: k, data: Buffer.from(JSON.stringify(m), 'utf8') }); continue }
+      const alt = swap && swap.get(k)
+      rows.push({ name: k, data: alt !== undefined ? alt : v, store: /\.zstd$/.test(k) })
+    }
+    await fsp.writeFile(file, P.createZip(rows))
+    return file
+  }
+  const goalEntryName = 'sessions/sess-goal-1/transcript.jsonl.zstd'
+  const anGoal = P.analyzeTranscript(zExt.get(goalEntryName))
+  // 正文比本机多一行 ⇒ 不是"内容一致"能豁免的形状（否则 noop 会先抢掉）
+  const goalAhead = await P.jsonlToZstdFrames([JSON.stringify(anGoal.header), ...anGoal.lines, ev('turn/start', anGoal.lines.length, { turn: 77 })].join('\n') + '\n')
+  const aheadZip = await repack(path.join(tmpRoot, 'gen-ahead.zip'),
+    (m) => { m.source.hostSessionFormatVersion = LOCAL_GEN + 5; for (const s of m.sessions) s.sessionFormatVersion = LOCAL_GEN + 5 },
+    new Map([[goalEntryName, goalAhead]]))
+  const aheadPrev = await callRpc('study.inspectImport', { path: aheadZip, mode: 'overwrite' })
+  const aPlan = (aheadPrev || {}).json || {}
+  const aItem = ((aPlan.plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('B：包体分代高于本机 ⇒ 预览就判 formatTooNew 并说清两边版本',
+    aPlan.canImport === false && (aPlan.conflicts || []).some((c) => c.kind === 'sessionFormatTooNew') && aItem && aItem.action === 'formatTooNew' && /本机宿主只写到 v/.test(aItem.detail || ''),
+    aItem && { act: aItem.action, detail: aItem.detail })
+  check('B：只拦真会落盘的那条，内容一致的照旧 noop（不冤枉整包）',
+    (aPlan.conflicts || []).filter((c) => c.kind === 'sessionFormatTooNew').length === 1 && ((aPlan.plan || {}).sessions || []).filter((x) => x.action === 'noop').length === 2,
+    { conflicts: (aPlan.conflicts || []).map((c) => c.kind), acts: ((aPlan.plan || {}).sessions || []).map((x) => x.action) })
+  check('A：预览里同时看见本机与导出机的分代（不用解包）',
+    (aPlan.plan || {}).hostSessionFormatVersion === LOCAL_GEN && (aPlan.plan || {}).sourceSessionFormatVersion === LOCAL_GEN + 5,
+    { host: (aPlan.plan || {}).hostSessionFormatVersion, src: (aPlan.plan || {}).sourceSessionFormatVersion })
+  const shaBefore5 = P.sha256Hex(await fsp.readFile(gp5))
+  const aheadImp = await callRpc('study.importGoal', { path: aheadZip, confirm: true, mode: 'overwrite', force: true })
+  check('B：force 也不放行（不是"要不要覆盖"，是本机宿主读不懂这种正文）',
+    aheadImp.json && aheadImp.json.ok === false && /sessionFormatTooNew/.test(aheadImp.json.error || ''), aheadImp.json && aheadImp.json.error)
+  check('拒收时一个字节都没落盘（宿主整根 list() 未被波及）', P.sha256Hex(await fsp.readFile(gp5)) === shaBefore5, { sha: shaBefore5.slice(0, 12) })
+  // 旧包形状：manifest 没记代次 ⇒ 退回正文 header 自述（文件名统一叫 transcript.jsonl.zstd，问不到 vN）
+  const legacyBody = await P.jsonlToZstdFrames([JSON.stringify(Object.assign({}, anGoal.header, { version: LOCAL_GEN + 5 })), ...anGoal.lines, ev('turn/start', anGoal.lines.length, { turn: 88 })].join('\n') + '\n')
+  const legacyZip = await repack(path.join(tmpRoot, 'gen-legacy-ahead.zip'),
+    (m) => { for (const s of m.sessions) { delete s.sessionFormatVersion; delete s.sessionHeaderVersion } },
+    new Map([[goalEntryName, legacyBody]]))
+  const legacyPrev = await callRpc('study.inspectImport', { path: legacyZip, mode: 'overwrite' })
+  check('旧包没记字段 ⇒ 退回正文 header.version 判定，照样拦', legacyPrev.json && legacyPrev.json.canImport === false && (legacyPrev.json.conflicts || []).some((c) => c.kind === 'sessionFormatTooNew'), legacyPrev.json && legacyPrev.json.conflicts)
+  // 同代次（未知即不拦）：删掉自述字段、正文仍是本机读得懂的版本 ⇒ 照常快进
+  const sameGenZip = await repack(path.join(tmpRoot, 'gen-same-ahead.zip'),
+    (m) => { for (const s of m.sessions) { delete s.sessionFormatVersion; delete s.sessionHeaderVersion } },
+    new Map([[goalEntryName, goalAhead]]))
+  const samePrev = await callRpc('study.inspectImport', { path: sameGenZip, mode: 'overwrite' })
+  const sItem = ((((samePrev || {}).json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('代次相等或未自述 ⇒ 不误拦（照走 append 快进）', samePrev.json && samePrev.json.canImport === true && !(samePrev.json.conflicts || []).length && sItem && sItem.action === 'append', samePrev.json && { conflicts: samePrev.json.conflicts, act: sItem && sItem.action })
 
   // ── P6 失败要回滚干净：不留空目录、不留半个目标、index 还原 ────────────────
   const idxBefore = await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')
@@ -835,10 +926,12 @@ let exportedGoalId = ''
   await wsRegistryReal.archiveSession('sess-ch-1')
   check('前置：sess-ch-1 已进入宿主归档集', (wsRegistryReal.archivedSessionIds || []).indexOf('sess-ch-1') >= 0, wsRegistryReal.archivedSessionIds)
   const dupImp = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'copy' })
-  check('源仍在盘上 ⇒ 三条全部换发新身份（库里不出现 duplicate id，list() 仍正常）', dupImp.json && dupImp.json.ok === true && (dupImp.json.remap || []).length === 3 && (await mockPersistence.list()).length === 7, dupImp.json && { remap: (dupImp.json.remap || []).length, listed: (await mockPersistence.list()).length })
-  await callRpc('study.deleteGoal', { goalId: dupImp.json.goalId })
-  await fsp.rm(dupImp.json.dir, { recursive: true, force: true })
-  await fsp.rm(projectDirOf(dupImp.json.dir), { recursive: true, force: true })
+  check('源仍在盘上 ⇒ 三条全部换发新身份（库里不出现 duplicate id，list() 仍正常）', dupImp.json && dupImp.json.ok === true && (dupImp.json.remap || []).length === 3 && (await mockPersistence.list()).length === 7, dupImp.json && { ok: dupImp.json.ok, err: dupImp.json.error, remap: (dupImp.json.remap || []).length, listed: (await mockPersistence.list()).length })
+  if (dupImp.json && dupImp.json.dir) {
+    await callRpc('study.deleteGoal', { goalId: dupImp.json.goalId })
+    await fsp.rm(dupImp.json.dir, { recursive: true, force: true })
+    await fsp.rm(projectDirOf(dupImp.json.dir), { recursive: true, force: true })
+  }
   // 8b 连源也抹掉 ⇒ 「id 空闲」时归档集仍然会藏会话 ⇒ 必须不换用该 id（上一版就在这里"导入即隐身"）
   await fsp.rm(goalAbsDir, { recursive: true, force: true })
   await fsp.rm(projectDirOf(goalAbsDir), { recursive: true, force: true })
@@ -901,7 +994,7 @@ let exportedGoalId = ''
 {
   check('defineTool 已解析（静态注册启用）', registeredTools.length > 0, '注册数=' + registeredTools.length)
   const names = registeredTools.map((t) => t.name).sort()
-  check('8 个工具注册', names.join(',') === 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_test_generate', names)
+  check('11 个工具注册（M2/M4 + D37 同步三件套）', names.join(',') === 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_sync_apply,study_sync_fetch,study_sync_status,study_test_generate', names)
   const byName = Object.fromEntries(registeredTools.map((t) => [t.name, t]))
   const createJson = JSON.stringify(byName.study_plan_create && byName.study_plan_create.parameters)
   check('create schema 含 topic 且表达 required', /topic/.test(createJson) && /required/.test(createJson), createJson)

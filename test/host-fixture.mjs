@@ -58,6 +58,8 @@ export function makeStubCtx(extra = {}) {
     config: {},
     use: () => noop,
     provide: noop,
+    /** 宿主 0.2.x 用 ctx.waterfall 问「这个会话有没有在跑的活」；夹具里没有监听者 ⇒ 直接取默认值。 */
+    waterfall: async (_event, _payload, fallback) => (typeof fallback === 'function' ? await fallback(_payload) : []),
     dispose: noop,
     effect: (fn) => (typeof fn === 'function' ? fn() : undefined),
     reflect: { provide: noop, dispose: noop, dep: swallow, resolve: () => undefined },
@@ -87,7 +89,7 @@ class FakeTable {
   keys() { return this.map.keys() }
 }
 
-export function makeStorageDomain(initial = { initialized: false, workspaceIds: [], archivedSessionIds: [] }) {
+export function makeStorageDomain(initial = { initialized: false, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [] }) {
   let current = JSON.parse(JSON.stringify(initial))
   const table = new FakeTable()
   const domain = {
