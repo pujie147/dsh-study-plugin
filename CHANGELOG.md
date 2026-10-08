@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0] - 2026-10-08
+
+### added
+- **导出包自述宿主会话分代（A）**：`manifest.sessions[]` 新增 `sessionFormatVersion`（打包时选中的**宿主文件名代次** `vN`，权威；活体会话 flush 重读后一起刷新）与 `sessionHeaderVersion`（正文 header 自述），`manifest.source.hostSessionFormatVersion` 记导出机当前代次，导入预览 `plan` 回带 `hostSessionFormatVersion` / `sourceSessionFormatVersion` ⇒ **换机导入时不解包就看得见两边是否同代次**（包内 entry 统一叫 `transcript.jsonl.zstd`，这两个字段不记就永久丢失，正是 v4 事故查不动的原因）。
+- **包体分代高于本机宿主 ⇒ 一律拒收（B）**：新判定 `action='formatTooNew'` + 硬冲突 `kind='sessionFormatTooNew'`（merge/overwrite 都挡、`force`/`discardLocal` 都不放行，apply 侧另有一条 `throw` 兜底）。理由是爆炸半径：本机宿主读不懂高代次正文（fail-closed），而 0.2.x 遇到「文件名 `vN` 与 header `version` 不符」会让**整个 sessions 根** `list()` 抛错，坏的不止一条会话。包体代次优先取 A 记的文件名代次、旧包退回正文 `header.version`，**任一侧未知就不拦**（宁可放行给行级比对，不凭猜测拒收）；本机基线由 `hostSessionFormatVersion()` 用 `locate()` 探针从文件名反推（宿主 `locate` 只拼路径不碰盘，零副作用）。
+
+### fixed
+- **活体门假冲突（C）＝ 内容一致优先于活体门**：`resolveImport` 把**行级比对提到活体门之前**——`compareTranscriptLines==='same'` 一律判 `noop`（不再先看 sha 是否相等、也不再让「会话正被打开」抢先判 `liveBlocked`），并在预览 detail 如实写明差异性质（`逻辑内容一致，仅宿主会话分代不同（包 vN → 本机 vM）` / `逻辑内容一致，仅物理形态（压缩分帧）不同`）。真差异时活体门照旧硬挡（宿主无 close/detach API、`SessionStore` write-behind 回写 ⇒ 覆盖活体文件必然 seq 断档 `corrupt session log`）。修掉的症状是面板那句自指的 `导入被冲突挡住: sessionLive=session-xxxx… → session-xxxx…`。
+- **`globalSessionIndex()` 把宿主 `list()` 的快照当裸 header 读**：宿主返回 `{header, revision, sizeBytes}`，旧代码直接取 `.id/.cwd` ⇒ 身份索引恒空 ⇒ 换身份判定全瞎、copy 导入会把别处已占用的 id 再写一份 ⇒ 宿主抛 `duplicate JSONL session id … appears in multiple project directories`（一条重复让整根列不出来）。改为 `snap.header || snap`。
+
+### notes
+- 测试：`smoke` 新增 **P5b 五条**（活体 + 换分帧 ⇒ noop 不撞活体门 / 预览写明「逻辑内容一致」/ noop 不动盘上字节 / 活体且真差异 ⇒ `sessionLive` 照旧硬挡）与 **P5c 八条**（代次字段齐 + `source` 带导出机代次 / 高代次预览就判 `formatTooNew` / **只拦真会落盘的那条**、内容一致的照旧 noop / 预览同时看见两边代次 / `force` 也不放行 / **拒收时一个字节都没落盘** / 旧包退回 `header.version` 照样拦 / 代次相等或未自述 ⇒ 不误拦、照走 append）。全套 **`smoke 238/0`、`portable 32/0`、`client 64/0`、`sync 122/0`**。
+- 测试夹具补齐宿主 0.2.x 硬事实（v4 header 必带布尔 `isSeeded`、文件名 `vN` 必须等于 header `version`、`list()` 返回快照、`archiveSession` 需 `ctx.waterfall` + `pinnedSessionIds`）；顺带修 v0.10.0 留下的两处过期断言与 D37 忘了改的工具计数（8→11）。文档：PROJECT.md 决策 **D38** + §5 宿主事实四行 + §7 取舍 + §8 基线与造包约定。
+- **边界（诚实）**：① **跨分代的真分叉假冲突仍然存在**——本机 20 对同时有 v3/v4 的真会话实测 **18 对 diverged / 2 对 same**（行数相同，差异是 `message.source` 词表改名），要判成「同一份历史」必须做 v3→v4 语义换算，那是宿主 `dsh-session-format-v3-to-v4` 的职责，**插件不复刻宿主编解码**（红线）；C 只消掉「同内容不同物理形态」这一类，A 只给可见性，B 只挡危险方向。② 建议 **D**（导出时目录里存在更高代次文件名 ⇒ 记 warning）本轮**未做**。③ **真机验收未做**：须重启 DSH 让 `9719939` 的导出侧生效 → 重新 push（让仓库带 v4 包体）→ 再走一次拉取/暂存导入。④ 提交前的净室探针 `scripts/cleanroom-check.mjs` 在本机被权限拦下，未跑。
+
 ## [0.11.0] - 2026-10-08
 
 ### added
