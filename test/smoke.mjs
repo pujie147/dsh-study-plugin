@@ -659,9 +659,13 @@ let exportedGoalId = ''
   const pngRef = await mockAttachments.saveImage({ data: new Uint8Array(pngBytes), mediaType: 'image/png' })
   await makeSession('sess-goal-1', goalAbsDir, [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: 'Transformer 课程规划草案', messageSeqs: [2], source: { kind: 'llm' } }),
-    ev('user/message', 2, { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '请调研并写 ' + goalAbsDir.replace(/\\/g, '/') + '/draft.json' }] }, { surfaceOp: 'append' }),
-    ev('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
+    ev('user/message', 1, { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '请调研并写 ' + goalAbsDir.replace(/\\/g, '/') + '/draft.json' }] }, { surfaceOp: 'append' }),
+    // source.kind='goal' 是宿主 v3 表里的第一方生产者同名身份 ⇒ 可写成 v3 的 {kind:'plugin',plugin:'goal'}
+    // 包装，宿主迁移后还原成同一个 {kind:'goal'} ⇒ D39 用它能造出"逻辑同内容、逐行不同字节"的真跨代次正文
+    ev('user/message', 2, { id: 'u1b', role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: '目标补充说明' }] }, { surfaceOp: 'append' }),
+    // 宿主 v4 校验：session/title 的 messageSeqs 必须指向**更早**的事件（否则 restore 判 corrupt）
+    ev('session/title', 3, { title: 'Transformer 课程规划草案', messageSeqs: [1], source: { kind: 'llm' } }),
+    ev('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
   ])
   await makeSession('sess-ch-1', goalAbsDir, [
     ev('turn/start', 0, { turn: 1 }),
@@ -764,7 +768,7 @@ let exportedGoalId = ''
   const shaPng = pngRef.attachmentId.slice(7)
   const backPng = await fsp.readFile(path.join(attachRoot, shaPng.slice(0, 2), shaPng)).catch(() => undefined)
   check('附件按内容寻址回写，attachmentId 不变（会话引用不悬空）', !!backPng && Buffer.compare(backPng, pngBytes) === 0)
-  check('导入自检 verified 与宿主能力一致(rc.2 无 inspect ⇒ false 属诚实降级)', imp.json.ok === true && imp.json.verified === (typeof mockPersistence.inspect === 'function'), { verified: imp.json.verified, hostInspect: typeof mockPersistence.inspect })
+  check('导入自检 verified = 宿主 open() 可用（D39：自检真的把写过的会话读回来）', imp.json.ok === true && imp.json.verified === (typeof mockPersistence.open === 'function') && imp.json.decodedBack > 0, { verified: imp.json.verified, decodedBack: imp.json.decodedBack, hostOpen: typeof mockPersistence.open })
   const led2 = JSON.parse(await fsp.readFile(path.join(goalAbsDir, '.study-sync.json'), 'utf8'))
   check('写了设备本地身份账本（remoteId↔localId 三条）', led2.remoteGoalId === exportedGoalId && led2.sessions.length === 3 && led2.sessions.every((x) => x.remoteId === x.localId), led2.sessions.map((x) => [x.remoteId, x.localId]))
   check('导入报告哪几条按宿主规则不会单独出现', /不会在工作区里单独出现/.test((imp.json.warnings || []).join(' ')), imp.json.warnings)
@@ -830,7 +834,7 @@ let exportedGoalId = ''
   await fsp.writeFile(gp5, base5)
   live.length = 0
 
-  // ── P5c 包体自述宿主分代（A）+ 高于本机宿主 ⇒ 拒收（B）─────────────────────
+  // ── P5c 包里逐会话自述分代（A）+ 判定以正文为准、不拒收整包（D39）───────────
   const LOCAL_GEN = Number(/\.v(\d+)\./.exec(path.basename(mockPersistence.locate({ cwd: goalAbsDir, id: 'fmt-probe' }).path))[1])
   const zExt = P.readZip(await fsp.readFile(zipExtPath))
   const manExt = P.readJsonEntry(zExt, 'manifest.json')
@@ -859,49 +863,124 @@ let exportedGoalId = ''
   }
   const goalEntryName = 'sessions/sess-goal-1/transcript.jsonl.zstd'
   const anGoal = P.analyzeTranscript(zExt.get(goalEntryName))
+
   // 正文比本机多一行 ⇒ 不是"内容一致"能豁免的形状（否则 noop 会先抢掉）
   const goalAhead = await P.jsonlToZstdFrames([JSON.stringify(anGoal.header), ...anGoal.lines, ev('turn/start', anGoal.lines.length, { turn: 77 })].join('\n') + '\n')
-  const aheadZip = await repack(path.join(tmpRoot, 'gen-ahead.zip'),
+  // 1) manifest 谎报文件名代次（v(LOCAL+5)）而正文自述 LOCAL ⇒ 按正文判定，不拦、只告警
+  const liedZip = await repack(path.join(tmpRoot, 'gen-lied.zip'),
     (m) => { m.source.hostSessionFormatVersion = LOCAL_GEN + 5; for (const s of m.sessions) s.sessionFormatVersion = LOCAL_GEN + 5 },
     new Map([[goalEntryName, goalAhead]]))
-  const aheadPrev = await callRpc('study.inspectImport', { path: aheadZip, mode: 'overwrite' })
-  const aPlan = (aheadPrev || {}).json || {}
-  const aItem = ((aPlan.plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
-  check('B：包体分代高于本机 ⇒ 预览就判 formatTooNew 并说清两边版本',
-    aPlan.canImport === false && (aPlan.conflicts || []).some((c) => c.kind === 'sessionFormatTooNew') && aItem && aItem.action === 'formatTooNew' && /本机宿主只写到 v/.test(aItem.detail || ''),
-    aItem && { act: aItem.action, detail: aItem.detail })
-  check('B：只拦真会落盘的那条，内容一致的照旧 noop（不冤枉整包）',
-    (aPlan.conflicts || []).filter((c) => c.kind === 'sessionFormatTooNew').length === 1 && ((aPlan.plan || {}).sessions || []).filter((x) => x.action === 'noop').length === 2,
-    { conflicts: (aPlan.conflicts || []).map((c) => c.kind), acts: ((aPlan.plan || {}).sessions || []).map((x) => x.action) })
-  check('A：预览里同时看见本机与导出机的分代（不用解包）',
-    (aPlan.plan || {}).hostSessionFormatVersion === LOCAL_GEN && (aPlan.plan || {}).sourceSessionFormatVersion === LOCAL_GEN + 5,
-    { host: (aPlan.plan || {}).hostSessionFormatVersion, src: (aPlan.plan || {}).sourceSessionFormatVersion })
-  const shaBefore5 = P.sha256Hex(await fsp.readFile(gp5))
-  const aheadImp = await callRpc('study.importGoal', { path: aheadZip, confirm: true, mode: 'overwrite', force: true })
-  check('B：force 也不放行（不是"要不要覆盖"，是本机宿主读不懂这种正文）',
-    aheadImp.json && aheadImp.json.ok === false && /sessionFormatTooNew/.test(aheadImp.json.error || ''), aheadImp.json && aheadImp.json.error)
-  check('拒收时一个字节都没落盘（宿主整根 list() 未被波及）', P.sha256Hex(await fsp.readFile(gp5)) === shaBefore5, { sha: shaBefore5.slice(0, 12) })
-  // 旧包形状：manifest 没记代次 ⇒ 退回正文 header 自述（文件名统一叫 transcript.jsonl.zstd，问不到 vN）
-  const legacyBody = await P.jsonlToZstdFrames([JSON.stringify(Object.assign({}, anGoal.header, { version: LOCAL_GEN + 5 })), ...anGoal.lines, ev('turn/start', anGoal.lines.length, { turn: 88 })].join('\n') + '\n')
-  const legacyZip = await repack(path.join(tmpRoot, 'gen-legacy-ahead.zip'),
-    (m) => { for (const s of m.sessions) { delete s.sessionFormatVersion; delete s.sessionHeaderVersion } },
-    new Map([[goalEntryName, legacyBody]]))
-  const legacyPrev = await callRpc('study.inspectImport', { path: legacyZip, mode: 'overwrite' })
-  check('旧包没记字段 ⇒ 退回正文 header.version 判定，照样拦', legacyPrev.json && legacyPrev.json.canImport === false && (legacyPrev.json.conflicts || []).some((c) => c.kind === 'sessionFormatTooNew'), legacyPrev.json && legacyPrev.json.conflicts)
-  // 同代次（未知即不拦）：删掉自述字段、正文仍是本机读得懂的版本 ⇒ 照常快进
-  const sameGenZip = await repack(path.join(tmpRoot, 'gen-same-ahead.zip'),
-    (m) => { for (const s of m.sessions) { delete s.sessionFormatVersion; delete s.sessionHeaderVersion } },
-    new Map([[goalEntryName, goalAhead]]))
-  const samePrev = await callRpc('study.inspectImport', { path: sameGenZip, mode: 'overwrite' })
-  const sItem = ((((samePrev || {}).json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
-  check('代次相等或未自述 ⇒ 不误拦（照走 append 快进）', samePrev.json && samePrev.json.canImport === true && !(samePrev.json.conflicts || []).length && sItem && sItem.action === 'append', samePrev.json && { conflicts: samePrev.json.conflicts, act: sItem && sItem.action })
+  const liedPrev = await callRpc('study.inspectImport', { path: liedZip, mode: 'overwrite' })
+  const g1Item = ((((liedPrev || {}).json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('判定以正文 header.version 为准：manifest 报 v9 也照样放行（不拦整包）',
+    liedPrev.json && liedPrev.json.canImport === true && g1Item && g1Item.pkgBodyGen === LOCAL_GEN && g1Item.pkgNameGen === LOCAL_GEN + 5 && g1Item.action === 'append',
+    g1Item && { body: g1Item.pkgBodyGen, name: g1Item.pkgNameGen, act: g1Item.action, conflicts: (liedPrev.json || {}).conflicts })
+  check('包内自述不一致（文件名代次 ≠ 正文）⇒ 如实告警',
+    /包内自述不一致/.test(((liedPrev.json || {}).warnings || []).join(' ')), (liedPrev.json || {}).warnings)
+  // 2) 正文真的比本机新（header.version = LOCAL+5）⇒ 逐条延后，导入照做、这条零写入
+  const futureBody = await P.jsonlToZstdFrames([JSON.stringify(Object.assign({}, anGoal.header, { version: LOCAL_GEN + 5 })), ...anGoal.lines, ev('turn/start', anGoal.lines.length, { turn: 88 })].join('\n') + '\n')
+  const futureZip = await repack(path.join(tmpRoot, 'gen-future.zip'),
+    (m) => { for (const s of m.sessions) { s.sessionFormatVersion = LOCAL_GEN + 5; s.sessionHeaderVersion = LOCAL_GEN + 5 } },
+    new Map([[goalEntryName, futureBody]]))
+  const futurePrev = await callRpc('study.inspectImport', { path: futureZip, mode: 'overwrite' })
+  const fItem = (((futurePrev.json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('正文代次高于本机 ⇒ 该条判 deferredFutureFormat（不再是冲突），计划里带两边代次',
+    futurePrev.json && futurePrev.json.canImport === true && fItem && fItem.action === 'deferredFutureFormat' && /本机宿主只写到 v/.test(fItem.detail || '')
+    && (futurePrev.json.plan || {}).hostSessionFormatVersion === LOCAL_GEN && (futurePrev.json.plan || {}).deferred === 1,
+    fItem && { act: fItem.action, detail: fItem.detail, deferred: (futurePrev.json.plan || {}).deferred })
+  const shaBeforeF = P.sha256Hex(await fsp.readFile(gp5))
+  const futureImp = await callRpc('study.importGoal', { path: futureZip, confirm: true, mode: 'overwrite', force: true })
+  check('高代次包体不再让整包失败：ok:true + 该条 skipped-by-defer + 其余照写',
+    futureImp.json && futureImp.json.ok === true && (futureImp.json.applied || {}).deferredFutureFormat === 1,
+    futureImp.json && { ok: futureImp.json.ok, err: futureImp.json.error, applied: futureImp.json.applied })
+  check('延后的一条一个字节都没落盘（不造出本机读不懂的产物）', P.sha256Hex(await fsp.readFile(gp5)) === shaBeforeF, { sha: shaBeforeF.slice(0, 12) })
+  check('延后如实写进告警：包留在暂存区等本机宿主升级',
+    /读不懂也转不出来|宿主分代高于本机/.test((futureImp.json.warnings || []).join(' ')), futureImp.json.warnings)
+
+  // ── P5d D39 真跨代次：借宿主解码比对、借宿主落盘 ──────────────────────────
+  // v3 形态的同一份正文：把第一方生产者 source 还原成 v3 的 plugin 包装（宿主迁移会解回同一个 kind）
+  const asV3Lines = (lines) => lines.map((l) => {
+    const o = JSON.parse(l)
+    const d = o.data || {}
+    const src = (d.message && d.message.source) || d.source
+    if (src && src.kind === 'goal') {
+      const wrapped = { kind: 'plugin', plugin: 'goal' }
+      if (d.message) d.message.source = wrapped; else d.source = wrapped
+    }
+    return JSON.stringify(o)
+  })
+  const v3HeaderOf = (h) => Object.assign({}, h, { version: 3 })
+  const mkV3Body = async (lines, head) => P.jsonlToZstdFrames([JSON.stringify(v3HeaderOf(head || anGoal.header)), ...asV3Lines(lines)].join('\n') + '\n')
+  const anLocalNow = P.analyzeTranscript(await fsp.readFile(gp5))
+  const v3Same = await mkV3Body(anLocalNow.lines, anLocalNow.header)
+  check('跨代次正文逐行字节直比 = diverged（证明只能靠宿主解码，不能靠行比对）',
+    P.compareTranscriptLines(P.analyzeTranscript(v3Same).lines, anLocalNow.lines) === 'diverged',
+    { v3lines: P.analyzeTranscript(v3Same).lines.length, v4lines: anLocalNow.lines.length })
+  const v3SameZip = await repack(path.join(tmpRoot, 'gen-v3-same.zip'),
+    (m) => { for (const s of m.sessions) { if (s.remoteId === 'sess-goal-1') { s.sessionFormatVersion = 3; s.sessionHeaderVersion = 3 } } },
+    new Map([[goalEntryName, v3Same]]))
+  const v3SamePrev = await callRpc('study.inspectImport', { path: v3SameZip, mode: 'overwrite' })
+  const v3SameItem = (((v3SamePrev.json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('包 v3 / 本机 v4 且逻辑内容一致 ⇒ 按宿主解码判 noop（跨代次假分叉已消）',
+    v3SameItem && v3SameItem.action === 'noop' && v3SameItem.compareMode === 'events' && /仅宿主会话分代不同/.test(v3SameItem.detail || ''),
+    v3SameItem && { act: v3SameItem.action, mode: v3SameItem.compareMode, detail: v3SameItem.detail })
+  // 同一份 v3 正文再多一个事件 ⇒ 必须走宿主转码写（不能字节照抄）
+  // 追加的事件必须是宿主词表里合法的一条：新开一轮 ⇒ turn 号取本地正文最后一轮的下一号
+  const lastTurn = anLocalNow.lines.reduce((m, l) => {
+    try { const t = (JSON.parse(l).data || {}).turn; return typeof t === 'number' && t > m ? t : m } catch { return m }
+  }, 0)
+  const v3Ahead = await mkV3Body(anLocalNow.lines.concat([ev('turn/start', anLocalNow.lines.length, { turn: lastTurn + 1 })]), anLocalNow.header)
+  const v3AheadZip = await repack(path.join(tmpRoot, 'gen-v3-ahead.zip'),
+    (m) => { for (const s of m.sessions) { if (s.remoteId === 'sess-goal-1') { s.sessionFormatVersion = 3; s.sessionHeaderVersion = 3 } } },
+    new Map([[goalEntryName, v3Ahead]]))
+  const v3AheadPrev = await callRpc('study.inspectImport', { path: v3AheadZip, mode: 'overwrite' })
+  const v3AheadItem = (((v3AheadPrev.json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('跨代次且有增量 ⇒ 判定为借宿主落盘（writeKind=host / hostMode=append）',
+    v3AheadPrev.json && v3AheadPrev.json.canImport === true && v3AheadItem && v3AheadItem.writeKind === 'host' && v3AheadItem.hostMode === 'append' && (v3AheadPrev.json.plan || {}).migrate === 1,
+    v3AheadItem && { wk: v3AheadItem.writeKind, hm: v3AheadItem.hostMode, act: v3AheadItem.action })
+  const v3AheadImp = await callRpc('study.importGoal', { path: v3AheadZip, confirm: true, mode: 'overwrite' })
+  const v3After = P.analyzeTranscript(await fsp.readFile(gp5))
+  const v3AfterGen = Number(/\.v(\d+)\./.exec(path.basename(gp5))[1])
+  check('借宿主转码导入成功（ok + 自检读得回来）', v3AheadImp.json && v3AheadImp.json.ok === true && (v3AheadImp.json.decodedBack || 0) >= 1,
+    v3AheadImp.json && { ok: v3AheadImp.json.ok, err: v3AheadImp.json.error, applied: v3AheadImp.json.applied })
+  check('落盘产物自洽：v4 文件名 + header.version=v4（不再制造让整根 list() 抛的产物）',
+    v3After.header.version === v3AfterGen && v3AfterGen === LOCAL_GEN, { nameGen: v3AfterGen, bodyVer: v3After.header.version })
+  check('转码追加按宿主当前词表落进本机文件（本地多 1 行）', v3After.lines.length === anLocalNow.lines.length + 1,
+    { before: anLocalNow.lines.length, after: v3After.lines.length })
+  check('转码后宿主照常列得出来（整根未被自相矛盾的产物打爆）', (await mockPersistence.list()).length >= 4, (await mockPersistence.list()).length)
+  // 本地目录只躺旧代次正文 ⇒ 必须认得住"本地已有"，不能当新会话把旧正文塞进当前代文件名
+  const keepV4 = await fsp.readFile(gp5)
+  const dirOfGoal1 = path.dirname(gp5)
+  const anV3Local = P.analyzeTranscript(v3Same)
+  await fsp.writeFile(path.join(dirOfGoal1, 'session.v3.jsonl.zstd'), v3Same)
+  await fsp.unlink(gp5)
+  const oldArtZip = await repack(path.join(tmpRoot, 'gen-local-v3only.zip'),
+    (m) => { for (const s of m.sessions) { if (s.remoteId === 'sess-goal-1') { s.sessionFormatVersion = 3; s.sessionHeaderVersion = 3 } } },
+    new Map([[goalEntryName, v3Same]]))
+  const oldArtPrev = await callRpc('study.inspectImport', { path: oldArtZip, mode: 'overwrite' })
+  const oldArtItem = (((oldArtPrev.json || {}).plan || {}).sessions || []).find((x) => x.remoteId === 'sess-goal-1')
+  check('本地只有 v3 正文 ⇒ 认出本地存在（noop 而非 create；基线是目录里最高代次）',
+    oldArtItem && oldArtItem.action === 'noop' && oldArtItem.localArtGen === 3 && oldArtItem.writeKind === 'bytes' && /session\.v3\./.test(oldArtItem.writePath || ''),
+    oldArtItem && { act: oldArtItem.action, artGen: oldArtItem.localArtGen, wk: oldArtItem.writeKind, wp: path.basename(oldArtItem.writePath || '') })
+  const oldArtImp = await callRpc('study.importGoal', { path: oldArtZip, confirm: true, mode: 'overwrite' })
+  check('识别旧代次本地正文后导入成功，且不生成"当前代文件名装旧正文"的产物',
+    oldArtImp.json && oldArtImp.json.ok === true && !(await fsp.stat(gp5).catch(() => undefined)) && (await fsp.readdir(dirOfGoal1)).join(',') === 'session.v3.jsonl.zstd',
+    oldArtImp.json && { ok: oldArtImp.json.ok, err: oldArtImp.json.error, files: await fsp.readdir(dirOfGoal1) })
+  check('宿主仍读得懂只有历史代次文件的会话（懒迁移是宿主的活）',
+    (await (await mockPersistence.open('sess-goal-1', 'read')).read()).events.length === anV3Local.lines.length,
+    { events: (await (await mockPersistence.open('sess-goal-1', 'read')).read()).events.length })
+  await fsp.unlink(path.join(dirOfGoal1, 'session.v3.jsonl.zstd')).catch(() => {})
+  await fsp.writeFile(gp5, keepV4)
 
   // ── P6 失败要回滚干净：不留空目录、不留半个目标、index 还原 ────────────────
   const idxBefore = await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')
-  const realInspect = mockPersistence.inspect
-  mockPersistence.inspect = async () => { throw new Error('测试注入：宿主读不懂') }
+  const realOpen = mockPersistence.open
+  mockPersistence.open = async (id, access) => {
+    if (access === 'read') throw new Error('测试注入：宿主读不懂（' + id + '）')
+    return realOpen.call(mockPersistence, id, access)
+  }
   const boom = await callRpc('study.importGoal', { path: rE.json.path, confirm: true, mode: 'copy' })
-  mockPersistence.inspect = realInspect
+  mockPersistence.open = realOpen
   check('自检失败 ⇒ ok:false + rolledBack', boom.json && boom.json.ok === false && boom.json.rolledBack === true, boom.json)
   check('回滚不留空 session 目录（上一版就是留了 6 个空壳）', (await emptySessionDirs()).length === 0, await emptySessionDirs())
   check('回滚后 index.json 逐字还原', (await fsp.readFile(path.join(tmpRoot, 'index.json'), 'utf8')) === idxBefore, (await readIndexGoals()).map((g) => g.id))

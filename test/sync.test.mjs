@@ -294,7 +294,7 @@ let goalId = ''
   check('createGoal ok', c.ok === true && /^goal-/.test(goalId), c)
   await makeSession(A, 'sess-sync-1', goalDirOf(A, goalId), [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: '同步试验会话' }),
+    ev('session/title', 1, { title: '同步试验会话', messageSeqs: [], source: { kind: 'user' } }),
     ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   const i0 = await A.call('study.syncInspect', { goalId })
@@ -332,7 +332,7 @@ console.log('\n══ 6. 快进链：B 追加会话帧 → localAhead → 推；
 {
   await makeSession(B, 'sess-sync-1', goalDirOf(B, goalId), [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: '同步试验会话' }),
+    ev('session/title', 1, { title: '同步试验会话', messageSeqs: [], source: { kind: 'user' } }),
     ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   // 独立机器：B 拉取后本地会话沿用 sess-sync-1（各自 sessions 根，不撞全局唯一）。
@@ -449,7 +449,7 @@ console.log('\n══ 9b. 多台主机绑同一账号：后来者直接 adopt，
   const dg = await D.call('study.createGoal', { topic: 'D 独家', target_level: '入门', requirements: '中文' })
   await makeSession(D, 'sess-d-1', goalDirOf(D, dg.goalId), [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: 'D 的会话' }),
+    ev('session/title', 1, { title: 'D 的会话', messageSeqs: [], source: { kind: 'user' } }),
     ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   const dp = await D.call('study.syncPush', { goalId: dg.goalId })
@@ -465,7 +465,7 @@ console.log('\n══ 9.5 删除远端目标：confirm 闸门 + 删该目标全�
   const delGoalId = c.goalId
   await makeSession(A, 'sess-del-1', goalDirOf(A, delGoalId), [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: '待删除会话' }),
+    ev('session/title', 1, { title: '待删除会话', messageSeqs: [], source: { kind: 'user' } }),
     ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   const dp = await A.call('study.syncPush', { goalId: delGoalId })
@@ -502,7 +502,7 @@ console.log('\n══ 9.7 两段式拉取/导入（sync-stash）+ study_sync_* �
   const g97 = c97.goalId
   await makeSession(A, 'sess-97-1', goalDirOf(A, g97), [
     ev('turn/start', 0, { turn: 1 }),
-    ev('session/title', 1, { title: '两段式会话' }),
+    ev('session/title', 1, { title: '两段式会话', messageSeqs: [], source: { kind: 'user' } }),
     ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
   ])
   const p97 = await A.call('study.syncPush', { goalId: g97 })
