@@ -2,6 +2,22 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.13.0] - 2026-10-09
+
+### fixed
+- **跨代次导入彻底重写（D39）＝ 修「全部 4 个目标导入失败并回滚」**：根因不是导出错标，而是 v0.12.0 护栏（D38）漏掉的一条宿主事实——**懒迁移只在写路径发生**（`open(id,'write')` 才 `publishStoredMigration` 新建当前代文件并保留历史文件；本机实测 29 个目录 v3/v4 共存）。只要没人写过那条会话，盘上就还是旧代次；而导入侧只拿 `locate()` 的**当前代名**比 sha，会把目录里躺着的 v3 正文当成「本地不存在」，noop 优先 / 行级比对 / 活体门**一起绕过**，再把 v3 字节塞进 v4 文件名 ⇒ 宿主 `readGenerationHeader` 抛 ⇒ 整个 sessions 根 `list()` 失败 ⇒ 自检判不过 ⇒ 全量回滚。
+
+### added
+- **本地基线认「目录最高代次产物」**：新增 `localTranscriptArt(dir)`（读会话目录里数值最高的 canonical `session.vN` 那条，返回 `{path,gen,headerVersion,bytes,kind}`），判定基线不再是 `locate()` 的当前代名。
+- **跨代次比对借宿主解码（消 D38 遗留的 18/20 假分叉）**：`compareMode='events'` 时两边都过 `hostDecodeForCompare`→`migrateViaHost`（一次性沙箱目录 + 宿主 `open(scratchId,'read')` 取当前词表 `{header,events,inheritedEventCount}` + `finally` 删沙箱）再 `canonicalEventLines`（递归 key 排序后 stringify）比对。逻辑一致 ⇒ `noop`（detail「逻辑内容一致，仅宿主会话分代不同」）；**插件全程只调宿主的解码，零复刻 v3↔v4 语义**（红线：不跟宿主版本漂移赛跑）。
+- **跨代次写路径借宿主 `create`/`append`（`writeKind='host'`）**：`writeSessionViaHost` 用宿主解码后的当前词表事件落盘——快进 `open(id,'write')+append(delta)+close()`（`hostMode='append'`）、本地无正文 `create+append`（`create`）、目录里已有另一代次正文且非快进则 `reissue` 换发新身份（**用户原件一字节不动**）；任何一步宿主解不出/写不出 ⇒ `skippedUnsupportedBody` + 告警、零写入。落盘文件名一律由宿主 `locate()` 反推 ⇒ 绝不再自造「文件名 vN≠header.version」那种炸全根的产物。
+- **高代次包体不再拒收整包**：D38 的 B（`sessionFormatTooNew` 硬冲突）松成逐条 `deferredFutureFormat`——本机解不出的那条留暂存区、`stampSyncBase` 不盖章、等宿主升级再导，其余会话照常导入、整包不塌；包体正文代次以 `header.version` 为准（高于 manifest 记的文件名代次），二者不符记「包内自述不一致」告警。
+- **导入自检改成真解码**：第 6 步从死的 `pp.inspect` 腿换成对每条真写盘会话 `pp.open(id,'read')+read()`，读不回即 `verifyFail` 整体回滚（仅指名**别的 id** 的 `duplicate JSONL session id` 降级为告警）。
+
+### notes
+- 测试：`smoke` 新增 **P5d**（v3 孪生逐行字节比 = `diverged` 证只能靠宿主解码 / 包 v3 同内容 ⇒ `noop`+`compareMode=events` / 包 v3 多一条合法 `turn/start` ⇒ `writeKind=host`+`hostMode=append`+`plan.migrate=1` / 转码导入落盘产物 `header.version≡文件名 vN≡本机代次`、本地恰好多 1 行、`list()` 仍正常 / 本地只有 v3 正文 ⇒ 认得住「本地已有」判 `noop` 且写回 `session.v3` 名不造当前代孤儿文件）+ 改写 P5c（`formatTooNew` 冲突 → `deferredFutureFormat` 逐条延后不炸整包）。**被新解码自检逼出并修好的测试夹具假绿**：`smoke` 的 `sess-goal-1` title 指向了更晚的 seq（宿主判 corrupt）、`sync` 五处手写 title 缺 `messageSeqs` 数组——旧 `inspect()` 死腿永远查不到这类问题。全套 **`smoke 247/0`、`portable 32/0`、`client 64/0`、`sync 122/0`**。文档：PROJECT.md 决策 **D39** + §5 宿主事实五行（懒迁移只在写路径 / 未来代次只炸单条 / 借宿主写是唯一安全落盘 / title 严格校验 / `locate` 只拼路径）+ §7 更正（D38「重启→重推即得 v4 包体」前提错、跨代次假分叉已被 D39 消解）。
+- **边界（诚实）**：① 连宿主自己 `open('read')` 都解不出的正文（如 v0 header 老包）谁都导不了 ⇒ 记 `skippedUnsupportedBody`，不伪装成功；② 活体会话照旧 `liveBlocked`（宿主 write-behind 是兜底，未放宽）；③ 导入的会话**仍需重启 DSH 才在左栏出现**（带外改动，承旧事实）；④ **真机验收未做**——重启 DSH → 重导那 4 个失败目标 → 会话可见可打开；混代次父子链；v0 header 的旧包期望 `skippedUnsupportedBody` 而非整包失败。
+
 ## [0.12.0] - 2026-10-08
 
 ### added
