@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.14.0] - 2026-10-23
+
+### added
+- **资料检索门（D40）＝先检索资料、整课确认，才允许写讲义**：批准草案后新增一步「按大纲逐章检索资料」——目标会话 AI 每章做 2–4 次检索，写出 `research/materials/NN-<slug>.md`（固定三节：来源清单 / 摘录与要点 / 仍缺的缺口；`^N. ` 行计来源数）并在会话里给出整课汇总、请求确认；确认事实写 `goal.json` 的 `materialSearch.confirmedAt`（`confirmSource:'chat'|'panel'`），**这是唯一的讲义门**：未确认时 `generateChapter` / `continueChapter` / `generateAllChapters` 三处派发一律拒绝，章状态与注入次数均不变。不新增状态机节点（承 D16 / D35）。
+- **新 RPC ×3**（`/study-rpc` 方法总数 47 → 50）：`study.dispatchMaterialSearch`（面板派发口，委托 `chatMaterialSearch`，与 `study.dispatchResearch` 同一 owner 惯例）、`study.getMaterials`（只读预览：文件/字符数/来源数/缺料章）、`study.confirmMaterials`（面板兜底整课确认，先扫盘、≥1 份才写事实，`confirmSource:'panel'`）。
+- **新聊天工具 ×2**（工具总数 11 → 13）：`study_material_search`（聊天侧派发检索）与 `study_material_confirm`（**仅当学习者明确说"确认"后调用**，强制 `goal_id`，缺了指回 `study_plan_status`、严禁猜目标）。
+- **面板三态资料区**：无记录 → 「🔍 检索课程资料」；已派发未确认 → 资料包清单 + 缺料章告警 + 「✅ 整课确认」兜底；已确认 → 「✅ 已确认 N 份 / M 个来源」。未确认时章行与 ⚡ 区块不渲染派发按钮，只提示「🔍 需先检索并确认课程资料」；确认后按钮改名为「📄 依据资料生成」/「⚡ 依据已确认资料一次性整理全部讲义」。
+- **讲义指令接入已确认资料**：`buildGenInstruction` / `buildAllChaptersInstruction` 新增「本章已确认资料包（动笔前必须逐份 read）」绝对路径清单（网页课程源材料并入同一清单）、第 ⑦ 节「参考来源」（编号+标题+URL）、超出资料范围的补全须标注 `(补充)`；D34 的先总后分六段 / 前置章阅读 / 黑盒欠账 / git 分支 / LaTeX+mermaid 全部原样保留。
+- **聊天状态指引**：`study_plan_status` 新增 `materials_summary` 与 `material_*` 键，`next_action` 在「生成讲义」之前先给「检索并确认课程资料」。
+
+### fixed
+- **`runWebCrawl` 不再抹掉整个 `research/`**：收窄为只清 `research/web`，批准后点「🔁 重抓」不会连 `research/materials/` 一起删光。
+- **导入身份重映射补漏**：`materialSearch.sessionId` 随 `g.sessionId` / `ch[].sessionId` / `g.research.sessionId` 一起换成本机 id（破 D17/D18 双身份模型的隐患）。
+- **Windows 原子写退避重试**：`writeJson` 在 `rename` 撞 `EPERM/EBUSY/EACCES`（杀软/索引器短暂持有）时最多重试 5 次（15ms×n 退避），最终失败才清临时文件并抛出——修掉 smoke 网页抓取段偶发成片红。
+- **净室探针工具名单补到 13 个**（此前仍写 7 个）并修 Git Bash GNU tar 把 `C:\…` 当远端主机的解包失败（改用 cwd 相对路径）。
+
+### notes
+- 测试：`smoke` 新增资料门段（未确认时三处派发被拒且无注入 / 未批准与 `need_open` 降级 / 扫描计数 files·sources·missing / `confirmSource` chat vs panel / 指令正则「不要写讲义」「绝不虚构 URL」「已确认资料包」「参考来源」「(补充)」/ 导出包含 `research/materials/**` / 重抓后资料仍在）并重排讲义生成时序；`client.test` 新增两场景（未确认只有提示无派发按钮 / 「✅ 整课确认」打到 `study.confirmMaterials`）。全套 **`smoke 270/0`、`portable 32/0`、`client 68/0`、`sync 122/0`**，`cleanroom-check` 通过（3 路由 + 13 工具）。
+- **边界（诚实）**：检索质量、URL 真实性、讲义是否真读了资料包都只在**提示词层**约束，插件不硬校验；唯一硬保证是 `confirmedAt` 门。整课一次确认（换一章来源也要重跑整课），不做逐章确认。资料包与章的对应只靠 `NN-` 前缀，写错编号落入 `missing[]`、不猜。存量目标不动，但追加新章或整课重新生成前必须先完成一次资料检索。**真机验收未做**：见 `docs/design/material-search-gate.md` §8 八步。
+
 ## [0.13.0] - 2026-10-09
 
 ### fixed
