@@ -216,21 +216,7 @@ let exportedGoalId = ''
   check('goal.json 章节文件命名 01-slug.md', gj.chapters[0].file === '01-attention-mechanism.md' || /^01-[^/]+\.md$/.test(gj.chapters[0].file), gj.chapters[0].file)
   check('批准透传可选字段(D34)', gj.chapters[0].env_baseline === 'Python+PyTorch 环境+git 仓库(主分支=基线)' && gj.chapters[1].depends_on[0] === 1, gj.chapters)
 
-  // 写讲义 → 轮询采纳 → active/ready
-  const chAbs = path.join(tmpRoot, goalId, 'chapters', gj.chapters[0].file)
-  await fsp.mkdir(path.dirname(chAbs), { recursive: true })
-  await fsp.writeFile(chAbs, '# 注意力机制\n' + '内容'.repeat(300))
-  // 讲义回写补充目录（NN-notes/）+ 一个会话 AI 写在目标目录里的代码文件 → 都应进包
-  const notesDir = path.join(tmpRoot, goalId, 'chapters', '01-notes')
-  await fsp.mkdir(notesDir, { recursive: true })
-  await fsp.writeFile(path.join(notesDir, '梯度消失.md'), '# 梯度消失\n详细补充内容')
-  await fsp.writeFile(path.join(tmpRoot, goalId, 'chapters', '01-qa.md'), '# 问答要点\n- Q: 为何缩放')
-  await fsp.writeFile(path.join(tmpRoot, goalId, 'demo.py'), 'print("会话 AI 在目标工作区里写的代码")')
-  const r6 = await callRpc('study.list', {})
-  const g2 = r6.json.goals.find((g) => g.id === goalId)
-  check('讲义采纳 → ready + 目标 active', g2.chapters[0].status === 'ready' && g2.status === 'active', { ch: g2.chapters[0].status, goal: g2.status })
-
-  // 教学偏好记忆体登场：此后所有指令都应带上它（导出侧也应含 meta/ 条目）
+  // 教学偏好记忆体登场：此后所有指令（含资料检索）都应带上它（导出侧也应含 meta/ 条目）
   const prefsAbs = path.join(tmpRoot, '_meta', 'teaching-prefs.md')
   await fsp.mkdir(path.dirname(prefsAbs), { recursive: true })
   await fsp.writeFile(prefsAbs, '- 2026-09-19 讲义一律先总后分，概览配 mermaid 框架图\n')
@@ -246,20 +232,96 @@ let exportedGoalId = ''
     check('教练指令含偏好注入+沉淀回路(D34)', /用户教学偏好/.test(ci) && /先总后分/.test(ci) && /偏好沉淀/.test(ci) && /teaching-prefs\.md/.test(ci), ci.slice(0, 200))
   }
 
+  // ── D40：批准后先按大纲检索资料 → 整课确认 → 才允许派发讲义 ──────────────────
+  {
+    const injGate = injected.length
+    const gate1 = await callRpc('study.generateChapter', { goalId, chapter_index: 1 })
+    const gate2 = await callRpc('study.continueChapter', { goalId, chapter_index: 1 })
+    const gate3 = await callRpc('study.generateAllChapters', { goalId })
+    check('D40 门：未确认资料 → 单章/继续/整课三处派发口一律拒', [gate1, gate2, gate3].every((r) => r.json && r.json.ok === false && /已确认的课程资料/.test(r.json.error || '')), [gate1.json, gate2.json, gate3.json])
+    const gl = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+    check('D40 门：拒发期间零注入、章状态原样', injected.length === injGate && gl.chapters.every((c) => c.status === 'draft'), gl.chapters.map((c) => c.status))
+    const pre = await callRpc('study.getMaterials', { goalId })
+    check('getMaterials 未派发 → dispatched:false', pre.json && pre.json.ok === true && pre.json.dispatched === false, pre.json)
+  }
+  {
+    const injM = injected.length
+    const dm = await callRpc('study.dispatchMaterialSearch', { goalId })
+    check('dispatchMaterialSearch ok（注入目标会话恰好一次）', dm.json && dm.json.ok === true && dm.json.sessionId === 'sess-goal-1' && injected.length === injM + 1, dm.json)
+    const mi = injected[injected.length - 1].msg.content[0].text
+    check('检索指令：不写讲义/不虚构 URL/章级资料包/整课汇总/回调确认/偏好', /不要写讲义/.test(mi) && /绝不虚构 URL/.test(mi) && /research\/materials\/NN-/.test(mi) && /整课汇总/.test(mi) && /study_material_confirm/.test(mi) && /不要自行宣布确认/.test(mi) && /用户教学偏好/.test(mi), mi.slice(0, 320))
+    const rowM = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+    check('派发事实落库：materialDispatched + 时间，confirmed 仍为 false', rowM.materialDispatched === true && typeof rowM.materialsSummary.dispatchedAt === 'string' && rowM.materialConfirmed !== true, { d: rowM.materialDispatched, c: rowM.materialConfirmed, at: rowM.materialsSummary && rowM.materialsSummary.dispatchedAt })
+  }
+  // 模拟会话 AI 按大纲写出资料包（来源清单按 "N. " 编号行计数）
+  const matDir = path.join(tmpRoot, goalId, 'research', 'materials')
+  await fsp.mkdir(matDir, { recursive: true })
+  await fsp.writeFile(path.join(matDir, '01-attention.md'),
+    '# 第 1 章 注意力机制\n## 来源清单\n1. Attention Is All You Need — https://arxiv.org/abs/1706.03762 — 原始论文 — 访问 2026-10-23\n2. PyTorch MultiheadAttention — https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html — 官方实现 — 访问 2026-10-23\n## 摘录与要点\n- ' + 'QKV 与缩放点积的权威表述。'.repeat(10) + '\n## 本章仍缺的缺口\n- 缺中文教材\n')
+  {
+    const gm = await callRpc('study.getMaterials', { goalId })
+    check('getMaterials：扫描计数（1 份 / 2 来源 / 缺第 2 章）', gm.json && gm.json.ok === true && gm.json.dispatched === true && gm.json.files.length === 1 && gm.json.files[0].index === 1 && gm.json.files[0].sources === 2 && gm.json.missing.join(',') === '2', gm.json)
+    const rowM = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+    check('list 回带章级 materials 与目标级 materialsSummary', rowM.chapters[0].materials && rowM.chapters[0].materials.sources === 2 && rowM.materialsSummary && rowM.materialsSummary.files === 1 && rowM.materialsSummary.missing.join(',') === '2', { ch: rowM.chapters[0].materials, sum: rowM.materialsSummary })
+    const cfNo = await callRpc('study.confirmMaterials', { goalId: 'goal-none' })
+    check('confirmMaterials 目标不存在 → error', cfNo.json && cfNo.json.ok === false)
+    const stTool = registeredTools.find((t) => t.name === 'study_plan_status')
+    const st = await stTool.execute({})
+    const sg = (st.goals || []).find((g) => g.id === goalId) || {}
+    check('study_plan_status：未确认时 next_action 先指向检索资料（排在生成讲义前）', /检索并确认课程资料/.test(sg.next_action || '') && sg.material_confirmed === false && sg.materials_summary && sg.materials_summary.files === 1, sg)
+  }
+  {
+    const cf = await callRpc('study.confirmMaterials', { goalId })
+    check('面板整课确认 → confirmedAt + confirmSource=panel + 计数', cf.json && cf.json.ok === true && cf.json.files === 1 && cf.json.sources === 2 && cf.json.confirmSource === 'panel' && typeof cf.json.confirmedAt === 'string', cf.json)
+    const rowC = (await callRpc('study.list', {})).json.goals.find((g) => g.id === goalId)
+    check('确认事实回带 materialConfirmed/At + materialsSummary.confirmedAt', rowC.materialConfirmed === true && typeof rowC.materialConfirmedAt === 'string' && typeof rowC.materialsSummary.confirmedAt === 'string', { c: rowC.materialConfirmed, at: rowC.materialConfirmedAt })
+    const st2 = await registeredTools.find((t) => t.name === 'study_plan_status').execute({})
+    const sg2 = (st2.goals || []).find((g) => g.id === goalId) || {}
+    check('study_plan_status：确认后 next_action 才转为生成讲义 + confirm_source=panel', /生成第 1 章/.test(sg2.next_action || '') && sg2.material_confirmed === true && sg2.materials_summary.confirm_source === 'panel', sg2)
+  }
+  {
+    // 派发口的前置校验与降级（不依赖主目标的资料事实）
+    const rcN = await callRpc('study.createGoal', { topic: '资料派发降级' })
+    const gN = rcN.json.goalId
+    const noCh = await callRpc('study.dispatchMaterialSearch', { goalId: gN })
+    check('资料检索派发未批准 → 拒且指向批准草案', noCh.json && noCh.json.ok === false && !noCh.json.need_open && /先批准草案/.test(noCh.json.error || ''), noCh.json)
+    await fsp.writeFile(path.join(tmpRoot, gN, 'draft.json'), JSON.stringify({ course: 'x', overview: 'y', chapters: [{ title: 'a' }] }))
+    await callRpc('study.list', {})
+    await callRpc('study.approveDraft', { goalId: gN })
+    const noSess = await callRpc('study.dispatchMaterialSearch', { goalId: gN })
+    check('资料检索派发无会话 → need_open 白话指引（指向打开会话）', noSess.json && noSess.json.ok === false && noSess.json.need_open === true && /打开会话|目标会话/.test(noSess.json.error || ''), noSess.json)
+    check('资料检索派发未知目标 → error', (await callRpc('study.dispatchMaterialSearch', { goalId: 'nope' })).json.ok === false)
+    await callRpc('study.deleteGoal', { goalId: gN })
+  }
+
+  // 写讲义 → 轮询采纳 → active/ready（资料已确认，讲义才允许落盘/采纳）
+  const chAbs = path.join(tmpRoot, goalId, 'chapters', gj.chapters[0].file)
+  await fsp.mkdir(path.dirname(chAbs), { recursive: true })
+  await fsp.writeFile(chAbs, '# 注意力机制\n' + '内容'.repeat(300))
+  // 讲义回写补充目录（NN-notes/）+ 一个会话 AI 写在目标目录里的代码文件 → 都应进包
+  const notesDir = path.join(tmpRoot, goalId, 'chapters', '01-notes')
+  await fsp.mkdir(notesDir, { recursive: true })
+  await fsp.writeFile(path.join(notesDir, '梯度消失.md'), '# 梯度消失\n详细补充内容')
+  await fsp.writeFile(path.join(tmpRoot, goalId, 'chapters', '01-qa.md'), '# 问答要点\n- Q: 为何缩放')
+  await fsp.writeFile(path.join(tmpRoot, goalId, 'demo.py'), 'print("会话 AI 在目标工作区里写的代码")')
+  const r6 = await callRpc('study.list', {})
+  const g2 = r6.json.goals.find((g) => g.id === goalId)
+  check('讲义采纳 → ready + 目标 active', g2.chapters[0].status === 'ready' && g2.status === 'active', { ch: g2.chapters[0].status, goal: g2.status })
+
   // generateChapter：第1章=环境基线确立；第2章=读全部前置章讲义+承接与补完+闭环
   const injB0 = injected.length
   const rg1 = await callRpc('study.generateChapter', { goalId, chapter_index: 1 })
   check('generateChapter ch1 ok(注入目标会话)', rg1.json && rg1.json.ok === true && injected.length === injB0 + 1, rg1.json)
   {
     const t1 = injected[injected.length - 1].msg.content[0].text
-    check('ch1 指令=环境基线+git 分支约定+先总后分', /环境的起点|工程线的起点/.test(t1) && /git init/.test(t1) && /checkout -b chapter\//.test(t1) && /本章概览\(总\)/.test(t1) && /作黑盒使用，第 N 章详述/.test(t1) && /用户教学偏好/.test(t1) && !/前置章讲义/.test(t1), t1.slice(0, 260))
+    check('ch1 指令=环境基线+git 分支约定+先总后分+已确认资料包+参考来源', /环境的起点|工程线的起点/.test(t1) && /git init/.test(t1) && /checkout -b chapter\//.test(t1) && /本章概览\(总\)/.test(t1) && /作黑盒使用，第 N 章详述/.test(t1) && /用户教学偏好/.test(t1) && !/前置章讲义/.test(t1) && /本章已确认资料包/.test(t1) && /research\/materials\/01-attention\.md/.test(t1) && /参考来源/.test(t1) && /\(补充\)/.test(t1), t1.slice(0, 260))
   }
   const rL9a = await callRpc('study.list', {})   // ch1 讲义文件在盘 → 采纳回 ready，别把 generating 状态带进 ch2 的前置章判定
   const rg2 = await callRpc('study.generateChapter', { goalId, chapter_index: 2 })
   check('generateChapter ch2 ok', rg2.json && rg2.json.ok === true, rg2.json)
   {
     const t2 = injected[injected.length - 1].msg.content[0].text
-    check('ch2 指令=前置章讲义路径+承接与补完+清偿欠账+LaTeX/mermaid', /前置章讲义\(动笔前必须用 read 工具逐份读完\)/.test(t2) && t2.indexOf('chapters/' + gj.chapters[0].file) > 0 && /承接与补完/.test(t2) && /欠账清偿/.test(t2) && /已在第 2 章讲清/.test(t2) && /LaTeX/.test(t2) && /mermaid/.test(t2) && /全课程总览/.test(t2) && /依赖章: 1/.test(t2), t2.slice(0, 300))
+    check('ch2 指令=前置章讲义路径+承接与补完+清偿欠账+LaTeX/mermaid+跨章资料包', /前置章讲义\(动笔前必须用 read 工具逐份读完\)/.test(t2) && t2.indexOf('chapters/' + gj.chapters[0].file) > 0 && /承接与补完/.test(t2) && /欠账清偿/.test(t2) && /已在第 2 章讲清/.test(t2) && /LaTeX/.test(t2) && /mermaid/.test(t2) && /全课程总览/.test(t2) && /依赖章: 1/.test(t2) && /本章无独立资料包/.test(t2) && /其他章已确认资料包/.test(t2) && /01-attention\.md/.test(t2), t2.slice(0, 300))
   }
   const rL9 = await callRpc('study.list', {})
   const g9 = rL9.json.goals.find((g) => g.id === goalId)
@@ -388,13 +450,18 @@ let exportedGoalId = ''
     await callRpc('study.deleteGoal', { goalId: g2 })
   }
   {
-    // 幂等重抓：先塞一个残留文件，重抓必须整批重建
+    // 幂等重抓：先塞一个残留文件，重抓必须整批重建；但 research/materials/（D40 原料）绝不能被连带删掉
     const webDir = path.join(tmpRoot, wGoal, 'research', 'web')
+    const matKeep = path.join(tmpRoot, wGoal, 'research', 'materials', '00-scratch.md')
+    await fsp.mkdir(path.dirname(matKeep), { recursive: true })
+    await fsp.writeFile(matKeep, '# 检索中的临时资料\nstale\n')
     await fsp.writeFile(path.join(webDir, 'leftover.txt'), 'stale')
     await callRpc('study.startCrawl', { goalId: wGoal, url: url1 })
     const again = await waitCrawl(wGoal)
     const gone = await fsp.readFile(path.join(webDir, 'leftover.txt'), 'utf8').catch(() => undefined)
-    check('重抓幂等：research/ 整批重建，残留文件不存活', again.web.status === 'done' && again.web.ok === 28 && gone === undefined, { st: again.web.status, gone })
+    const kept = await fsp.readFile(matKeep, 'utf8').catch(() => undefined)
+    check('重抓幂等：research/web 整批重建，残留文件不存活', again.web.status === 'done' && again.web.ok === 28 && gone === undefined, { st: again.web.status, gone })
+    check('重抓只清 research/web：research/materials/ 原样保留（D40）', kept !== undefined && /临时资料/.test(kept), { kept: kept !== undefined })
   }
   {
     // 材料模式调研指令（webCrawl.done ⇒ 禁再抓取、逐份读材料、gap_notes 出口）
@@ -430,6 +497,27 @@ let exportedGoalId = ''
     const gjw = JSON.parse(await fsp.readFile(path.join(tmpRoot, wGoal, 'goal.json'), 'utf8'))
     check('批准透传 gap_notes 到 goal.json', gjw.chapters[1].gap_notes[0] === '缺部署实践' && gjw.chapters[0].gap_notes === undefined, gjw.chapters.map((c) => c.gap_notes))
 
+    // D40：网页课程源同样要先派发检索 → 会话内（工具）确认整课资料，才能 ⚡
+    const wMatDir = path.join(tmpRoot, wGoal, 'research', 'materials')
+    await fsp.mkdir(wMatDir, { recursive: true })
+    const wMat = (n, title) => '# 第 ' + n + ' 章 ' + title + '\n## 来源清单\n1. 网页课程源 — ' + url1 + ' — 原始材料 — 访问 2026-10-23\n## 摘录与要点\n- ' + LONG + '\n## 本章仍缺的缺口\n- 无\n'
+    await fsp.writeFile(path.join(wMatDir, '01-1.md'), wMat(1, '地基'))
+    await fsp.writeFile(path.join(wMatDir, '02-2.md'), wMat(2, '正文'))
+    await fsp.writeFile(path.join(wMatDir, '03-3.md'), wMat(3, '收尾'))
+    {
+      const wDm = await callRpc('study.dispatchMaterialSearch', { goalId: wGoal })
+      check('网页课程源：资料检索派发 ok', wDm.json && wDm.json.ok === true && wDm.json.sessionId === 'sess-web-1', wDm.json)
+      const wi = injected[injected.length - 1].msg.content[0].text
+      check('网页课程源检索指令：禁重抓 + 网页材料附录 + 章级资料包 + 不写讲义', /禁止重新抓取网页/.test(wi) && /网页课程源材料/.test(wi) && /research\/materials\/NN-/.test(wi) && /不要写讲义/.test(wi), wi.slice(0, 300))
+      const wTool = registeredTools.find((t) => t.name === 'study_material_confirm')
+      const wcf = await wTool.execute({ goal_id: wGoal, note: '资料够用' })
+      check('chat 路径确认：study_material_confirm → confirmSource=chat + 3 份', wcf && wcf.ok === true && wcf.confirmSource === 'chat' && wcf.files === 3, wcf)
+      const wNo = await wTool.execute({ goal_id: '' })
+      check('chat 确认缺 goal_id → 拒且指回 study_plan_status', wNo && wNo.ok === false && /study_plan_status/.test(wNo.error || ''), wNo)
+      const wRow = await rowOf(wGoal)
+      check('网页课程源：确认后 ⚡ 解锁（materialConfirmed=true）', wRow.materialConfirmed === true && wRow.materialConfirmedAt, { c: wRow.materialConfirmed, sum: wRow.materialsSummary })
+    }
+
     // ⚡ 整课生成：只碰待生成章 → 全部就绪报错 → regenerate 覆盖
     const chFile = (i) => path.join(tmpRoot, wGoal, 'chapters', gjw.chapters[i].file)
     await fsp.mkdir(path.dirname(chFile(0)), { recursive: true })
@@ -442,7 +530,7 @@ let exportedGoalId = ''
     check('generateAll 后注入目标会话 + 待生成章转 generating', injected.length === injA + 1 && (await rowOf(wGoal)).chapters.map((c) => c.status).join(',') === 'ready,generating,generating')
     {
       const t = injected[injected.length - 1].msg.content[0].text
-      check('整课指令：总数/章次地图/材料清单/缺料补全标注', /一次性整理全部讲义（共 3 章）/.test(t) && /章次地图: /.test(t) && /网页课程源材料\(先通读再动笔/.test(t) && /📤 补充：非原始网页来源/.test(t) && /六段结构\(先总后分\)/.test(t) && /gap_notes: 缺部署实践/.test(t) && /teaching-prefs/.test(t), t.slice(0, 200))
+      check('整课指令：总数/章次地图/材料清单/已确认资料包/七段结构/缺料补全', /一次性整理全部讲义（共 3 章）/.test(t) && /章次地图: /.test(t) && /网页课程源材料\(先通读再动笔/.test(t) && /📤 补充：非原始网页来源/.test(t) && /已确认章级资料包\(动笔前必须用 read 工具逐份读完/.test(t) && /research\/materials\/01-1\.md/.test(t) && /七段结构\(先总后分\)/.test(t) && /参考来源/.test(t) && /\(补充\)/.test(t) && /gap_notes: 缺部署实践/.test(t) && /teaching-prefs/.test(t), t.slice(0, 200))
       check('默认模式：就绪章仅前置、绝不重写；落盘清单只列 2/3 章', /已就绪\(勿重写，仅作前置阅读\): 第1章=/.test(t) && /绝不重写其讲义文件/.test(t) && /待你撰写落盘的章节[^。]*第2章/.test(t) && !/落盘的章节[^。]*第1章/.test(t))
     }
     check('全部 generating 时再点默认 ⚡ → 拒(没有处于「待生成」)', /没有处于「待生成」/.test((await callRpc('study.generateAllChapters', { goalId: wGoal })).json.error || ''))
@@ -717,8 +805,8 @@ let exportedGoalId = ''
   check('会话按逐字节原文入包（zstd 帧、header 保留源 cwd）', !!sRec && sRec.encoding === 'zstd' && sRec.frames >= 2 && P.normPath(sRec.cwd) === P.normPath(goalAbsDir), sRec)
   check('v2 会话带稳定身份与 seq/行数/blank', sRec.remoteId === 'sess-ch-1' && sRec.rows === 3 && sRec.maxSeq === 2 && typeof sRec.lastTime === 'number' && sRec.blank === false, sRec && { r: sRec.remoteId, rows: sRec.rows, seq: sRec.maxSeq, blank: sRec.blank })
   check('空会话被识别为 blank（宿主会隐藏，不是导入丢失）', man.sessions.find((s) => s.id === 'sess-sub-1').blank === true, man.sessions.map((s) => [s.id, s.blank]))
-  const wantGoal = ['goal/goal.json', 'goal/draft.json', 'goal/chapters/' + gj.chapters[0].file, 'goal/chapters/01-qa.md', 'goal/chapters/01-notes/梯度消失.md', 'goal/demo.py']
-  check('goal 树全部内容入包（讲义/qa/notes/代码/draft/goal.json）', wantGoal.every((n) => zentries.has(n)), wantGoal.filter((n) => !zentries.has(n)))
+  const wantGoal = ['goal/goal.json', 'goal/draft.json', 'goal/chapters/' + gj.chapters[0].file, 'goal/chapters/01-qa.md', 'goal/chapters/01-notes/梯度消失.md', 'goal/demo.py', 'goal/research/materials/01-attention.md']
+  check('goal 树全部内容入包（讲义/qa/notes/代码/draft/goal.json/资料包）', wantGoal.every((n) => zentries.has(n)), wantGoal.filter((n) => !zentries.has(n)))
   check('教学偏好随包旅行(D34: meta/teaching-prefs.md 入包)', zentries.has('meta/teaching-prefs.md') && /先总后分/.test(zentries.get('meta/teaching-prefs.md').toString('utf8')), [...zentries.keys()].filter((k) => k.startsWith('meta/')))
   check('会话绑定关系被记录(goal/chapter-1/unbound)', man.sessions.map((s) => s.boundTo).sort().join(',') === 'chapter-1,goal,unbound', man.sessions.map((s) => [s.id, s.boundTo]))
   check('附件按内容寻址入包', zentries.has(man.attachments[0].entry) && man.attachments[0].sha256 === pngRef.attachmentId.slice(7), man.attachments)
@@ -1073,7 +1161,7 @@ let exportedGoalId = ''
 {
   check('defineTool 已解析（静态注册启用）', registeredTools.length > 0, '注册数=' + registeredTools.length)
   const names = registeredTools.map((t) => t.name).sort()
-  check('11 个工具注册（M2/M4 + D37 同步三件套）', names.join(',') === 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_sync_apply,study_sync_fetch,study_sync_status,study_test_generate', names)
+  check('13 个工具注册（M2/M4 + D37 同步三件套 + D40 资料两件套）', names.join(',') === 'study_goal_export,study_goal_import,study_material_confirm,study_material_search,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_sync_apply,study_sync_fetch,study_sync_status,study_test_generate', names)
   const byName = Object.fromEntries(registeredTools.map((t) => [t.name, t]))
   const createJson = JSON.stringify(byName.study_plan_create && byName.study_plan_create.parameters)
   check('create schema 含 topic 且表达 required', /topic/.test(createJson) && /required/.test(createJson), createJson)
@@ -1084,6 +1172,9 @@ let exportedGoalId = ''
   // study_goal_import 不带 confirm = 只预览
   const pv = await byName.study_goal_import.execute({ path: path.join(tmpRoot, 'exports', exportedFile) })
   check('study_goal_import 无 confirm 只给预览', pv.ok === false && pv.preview === true && !!pv.plan, { ok: pv.ok, preview: pv.preview, error: pv.error })
+  // D40：聊天侧派发口缺 goal_id 一律报错并指回 status（严禁猜目标）
+  const msNo = await byName.study_material_search.execute({ goal_id: '' })
+  check('study_material_search 缺 goal_id → 拒且指回 study_plan_status', msNo && msNo.ok === false && /study_plan_status/.test(msNo.error || ''), msNo)
 }
 
 await fsp.rm(tmpRoot, { recursive: true, force: true })

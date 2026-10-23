@@ -7,7 +7,7 @@
 - **宿主半** `lib/index.js`：ESM 模块，`export function apply(ctx, config)`。
   - `ctx.inject(['webServer','agents','workspaceRegistry','tools'], …)` 注入服务；导出/导入另用一条 inject 取 `sessionPersistence / sessions / attachments`（缺席只降级该功能，面板与聊天工具不受影响）
   - `/study-rpc` webServer prefix 路由（POST only + 1MB 上限；**不判定来源 IP**，局域网可达）承载全部 `study.*` RPC；`/study-export` GET 路由下载导出 zip；`/study-file` GET 路由出学习文档页（章节讲义 / 测试卷 / 错题本；入参只有 goalId+编号/scope，落点经 goal.json 反查，正文转义 + CSP `default-src 'none'`）；`study.readChapter`/`study.readTestFile` 供面板「打开讲义/试卷」—— 路径优先交给 client 侧的 `betterSidebar` 服务（DSH-better-sidebar）开成右侧页签，取不到才 `window.open` `/study-file` 新标签
-  - `study_plan_*` 聊天工具 ×6（含 `study_test_generate` 派发测试）+ `study_goal_export`/`study_goal_import` ×2：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
+  - 聊天工具 ×13：`study_plan_*` ×5 + `study_goal_export`/`study_goal_import` ×2 + `study_test_generate` + 两段式同步 `study_sync_status`/`study_sync_fetch`/`study_sync_apply` + 资料检索门 `study_material_search`/`study_material_confirm`：`defineTool(@deepseek-ai/dsh-tools) + sctx.tools.register`（宿主桥接解析，同实例；解析失败仅降级为无聊天工具）
 - **可携化** `lib/portable.js`：零依赖 ZIP（store + deflate，已与 Windows 自带解压器互操作验证）+ zstd 会话帧工具（复刻宿主帧切分、帧级 header 重写〔可换 id/cwd/parentSession〕、只追加尾帧、行级前缀关系判定、zip-slip 防御、附件引用收集）
 - **客户端半** `lib/client.js`（构建产物，勿手改）：`window.__ModuleLoader__.load({id, factory:(require)=>…})` 形态；
   源码 `src/client.mjs`；CSS 从仓库根 `src/client.js` 的 `styles.insert` 提取并内联。
@@ -18,14 +18,13 @@
 ```bash
 cd study-plugin
 node scripts/build-client.mjs       # → lib/client.js（CSS 内联 + banner + react externals）
-node test/smoke.mjs                 # 宿主半运行时冒烟（含 readChapter + /study-file 讲义页；跑在宿主真实 persistence + registry 上）
+node test/smoke.mjs                 # 宿主半运行时冒烟（含资料检索门、readChapter + /study-file 讲义页；跑在宿主真实 persistence + registry 上）
 node test/sync.test.mjs             # GitHub 同步宿主半（122 断言，内存 mock GitHub server + 真宿主夹具，双设备 + 多主机 adopt + 两段式暂存 syncFetch/syncApply/syncListStash/syncDeleteStash + study_sync_* 聊天通道）
-npm test                            # smoke + portable + client(64，桩 React 真实渲染点击，含同步面板、「打开讲义」与网页课程源) + sync(122)
-                                    # ⚠ 本机宿主升到 dsh 0.1.5-rc.2 后 JsonlSessionPersistence 无 inspect() ⇒ smoke(M4 起)/portable 崩，属夹具待跟进宿主漂移（见 CHANGELOG 0.7.2 备注），未改代码
+npm test                            # smoke(270) + portable(32) + client(68，桩 React 真实渲染点击，含资料门、同步面板、「打开讲义」与网页课程源) + sync(122)
 node test/host-fixture.mjs 2>nul     // 夹具本身不单独跑；被 smoke/portable 复用
 npm run sweep                         # 本机全部真实 transcript 逐帧验帧（约 100 份 / 70 MB）
 node test/transcript-sweep.mjs      # 可选：拿本机真实会话日志全量验帧（无 DSH 数据时自动跳过）
-node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针）
+node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 profile → 探针，3 路由 + 13 工具）
 ```
 开发说明：`node_modules/@deepseek-ai/dsh-tools` 是指向本机宿主副本的 **dev junction**（仅开发用；真实目录安装无需它，终端用户经 DSH 宿主桥接解析，净室脚本已验证）。
 
@@ -35,7 +34,7 @@ node scripts/cleanroom-check.mjs    # 净室安装验证（npm pack → 假 prof
 # git+https 形式经 pnpm 直接 git clone（对代理/受限网络最稳）；github: 简写走 codeload tarball 快捷路径
 dsh plugin --profile web add git+https://github.com/pujie147/dsh-study-plugin.git
 ```
-装完**重启 DSH** 即生效：左栏出现「📚 学习区」（任何模式），`study_plan_*` 五工具全局可用。
+装完**重启 DSH** 即生效：左栏出现「📚 学习区」（任何模式），13 个聊天工具全局可用。
 注意事项（来自官方安装器的已知边界）：
 - `dsh plugin` 底层是把参数转发给 profile 目录里的 pnpm。pnpm 11 供应链策略可能拦首次安装：报 `Minimum release age` = 发布未满 24h（等或配 `minimumReleaseAge: 0`）；报 `untrusted origin` = 删 profile 目录 `node_modules` 与 `pnpm-lock.yaml` 后重装。
 - 数据根目录 = `~/.dsh/study-work`（自动创建）；更新：`dsh plugin --profile web update study-plugin`；卸载在「已安装」列表或 `dsh plugin --profile web remove study-plugin`。
@@ -77,10 +76,21 @@ Windows 用目录 Junction（免管理员）。安装后重启 DSH 验证：
 
 生成指令（提示词层，无硬校验）现按课程级上下文组装，只影响**新目标与新章节**，存量讲义不重生成：
 
-- **总分结构**：每篇讲义固定六段——标题 → 本章概览(总) → 承接与补完 → 正文分节(每节先总后分，可递归) → 动手练习 → 本章小结(只回收讲过的内容，严禁冒生知识点)。
+- **总分结构**：每篇讲义固定七段——标题 → 本章概览(总) → 承接与补完 → 正文分节(每节先总后分，可递归) → 动手练习 → 本章小结(只回收讲过的内容，严禁冒生知识点) → 参考来源（从已确认资料包抄编号+标题+URL，v0.14.0）。
 - **前后章接续**：生成第 N≥2 章前，AI 必须先 read 全部前置 ready 章讲义，复用其环境与工程、清偿「作黑盒使用，第 N 章详述」的欠账；第 1 章是工程线起点——`git init`，主分支为全课程基线，**每章独立分支 `chapter/NN-主题` 开发、章末合回，禁止直接在主分支开发**。
 - **排版**：公式用 LaTeX/KaTeX，图用 mermaid（better-sidebar 的 markdown 预览原生渲染两者）。
 - **教学偏好记忆体** `~/.dsh/study-work/_meta/teaching-prefs.md`：你在聊天里提出的长期结构/组织/构建规则（AI 提炼、经你同意后）记在这里，对后续所有生成生效；**只记规则不记课程内容**，随导出包/GitHub 同步旅行，导入时按行并集合并。
+
+## 资料检索门：先搜资料、确认后再写讲义（v0.14.0）
+
+批准草案后不再直接写讲义，而是多一步「检索课程资料」：
+
+- **🔍 检索课程资料**：向目标会话注入检索指令。AI 按已批准大纲逐章做 2–4 次检索（优先官方文档/经典教材/维护良好的仓库；工程章必须检到官方安装文档与样例仓），把每章资料写成 `<目标>/research/materials/NN-<slug>.md`（固定三节：来源清单 / 摘录与要点 / 本章仍缺的缺口），最后在会话里给出**整课汇总**（每章来源数、最权威的一份、明显缺口）并请你确认。
+- **✅ 整课确认**：在会话里回复确认，AI 调 `study_material_confirm` 把确认事实写进 `goal.json`；模型忘了回调时点面板「✅ 整课确认」兜底（`confirmSource` 区分 chat / panel）。**整课一次确认**，确认前不派发任何讲义生成。
+- **📄 依据资料生成 / ⚡ 依据已确认资料一次性整理全部讲义**：确认后按钮才出现。讲义指令要求动笔前逐份 `read` 已确认资料包、末尾固定第 ⑦ 节「参考来源」；超出资料范围的补全必须在正文标注 `(补充)`。
+- **边界（诚实）**：检索质量、URL 真实性、讲义是否真读了资料包都只在**提示词层**约束；唯一硬保证是 `confirmedAt` 门。资料包与章只靠 `NN-` 前缀对应，写错编号会落进「缺料章」而不猜。存量目标不动，但追加新章或整课重新生成前必须先完成一次资料检索。资料包在 `research/**` 下，随导出包 / GitHub 同步自动旅行；「🔁 重抓」只清 `research/web`、**不会删资料包**。
+
+设计细节见 [docs/design/material-search-gate.md](./docs/design/material-search-gate.md)（决策 D40）。
 
 ## 网页课程源：给个网址，照着教（v0.8.0）
 

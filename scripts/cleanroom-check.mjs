@@ -55,8 +55,9 @@ try {
   const tgzAbs = path.join(T, tgz)
   console.log('✓ tarball: ' + tgz + ' (' + (await fs.stat(tgzAbs)).size + ' bytes)')
 
-  // 1b) 内容核对（files 字段生效）
-  r = run('tar', ['-tzf', tgzAbs], { T }, 'list')
+  // 1b) 内容核对（files 字段生效）。cwd=T + 裸文件名：Git Bash 的 GNU tar 会把
+  //     "C:\…" 里的冒号当成远端主机（Cannot connect to C），相对路径避开这个坑。
+  r = run('tar', ['-tzf', tgz], { T }, 'list')
   if (r.status !== 0) throw new Error('tar -tzf 失败: ' + r.out)
   const entries = r.out.trim().split(/\r?\n/).map((s) => s.replace(/^package\//, ''))
   const need = ['package.json', 'cordis.patch.yml', 'lib/index.js', 'lib/client.js', 'lib/portable.js', 'LICENSE', 'CHANGELOG.md']
@@ -68,7 +69,7 @@ try {
   // 2) 解包到假 profile 的 web/node_modules（真实目录）
   const pkgDir = path.join(T, 'profiles', 'web', 'node_modules', 'study-plugin')
   await fs.mkdir(pkgDir, { recursive: true })
-  r = run('tar', ['-xzf', tgzAbs, '-C', pkgDir, '--strip-components=1'], { T }, 'unpack')
+  r = run('tar', ['-xzf', tgz, '-C', 'profiles/web/node_modules/study-plugin', '--strip-components=1'], { T }, 'unpack')
   if (r.status !== 0) throw new Error('tar 解包失败: ' + r.out)
   console.log('✓ 已按真实目录布局解包')
 
@@ -156,7 +157,7 @@ function call(method, args) {
   })
 }
 const names = tools.map((t) => t.name).sort().join(',')
-const expect = 'study_goal_export,study_goal_import,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status'
+const expect = 'study_goal_export,study_goal_import,study_material_confirm,study_material_search,study_plan_approve,study_plan_create,study_plan_reject,study_plan_research,study_plan_status,study_sync_apply,study_sync_fetch,study_sync_status,study_test_generate'
 const paths = routes.map((r) => r.path).sort().join(',')
 if (paths !== '/study-export,/study-file,/study-rpc') { console.error('✗ 路由不符: ' + paths); process.exit(1) }
 if (names !== expect) { console.error('✗ 工具不符: ' + names); process.exit(1) }
@@ -165,7 +166,7 @@ if (!st || st.ok !== true || !Array.isArray(st.goals)) { console.error('✗ stud
 let rejected = false
 try { await tools.find((t) => t.name === 'study_goal_export').execute({}) } catch { rejected = true }
 if (!rejected) { console.error('✗ study_goal_export 缺 goal_id 应被参数 schema 拦下'); process.exit(1) }
-console.log('✓ 探针: 2 路由 + 7 工具注册 + status 执行 + export 参数校验')
+console.log('✓ 探针: 3 路由 + 13 工具注册 + status 执行 + export 参数校验')
 
 // ── 端到端：造目标 → 造会话 → 导出 → 抹掉 → 覆盖式导入（证明 tarball 里 portable.js 真的可用）
 const created = await call('study.createGoal', { topic: '净室回归', target_level: 'x', requirements: '' })

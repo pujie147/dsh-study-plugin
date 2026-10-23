@@ -46,6 +46,16 @@ const ghostRow = {
   path: '/home/me/.dsh/study-work/goal-ghost', draft: null, chapters: []
 }
 let dispatchResult = { ok: true, sessionId: 'session-g', message: '已派发' }
+// D40 资料检索 / 确认的可控返回
+let dispatchMaterialsResult = { ok: true, sessionId: 'session-g', dispatchedAt: '2026-10-23T02:00:00.000Z' }
+let materialsPreviewResult = {
+  ok: true, dispatched: true, dispatchedAt: '2026-10-23T02:00:00.000Z',
+  files: [
+    { index: 1, file: '01-foundation.md', abs: '/home/me/.dsh/study-work/goal-d40/research/materials/01-foundation.md', chars: 860, sources: 3 }
+  ],
+  missing: [2]
+}
+let confirmMaterialsResult = { ok: true, files: 1, sources: 3, missing: [2], confirmedAt: '2026-10-23T03:00:00.000Z' }
 const pendingRow = {
   id: 'goal-pending', title: '草案待批', status: 'draft_pending', target_level: '入门', requirements: '',
   updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g', researchDispatched: true,
@@ -73,6 +83,8 @@ const webFailRow = webRow('goal-web-fail', '网页课抓取失败', {
 })
 const genRow = (id, title, statuses) => webRow(id, title, {
   status: 'active', researchDispatched: true,
+  // D40：讲义派发已加资料门，批量生成用例走"已确认"路径；门控本身另有专门用例
+  materialConfirmed: true, materialConfirmedAt: '2026-10-23T03:00:00.000Z',
   chapters: statuses.map((s, i) => ({ index: i + 1, title: '第' + (i + 1) + '章', file: '0' + (i + 1) + '-ch.md', status: s, sessionId: '', lastError: '' }))
 })
 const genMixedRow = genRow('goal-gen-mixed', '批量部分待生成', ['ready', 'draft', 'draft'])
@@ -109,6 +121,14 @@ const handlers = {
   'study.list': () => ({ goals: listGoals }),
   'study.rejectDraft': (a) => { rpc.push(['reject', a]); return { ok: true } },
   'study.dispatchResearch': (a) => { rpc.push(['dispatch', a]); return dispatchResult },
+  // ── D40 资料检索门：派发 / 预览 / 面板兜底确认 ──
+  'study.dispatchMaterialSearch': (a) => { rpc.push(['dispatchMaterials', a]); return dispatchMaterialsResult },
+  'study.getMaterials': (a) => { rpc.push(['getMaterials', a]); return materialsPreviewResult },
+  'study.confirmMaterials': (a) => {
+    rpc.push(['confirmMaterials', a])
+    materialsPreviewResult = Object.assign({}, materialsPreviewResult, { confirmedAt: confirmMaterialsResult.confirmedAt })
+    return confirmMaterialsResult
+  },
   // ── 网页课程源（v0.8.0）：抓取发起 / 预览 / 一次性生成（可控返回，供面板用例驱动）──
   'study.startCrawl': (a) => { rpc.push(['startCrawl', a]); return crawlStartResult },
   'study.getCrawlPreview': (a) => { rpc.push(['crawlPreview', a]); return crawlPreviewResult },
@@ -652,7 +672,7 @@ ok('打开讲义：按 features 门控能力，缺 openFile 时降级而非硬�
 // (3) 讲义文件还没生成：会话照样打开，讲义报白话错误且不抛、不开新标签
 hostShape.sidebar = false
 openedUrls.length = 0
-notesResult = { ok: false, error: '讲义文件还不存在：请先点「生成讲义」' }
+notesResult = { ok: false, error: '讲义文件还不存在：请先点「🔍 检索课程资料」并确认整课资料，再点「📄 依据资料生成」' }
 await useHost({ ui: true, legacy: false }, [goalRow])
 tree = await startChapter()
 assert.ok(bodyText().indexOf('讲义文件还不存在') >= 0, '缺讲义时应白话报错: ' + bodyText().slice(0, 200))
@@ -1095,10 +1115,10 @@ listGoals = [genMixedRow]
 await click(hdrBtn('刷新'), 'refresh gen-mixed')
 tree = await renderAll()
 await expand('批量部分待生成')
-assert.ok(btnIn('批量部分待生成', '⚡ 一次性生成全部讲义（2 章）'), '部分就绪时按钮应只报「待生成」章数: ' + rowRange('批量部分待生成').filter((e) => e.type === 'button').map(textOf).join('|'))
-assert.ok(!btnIn('批量部分待生成', '⚡ 重新生成全部讲义'), '有待生成章时不该出现「重新生成」')
+assert.ok(btnIn('批量部分待生成', '⚡ 依据已确认资料一次性整理全部讲义（2 章）'), '部分就绪时按钮应只报「待生成」章数: ' + rowRange('批量部分待生成').filter((e) => e.type === 'button').map(textOf).join('|'))
+assert.ok(!btnIn('批量部分待生成', '⚡ 依据已确认资料重新生成全部讲义'), '有待生成章时不该出现「重新生成」')
 rpc.length = 0
-await click(btnIn('批量部分待生成', '⚡ 一次性生成全部讲义（2 章）'), 'gen all mixed')
+await click(btnIn('批量部分待生成', '⚡ 依据已确认资料一次性整理全部讲义（2 章）'), 'gen all mixed')
 assert.ok(hasRpc('generateAll', { goalId: 'goal-gen-mixed' }), '默认派发不应带 regenerate：' + JSON.stringify(rpc))
 tree = await renderAll()
 assert.ok(bodyText().indexOf('⚡ 一次性生成已派发（2 章）') >= 0, '成功后缺提示')
@@ -1110,9 +1130,9 @@ listGoals = [genReadyRow]
 await click(hdrBtn('刷新'), 'refresh gen-ready')
 tree = await renderAll()
 await expand('批量全部就绪')
-assert.ok(btnIn('批量全部就绪', '⚡ 重新生成全部讲义'), '全部就绪时应变「⚡ 重新生成全部讲义」: ' + rowRange('批量全部就绪').filter((e) => e.type === 'button').map(textOf).join('|'))
+assert.ok(btnIn('批量全部就绪', '⚡ 依据已确认资料重新生成全部讲义'), '全部就绪时应变「⚡ 依据已确认资料重新生成全部讲义」: ' + rowRange('批量全部就绪').filter((e) => e.type === 'button').map(textOf).join('|'))
 rpc.length = 0
-await click(btnIn('批量全部就绪', '⚡ 重新生成全部讲义'), 'regen all')
+await click(btnIn('批量全部就绪', '⚡ 依据已确认资料重新生成全部讲义'), 'regen all')
 assert.ok(hasRpc('generateAll', { goalId: 'goal-gen-ready', regenerate: true }), '重新生成必须带 regenerate=true：' + JSON.stringify(rpc))
 tree = await renderAll()
 assert.ok(bodyText().indexOf('⚡ 一次性重新生成已派发（2 章）') >= 0, '重新生成缺提示')
@@ -1126,5 +1146,59 @@ await expand('批量有生成中')
 assert.ok(bodyText().indexOf('⚡ 有章节正在生成中') >= 0, '生成中应给等待说明')
 assert.ok(!rowRange('批量有生成中').some((e) => e.type === 'button' && textOf(e).indexOf('⚡') >= 0), '生成中不该出现 ⚡ 派发按钮')
 ok('⚡ 有章生成中：收起派发按钮，只提示等待完成')
+
+// ── D40 资料检索门：讲义必须建立在已确认的课程资料之上 ──────────────────────────
+const d40Row = (over) => Object.assign({
+  id: 'goal-d40', title: '资料门目标', status: 'active', target_level: '入门', requirements: '',
+  updatedAt: 'x', workspaceId: 'ws-1', sessionId: 'session-g',
+  path: '/home/me/.dsh/study-work/goal-d40', draft: null,
+  materialDispatched: false, materialConfirmed: false,
+  chapters: [
+    { index: 1, title: '地基', file: '01-foundation.md', status: 'draft', sessionId: '', lastError: '' },
+    { index: 2, title: '进阶', file: '02-advanced.md', status: 'draft', sessionId: '', lastError: '' }
+  ]
+}, over)
+await useHost({ ui: true, legacy: false }, [d40Row({})])
+tree = await renderAll()
+await expand('资料门目标')
+assert.ok(btnIn('资料门目标', '🔍 检索课程资料'), '未检索时应给「🔍 检索课程资料」入口')
+assert.ok(bodyText().indexOf('生成讲义前必须先按大纲检索资料') >= 0, '缺少资料先行说明')
+assert.ok(!btnIn('资料门目标', '📄 依据资料生成'), '未确认资料时不该出现「📄 依据资料生成」')
+assert.ok(!rowRange('资料门目标').some((e) => e.type === 'button' && textOf(e).indexOf('⚡') >= 0), '未确认资料时不该出现 ⚡ 派发按钮')
+assert.ok(bodyText().indexOf('🔍 需先检索并确认课程资料') >= 0, '章节/⚡ 处缺少门控提示')
+ok('D40：未检索 ⇒ 只有「🔍 检索课程资料」；生成入口被门控收起并给出白话提示')
+
+rpc.length = 0
+await click(btnIn('资料门目标', '🔍 检索课程资料'), 'dispatch materials')
+tree = await renderAll()
+assert.ok(hasRpc('dispatchMaterials', { goalId: 'goal-d40' }), '应调用 study.dispatchMaterialSearch: ' + JSON.stringify(rpc))
+assert.ok(hasRpc('getMaterials', { goalId: 'goal-d40' }), '派发成功后应拉 study.getMaterials')
+assert.ok(bodyText().indexOf('⏳ 资料检索已派发') >= 0, '已派发态缺失: ' + bodyText().slice(0, 300))
+assert.ok(bodyText().indexOf('第 1 章 01-foundation.md（860 字 / 来源 3）') >= 0, '资料包清单缺失')
+assert.ok(bodyText().indexOf('⚠ 缺料章: 2') >= 0, '缺料章告警缺失')
+assert.ok(btnIn('资料门目标', '✅ 整课确认'), '面板兜底确认按钮缺失')
+ok('D40：检索派发后展示资料包清单/来源数/缺料章 + 「✅ 整课确认」兜底')
+
+rpc.length = 0
+await click(btnIn('资料门目标', '✅ 整课确认'), 'confirm materials')
+tree = await renderAll()
+assert.ok(hasRpc('confirmMaterials', { goalId: 'goal-d40' }), '面板确认应调用 study.confirmMaterials')
+assert.ok(bodyText().indexOf('✅ 已确认整课资料（1 份 / 3 个来源）') >= 0, '确认成功提示缺失: ' + bodyText().slice(0, 240))
+assert.ok(bodyText().indexOf('缺料章: 2') >= 0, '确认提示应带上缺料章')
+ok('D40：「✅ 整课确认」= 面板兜底确认并回报份数/来源数/缺料章')
+
+materialsPreviewResult = {
+  ok: true, dispatched: true, dispatchedAt: '2026-10-23T02:00:00.000Z', confirmedAt: '2026-10-23T03:00:00.000Z',
+  files: [{ index: 1, file: '01-foundation.md', abs: '/home/me/.dsh/study-work/goal-d40/research/materials/01-foundation.md', chars: 860, sources: 3 }],
+  missing: [2]
+}
+listGoals = [d40Row({ materialDispatched: true, materialConfirmed: true, materialConfirmedAt: '2026-10-23T03:00:00.000Z' })]
+await click(hdrBtn('刷新'), 'refresh d40 confirmed')
+tree = await renderAll()
+if (!btnIn('资料门目标', '📄 依据资料生成')) await expand('资料门目标')
+assert.ok(btnIn('资料门目标', '📄 依据资料生成'), '确认后章节行应解锁「📄 依据资料生成」: ' + rowRange('资料门目标').filter((e) => e.type === 'button').map(textOf).join('|'))
+assert.ok(bodyText().indexOf('✅ 已确认课程资料：1 份 / 3 个来源') >= 0, '已确认摘要缺失')
+assert.ok(btnIn('资料门目标', '⚡ 依据已确认资料一次性整理全部讲义（2 章）'), '确认后 ⚡ 应解锁')
+ok('D40：确认资料后章节「📄 依据资料生成」与 ⚡ 整课入口解锁')
 
 console.log('\nclient.test: ' + n + ' 断言全部通过')
